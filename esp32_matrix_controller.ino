@@ -1421,12 +1421,13 @@ let st={mode:0,clockFace:0,prov:'owm',lavaHue:15,rotation:0,flipH:false,flipV:fa
 
 // ── Canvas preview ──
 const cv=document.getElementById('cv'),ctx=cv.getContext('2d');
-function drawMatrix(arr){
-  // arr передаётся в XY-порядке (строка за строкой), индекс = y*16+x
+function drawMatrix(hex){
+  // hex: строка 256×6 символов RRGGBB от /api/matrix (1536 байт вместо ~3.5 KB JSON)
   const SZ=12;
   ctx.fillStyle='#0a0c18';ctx.fillRect(0,0,192,192);
   for(let y=0;y<16;y++)for(let x=0;x<16;x++){
-    const v=arr[y*16+x]||0,r=(v>>16)&0xff,g=(v>>8)&0xff,b=v&0xff;
+    const i=(y*16+x)*6;
+    const r=parseInt(hex.substr(i,2),16)||0,g=parseInt(hex.substr(i+2,2),16)||0,b=parseInt(hex.substr(i+4,2),16)||0;
     if(r||g||b){
       ctx.fillStyle=`rgb(${r},${g},${b})`;
       ctx.fillRect(x*SZ+1,y*SZ+1,SZ-2,SZ-2);
@@ -1576,9 +1577,23 @@ async function fetchStatus(){
       document.getElementById('tempNeedle').style.left=pct;
       updLavaNeedle();
     }
-    if(d.matrix)drawMatrix(d.matrix);
     updateWifiUI(d);
-  }catch(e){}}
+  }catch(e){}
+  // setTimeout-чейнинг: следующий запрос только после завершения предыдущего —
+  // нет накопления очереди при медленном WiFi
+  setTimeout(fetchStatus,3000);}
+
+// Матрица вынесена в отдельный эндпоинт (/api/matrix): 1536 байт hex vs ~3.5 KB JSON.
+// Опрашивается независимо от статуса; 204 = ESP32 под нагрузкой, сохраняем кадр.
+async function fetchMatrix(){
+  try{
+    const r=await fetch('/api/matrix');
+    if(r.ok&&r.status!==204){
+      const h=await r.text();
+      if(h.length===256*6)drawMatrix(h);
+    }
+  }catch(e){}
+  setTimeout(fetchMatrix,2000);}
 
 async function saveAll(){
   const body={
@@ -1701,8 +1716,8 @@ async function rebootDevice(){
 
 buildPresets();
 loadSettings();
-fetchStatus();
-setInterval(fetchStatus,3000);
+fetchStatus();   // запускает собственный setTimeout-цикл (3 сек)
+fetchMatrix();   // запускает собственный setTimeout-цикл (2 сек)
 </script>
 </body></html>)HTML";
 
@@ -1791,6 +1806,30 @@ void handlePostSettings() {
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
+// Компактный снимок матрицы: 256×6 hex-символов (RRGGBB на пиксель) = 1536 байт.
+// Vs JSON-массив uint32: ~3.5 KB + ~5 KB ArduinoJson-пула + String-копия.
+// Серверный rate-limit 800 мс — защита loop() от частых TCP-отправок.
+// HTTP 204 при слишком частом запросе → браузер сохраняет предыдущий кадр.
+static uint32_t lastMatrixSendMs = 0;
+void handleGetMatrix() {
+  if (millis() - lastMatrixSendMs < 800) {
+    server.send(204); return;
+  }
+  lastMatrixSendMs = millis();
+  // Стек-аллокация: нет давления на heap в отличие от JsonDocument + String
+  char buf[MW * MH * 6 + 1];
+  char* p = buf;
+  for (int y = 0; y < MH; y++)
+    for (int x = 0; x < MW; x++) {
+      int idx = XY(x, y);
+      if (idx >= 0) sprintf(p, "%02X%02X%02X", leds[idx].r, leds[idx].g, leds[idx].b);
+      else          memcpy(p, "000000", 6);
+      p += 6;
+    }
+  *p = '\0';
+  server.send(200, "text/plain", buf);
+}
+
 void handleStatus() {
   JsonDocument doc;
   doc["wifi"]   = wifiConnected;
@@ -1804,13 +1843,6 @@ void handleStatus() {
   doc["heap"]   = String(ESP.getFreeHeap() / 1024) + " KB";
   doc["rssi"]   = wifiConnected ? String(WiFi.RSSI()) + " dBm" : "—";
 
-  // Отправляем в логическом XY-порядке (с учётом змейки)
-  JsonArray arr = doc["matrix"].to<JsonArray>();
-  for (int y = 0; y < MH; y++)
-    for (int x = 0; x < MW; x++) {
-      int idx = XY(x, y);
-      arr.add(idx >= 0 ? (((uint32_t)leds[idx].r << 16) | ((uint32_t)leds[idx].g << 8) | leds[idx].b) : 0u);
-    }
   String out; serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
@@ -2150,6 +2182,7 @@ void setup() {
   server.on("/api/disconnect",HTTP_POST, handleDisconnectWifi);
   server.on("/api/wifi",      HTTP_POST, handlePostWifi);
   server.on("/api/reboot",    HTTP_POST, handleReboot);
+  server.on("/api/matrix",    HTTP_GET,  handleGetMatrix);
   server.on("/api/update",    HTTP_POST, handleForceUpdate);
   server.onNotFound([](){ server.sendHeader("Location","/"); server.send(302); });
   server.begin();
