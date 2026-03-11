@@ -886,17 +886,6 @@ void lavaSetup() {
   lavaInit2 = true;
 }
 
-CRGB lavaColorPx(float field, uint16_t hue, bool autoC) {
-  float tmp = getTemp(); // один атомарный снимок
-  uint8_t h = autoC ? (uint8_t)((hue == 0 && tmp > -999) ?
-      constrain((int)(240 - (tmp + 20) / 60.f * 240), 0, 240) : hue) : (uint8_t)hue;
-
-  float t = constrain((field - 0.4f) / 2.0f, 0, 1);
-  uint8_t sat = 220 + (uint8_t)(35 * t);
-  uint8_t val = (uint8_t)(30 + 225 * t);
-  return CHSV(h, sat, val);
-}
-
 void showLava() {
   if (!lavaInit2) lavaSetup();
   if (millis() - lavaLastMs < 80) {
