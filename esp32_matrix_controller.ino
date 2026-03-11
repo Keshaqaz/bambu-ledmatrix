@@ -150,13 +150,18 @@ static const char* AP_NAME = "ESP32-Matrix";
 static const char* AP_PASS = "12345678";
 
 float    currentTemp    = -999.0f;
-bool     wifiConnected  = false;
+volatile bool wifiConnected  = false;  // volatile: читается core 0 без мьютекса
 bool     apMode         = true;   // стартуем всегда в AP
 volatile bool weatherRequested = false; // флаг запроса погоды для weatherTask
 
 // Мьютекс для доступа к WiFi-стеку между core 0 (weatherTask) и core 1 (loop/WebServer).
 // Любая операция с WiFi/HTTPClient должна удерживать этот мьютекс.
 SemaphoreHandle_t wifiMutex = NULL;
+
+// Спинлок для атомарного доступа к currentTemp и lastWeatherMs с двух ядер.
+// portENTER/EXIT_CRITICAL на ESP32 маскирует прерывания И блокирует второе ядро
+// через HW-спинлок — безопасно для коротких (~1 мкс) критических секций.
+static portMUX_TYPE statsMux = portMUX_INITIALIZER_UNLOCKED;
 
 uint32_t lastWeatherMs  = 0;
 uint32_t lastDrawMs     = 0;
@@ -259,6 +264,43 @@ void drawChar7(int x, int y, int di, CRGB col) {
 }
 
 // ════════════════════════════════════════════════════════════
+//  ПОТОКОБЕЗОПАСНЫЕ АКСЕССОРЫ SHARED-ПЕРЕМЕННЫХ
+//  currentTemp  — пишет core 0 (weatherTask), читает core 1 (render/web)
+//  lastWeatherMs — пишут оба ядра, читает core 1
+// ════════════════════════════════════════════════════════════
+
+inline float getTemp() {
+  float t;
+  portENTER_CRITICAL(&statsMux);
+  t = currentTemp;
+  portEXIT_CRITICAL(&statsMux);
+  return t;
+}
+
+// setTemp атомарно обновляет currentTemp И lastWeatherMs —
+// чтобы на core 1 оба значения всегда были согласованы.
+inline void setTemp(float t) {
+  portENTER_CRITICAL(&statsMux);
+  currentTemp   = t;
+  lastWeatherMs = millis();
+  portEXIT_CRITICAL(&statsMux);
+}
+
+inline uint32_t getLastWeatherMs() {
+  uint32_t ms;
+  portENTER_CRITICAL(&statsMux);
+  ms = lastWeatherMs;
+  portEXIT_CRITICAL(&statsMux);
+  return ms;
+}
+
+inline void setLastWeatherMs(uint32_t ms) {
+  portENTER_CRITICAL(&statsMux);
+  lastWeatherMs = ms;
+  portEXIT_CRITICAL(&statsMux);
+}
+
+// ════════════════════════════════════════════════════════════
 //  ЦВЕТ ПО ТЕМПЕРАТУРЕ
 // ════════════════════════════════════════════════════════════
 CRGB tempToColor(float t) {
@@ -271,7 +313,8 @@ CRGB tempToColor(float t) {
 }
 
 CRGB activeColor() {
-  if (cfg.autoColor && currentTemp > -999.0f) return tempToColor(currentTemp);
+  float t = getTemp(); // один атомарный снимок
+  if (cfg.autoColor && t > -999.0f) return tempToColor(t);
   return CRGB(cfg.customR, cfg.customG, cfg.customB);
 }
 
@@ -280,11 +323,11 @@ CRGB activeColor() {
 // ════════════════════════════════════════════════════════════
 void showTemperature() {
   clearMatrix();
-  if (currentTemp <= -999.0f) {
+  float t = getTemp(); // один атомарный снимок на весь кадр
+  if (t <= -999.0f) {
     drawStr3((MW - strW3("---")) / 2, 5, "---", CRGB(60, 60, 60), 0);
     FastLED.show(); return;
   }
-  float t = currentTemp;
   CRGB color = cfg.autoColor ? tempToColor(t) : CRGB(cfg.customR, cfg.customG, cfg.customB);
   int abst = (int)abs(t);
   bool neg = (t < 0);
@@ -832,8 +875,9 @@ void lavaSetup() {
 }
 
 CRGB lavaColorPx(float field, uint16_t hue, bool autoC) {
-  uint8_t h = autoC ? (uint8_t)((hue == 0 && currentTemp > -999) ?
-      constrain((int)(240 - (currentTemp + 20) / 60.f * 240), 0, 240) : hue) : (uint8_t)hue;
+  float tmp = getTemp(); // один атомарный снимок
+  uint8_t h = autoC ? (uint8_t)((hue == 0 && tmp > -999) ?
+      constrain((int)(240 - (tmp + 20) / 60.f * 240), 0, 240) : hue) : (uint8_t)hue;
 
   float t = constrain((field - 0.4f) / 2.0f, 0, 1);
   uint8_t sat = 220 + (uint8_t)(35 * t);
@@ -871,8 +915,9 @@ void showLava() {
   }
 
   // Рендер поля
+  float lavaTmp = getTemp(); // один атомарный снимок на весь кадр
   uint16_t hue = cfg.lavaAutoColor ? (uint16_t)constrain(
-    (int)(240 - (currentTemp > -999 ? (currentTemp + 20) / 60.f : 0.5f) * 240), 0, 240) : cfg.lavaHue;
+    (int)(240 - (lavaTmp > -999 ? (lavaTmp + 20) / 60.f : 0.5f) * 240), 0, 240) : cfg.lavaHue;
 
   for (int y = 0; y < MH; y++) {
     for (int x = 0; x < MW; x++) {
@@ -930,9 +975,9 @@ void fetchWeather() {
   if (code == 200) {
     JsonDocument doc; // ArduinoJson 7  (для v6: JsonDocument doc)
     if (!deserializeJson(doc, http.getString())) {
-      currentTemp   = isYa ? doc["fact"]["temp"].as<float>()
-                           : doc["main"]["temp"].as<float>();
-      lastWeatherMs = millis();
+      // setTemp атомарно обновляет currentTemp + lastWeatherMs под спинлоком
+      setTemp(isYa ? doc["fact"]["temp"].as<float>()
+                   : doc["main"]["temp"].as<float>());
     }
   }
   http.end();
@@ -1713,7 +1758,7 @@ void handleStatus() {
   doc["ssid"]   = cfg.ssid;
   doc["ip"]     = wifiConnected ? WiFi.localIP().toString() : "192.168.4.1";
   doc["apIP"]   = "192.168.4.1";
-  doc["temp"]   = currentTemp;
+  doc["temp"]   = getTemp();
   doc["uptime"] = String(millis() / 1000 / 3600, DEC) + "ч " +
                   String((millis() / 1000 % 3600) / 60, DEC) + "м";
   doc["heap"]   = String(ESP.getFreeHeap() / 1024) + " KB";
@@ -1930,7 +1975,7 @@ void weatherTask(void* param) {
         Serial.println("[Weather] Запрос погоды...");
         fetchWeather();
         Serial.printf("[Weather] %.1f C  стек: %u bytes free\n",
-          currentTemp, uxTaskGetStackHighWaterMark(NULL));
+          getTemp(), uxTaskGetStackHighWaterMark(NULL));
       }
     }
     vTaskDelay(100);
@@ -2107,8 +2152,9 @@ void loop() {
   // Обновление погоды — через флаг weatherTask (не блокирует loop)
   if (wifiConnected) {
     uint32_t interval = (uint32_t)cfg.updateMin * 60000UL;
-    if (lastWeatherMs == 0 || millis() - lastWeatherMs >= interval) {
-      lastWeatherMs = millis(); // обновляем сразу, чтобы не спамить
+    uint32_t lw = getLastWeatherMs(); // атомарный снимок
+    if (lw == 0 || millis() - lw >= interval) {
+      setLastWeatherMs(millis()); // обновляем сразу, чтобы не спамить
       weatherRequested = true;
     }
   }
