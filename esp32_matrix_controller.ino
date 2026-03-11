@@ -218,7 +218,9 @@ int extIdx(char c) {
   return -15; // space
 }
 
-const uint8_t* getFntRow(int ei, uint8_t font, int row) {
+// Возвращает указатель на начало 5-байтовых данных символа в PROGMEM.
+// Вызывающий код сам добавляет смещение строки: getFontData(ei, font) + row.
+const uint8_t* getFontData(int ei, uint8_t font) {
   // ei < 0: базовый шрифт, -(ei+1) = индекс 0-14
   if (ei < 0) {
     int idx = -(ei + 1);
@@ -234,7 +236,7 @@ const uint8_t* getFntRow(int ei, uint8_t font, int row) {
 void drawChar3(int x, int y, char c, CRGB col, uint8_t font) {
   int ei = extIdx(c);
   for (int row = 0; row < 5; row++) {
-    uint8_t bits = pgm_read_byte(getFntRow(ei, font, 0) + row);
+    uint8_t bits = pgm_read_byte(getFontData(ei, font) + row);
     for (int col2 = 0; col2 < 3; col2++)
       if (bits & (1 << (2 - col2))) px(x + col2, y + row, col);
   }
@@ -796,7 +798,17 @@ struct Snake {
 static Snake sn;
 static uint32_t snLastMs = 0;
 
-void snPlace() { sn.fx = random(MW); sn.fy = random(MH); }
+void snPlace() {
+  // Ищем свободную клетку за максимум MW*MH попыток.
+  // Если доска заполнена (змейка выиграла) — оставляем позицию как есть.
+  for (int attempt = 0; attempt < MW * MH; attempt++) {
+    int fx = random(MW), fy = random(MH);
+    bool hit = false;
+    for (int i = 0; i < sn.len; i++)
+      if (sn.bx[i] == fx && sn.by[i] == fy) { hit = true; break; }
+    if (!hit) { sn.fx = fx; sn.fy = fy; return; }
+  }
+}
 void snReset() {
   sn.bx[0]=8; sn.by[0]=8; sn.len=3; sn.dx=1; sn.dy=0; sn.alive=true;
   for(int i=1;i<3;i++){sn.bx[i]=8-i;sn.by[i]=8;}
@@ -973,8 +985,11 @@ void fetchWeather() {
 
   int code = http.GET();
   if (code == 200) {
-    JsonDocument doc; // ArduinoJson 7  (для v6: JsonDocument doc)
-    if (!deserializeJson(doc, http.getString())) {
+    // getStream() парсит JSON прямо из TCP-буфера без выделения String в heap.
+    // http.getString() копировал весь ответ (~1 KB) — при фрагментированной
+    // куче это вызывало OOM и перезагрузку.
+    JsonDocument doc;
+    if (!deserializeJson(doc, http.getStream())) {
       // setTemp атомарно обновляет currentTemp + lastWeatherMs под спинлоком
       setTemp(isYa ? doc["fact"]["temp"].as<float>()
                    : doc["main"]["temp"].as<float>());
@@ -2143,10 +2158,22 @@ void loop() {
     }
   }
   // Проверяем что STA соединение не упало
-  if (wifiConnected && !apMode && WiFi.status() != WL_CONNECTED) {
-    Serial.println("[WiFi] Соединение потеряно! Перезагрузка...");
-    delay(1000);
-    ESP.restart();
+  {
+    static uint32_t wifiLostMs = 0;
+    if (wifiConnected && !apMode && WiFi.status() != WL_CONNECTED) {
+      if (wifiLostMs == 0) {
+        wifiLostMs = millis();
+        Serial.println("[WiFi] Соединение потеряно, запускаем WiFi.reconnect()...");
+        WiFi.reconnect();
+      } else if (millis() - wifiLostMs > 30000) {
+        // 30 сек переподключения не помогли — единственный надёжный выход
+        Serial.println("[WiFi] Переподключение не удалось (30 сек), перезагрузка...");
+        delay(500);
+        ESP.restart();
+      }
+    } else {
+      wifiLostMs = 0; // соединение есть — сбрасываем счётчик
+    }
   }
 
   // Обновление погоды — через флаг weatherTask (не блокирует loop)
