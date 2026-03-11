@@ -1984,14 +1984,19 @@ static void startAP() {
 // ════════════════════════════════════════════════════════════
 void weatherTask(void* param) {
   for (;;) {
-    if (weatherRequested) {
-      weatherRequested = false;
-      if (wifiConnected) {
-        Serial.println("[Weather] Запрос погоды...");
-        fetchWeather();
-        Serial.printf("[Weather] %.1f C  стек: %u bytes free\n",
-          getTemp(), uxTaskGetStackHighWaterMark(NULL));
-      }
+    // Атомарный read-and-clear: проверка и сброс флага — единая операция
+    // под спинлоком. Без этого core 1 может записать weatherRequested=true
+    // точно между нашим чтением и сбросом → принудительное обновление теряется.
+    bool doFetch = false;
+    portENTER_CRITICAL(&statsMux);
+    if (weatherRequested) { doFetch = true; weatherRequested = false; }
+    portEXIT_CRITICAL(&statsMux);
+
+    if (doFetch && wifiConnected) {
+      Serial.println("[Weather] Запрос погоды...");
+      fetchWeather();
+      Serial.printf("[Weather] %.1f C  стек: %u bytes free\n",
+        getTemp(), uxTaskGetStackHighWaterMark(NULL));
     }
     vTaskDelay(100);
   }
