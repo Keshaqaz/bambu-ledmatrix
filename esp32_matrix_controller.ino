@@ -1914,6 +1914,7 @@ void handleConnectWifi() {
   WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
   WiFi.softAP(AP_NAME, AP_PASS, 6, 0, 4);
   delay(500);
+  applyAPSecurityConfig();  // WPA2-PSK + PMF → macOS не покажет «Сбой подключения»
   esp_wifi_set_ps(WIFI_PS_NONE);
   WiFi.begin(ssid, pass);
 
@@ -2026,6 +2027,19 @@ void showConnecting() {
   FastLED.show();
 }
 
+// macOS Ventura/Sonoma показывает «Сбой подключения» если AP работает
+// в режиме WPA/WPA2-mixed (дефолт WiFi.softAP) или без PMF.
+// Эта функция вызывается ПОСЛЕ softAP() и переключает AP на WPA2-PSK + PMF capable.
+// PMF required=false сохраняет совместимость со старыми Android/Windows-клиентами.
+static void applyAPSecurityConfig() {
+  wifi_config_t ap_cfg;
+  esp_wifi_get_config(WIFI_IF_AP, &ap_cfg);
+  ap_cfg.ap.authmode          = WIFI_AUTH_WPA2_PSK; // только WPA2, не mixed
+  ap_cfg.ap.pmf_cfg.capable   = true;               // PMF поддерживается (нужен macOS)
+  ap_cfg.ap.pmf_cfg.required  = false;              // не обязателен (старые клиенты)
+  esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+}
+
 // Старт AP — вызывать ТОЛЬКО когда WiFi уже в WIFI_OFF или WIFI_AP
 static void startAP() {
   WiFi.mode(WIFI_AP);
@@ -2035,10 +2049,11 @@ static void startAP() {
   // Канал 6, скрытый=false, макс.клиентов=4
   WiFi.softAP(AP_NAME, AP_PASS, 6, 0, 4);
   delay(500);
+  applyAPSecurityConfig();  // WPA2-PSK + PMF capable → совместимость с macOS
   // КРИТИЧНО для ESP32-C3: отключить power save, иначе клиенты не могут подключиться
   esp_wifi_set_ps(WIFI_PS_NONE);
   apMode = true;
-  Serial.printf("[AP] Запущена: %s / %s → %s  (ch6, ps=none)\n",
+  Serial.printf("[AP] Запущена: %s / %s → %s  (ch6, WPA2+PMF, ps=none)\n",
     AP_NAME, AP_PASS, WiFi.softAPIP().toString().c_str());
 }
 
