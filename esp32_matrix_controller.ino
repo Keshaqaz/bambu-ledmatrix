@@ -233,25 +233,60 @@ const uint8_t* getFontData(int ei, uint8_t font) {
   return &F_EXT[ei][0];
 }
 
-void drawChar3(int x, int y, char c, CRGB col, uint8_t font) {
-  int ei = extIdx(c);
+// Внутренний: рисует глиф по уже вычисленному font-индексу ei
+static void drawGlyph3(int x, int y, int ei, CRGB col, uint8_t font) {
   for (int row = 0; row < 5; row++) {
     uint8_t bits = pgm_read_byte(getFontData(ei, font) + row);
     for (int col2 = 0; col2 < 3; col2++)
       if (bits & (1 << (2 - col2))) px(x + col2, y + row, col);
   }
 }
+void drawChar3(int x, int y, char c, CRGB col, uint8_t font) {
+  drawGlyph3(x, y, extIdx(c), col, font);
+}
+
+// НЗ-1: UTF-8-aware helpers для кириллицы (2-байтовые последовательности 0xD0/0xD1)
+// Декодирует следующий Unicode codepoint из p, сдвигает указатель.
+// Возвращает -1 в конце строки. ASCII ≤0x7F — один байт; 0xD0/0xD1 — два байта.
+static int utf8Next(const uint8_t*& p) {
+  if (*p == 0) return -1;
+  uint8_t b0 = *p++;
+  if (b0 < 0x80) return (int)b0;
+  if ((b0 & 0xE0) == 0xC0 && *p) {
+    int cp = ((b0 & 0x1F) << 6) | (*p++ & 0x3F);
+    return cp;
+  }
+  return (int)b0; // неизвестная последовательность — возвращаем raw-байт
+}
+
+// Кол-во символов (не байт) в UTF-8 строке
+static int utf8Len(const char* s) {
+  const uint8_t* p = (const uint8_t*)s;
+  int n = 0;
+  while (utf8Next(p) != -1) n++;
+  return n;
+}
 
 int strW3(const char* s) {
-  int n = strlen(s);
+  int n = utf8Len(s);
   return n ? n * 3 + (n - 1) : 0;
 }
 
 void drawStr3(int x, int y, const char* s, CRGB col, uint8_t font) {
+  const uint8_t* p = (const uint8_t*)s;
   int cx = x;
-  for (int i = 0; s[i]; i++) {
-    if (i > 0) cx++;
-    drawChar3(cx, y, s[i], col, font);
+  bool first = true;
+  int cp;
+  while ((cp = utf8Next(p)) != -1) {
+    if (!first) cx++;
+    first = false;
+    // Кириллические codepoints U+0410–U+044F → индексы 0–62 для F_EXT
+    // Цифры, латиница, спецсимволы — передаём raw (< 0x80)
+    int ei;
+    if (cp >= 0x0410 && cp <= 0x044F) ei = cp - 0x0410;  // А=0 … я=62
+    else if (cp > 0xFF) ei = -1;                           // неизвестный → skip
+    else ei = cp;
+    if (ei != -1) drawGlyph3(cx, y, ei, col, font);
     cx += 3;
   }
 }
@@ -331,7 +366,7 @@ void showTemperature() {
     FastLED.show(); return;
   }
   CRGB color = cfg.autoColor ? tempToColor(t) : CRGB(cfg.customR, cfg.customG, cfg.customB);
-  int abst = (int)abs(t);
+  int abst = min((int)abs(t), 99);  // ВЖ-8: ≥100°C рендерим как 99 (символ ':' иначе)
   bool neg = (t < 0);
   bool showSign = (abst > 0);
 
@@ -1000,10 +1035,10 @@ void saveConfig() {
 void loadConfig() {
   prefs.begin("matrix", true);
   uint16_t ver = prefs.getUShort("ver", 0);
-  if (ver == 312 && prefs.isKey("cfg")) {
+  if (ver == 312 && prefs.getBytesLength("cfg") == sizeof(cfg)) {  // НЗ-2: sizeof-guard
     prefs.getBytes("cfg", &cfg, sizeof(cfg));
   }
-  // ver != 310 → первый запуск / старый формат → defaults из struct
+  // ver != 312 или размер не совпадает → первый запуск / старый формат → defaults из struct
   prefs.end();
 }
 
@@ -1717,7 +1752,10 @@ void handleGetSettings() {
 void handlePostSettings() {
   if (!server.hasArg("plain")) { server.send(400); return; }
   JsonDocument doc;
-  deserializeJson(doc, server.arg("plain"));
+  if (deserializeJson(doc, server.arg("plain"))) {           // НЗ-3: невалидный JSON → 400
+    server.send(400, "application/json", "{\"error\":\"invalid json\"}");
+    return;
+  }
 
   auto setStr = [&](const char* key, char* dst, size_t sz) {
     if (doc[key].is<const char*>()) strlcpy(dst, doc[key].as<const char*>(), sz);
