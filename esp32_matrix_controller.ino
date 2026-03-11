@@ -2001,6 +2001,12 @@ void weatherTask(void* param) {
 //  SETUP
 // ════════════════════════════════════════════════════════════
 void setup() {
+  // Мьютекс создаём самым первым — до любого WiFi-кода и до старта задач.
+  // Это гарантирует что wifiMutex != NULL в момент первого xSemaphoreTake(),
+  // независимо от будущей перестановки кода в setup().
+  wifiMutex = xSemaphoreCreateMutex();
+  configASSERT(wifiMutex);
+
   Serial.begin(115200);
   Serial.println("\n╔════════════════════════╗");
   Serial.println("║  ESP32 LED Matrix v3.0 ║");
@@ -2111,12 +2117,7 @@ void setup() {
   server.begin();
   Serial.println("Server started");
 
-  // Создаём мьютекс ДО запуска weatherTask — он должен существовать
-  // раньше, чем задача попытается его взять.
-  wifiMutex = xSemaphoreCreateMutex();
-  configASSERT(wifiMutex); // паника при нехватке памяти
-
-  // Запускаем веб-сервер на core 0, анимации остаются на core 1 (loop)
+  // Запускаем задачу погоды на core 0, анимации остаются на core 1 (loop)
   xTaskCreatePinnedToCore(
     weatherTask,   // погода на core 0 — HTTPClient блокирует до 8 сек
     "weather",
