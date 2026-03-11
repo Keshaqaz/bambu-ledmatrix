@@ -1858,13 +1858,14 @@ void handleConnectWifi() {
   esp_wifi_set_ps(WIFI_PS_NONE);
   WiFi.begin(ssid, pass);
 
-  // Ждём до 15 сек, периодически отдавая управление серверу.
-  // wifiMutex удерживаем всё время — weatherTask не сможет начать HTTP-запрос,
-  // пока мы не завершим реконфигурацию и не отпустим мьютекс.
+  // Ждём до 15 сек. server.handleClient() здесь намеренно НЕ вызывается —
+  // мы внутри обработчика, вызванного из handleClient(); повторный вызов
+  // перезапишет _currentClient и сломает текущий ответ или вызовет
+  // Stack Overflow. Браузер держит TCP-соединение открытым всё это время
+  // (мы в AP+STA, AP работает, клиент подключён через AP).
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
     dnsServer.processNextRequest();
-    server.handleClient();
     delay(50);
   }
 
