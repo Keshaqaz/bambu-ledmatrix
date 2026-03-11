@@ -1912,9 +1912,8 @@ void handleConnectWifi() {
   delay(300);
   IPAddress apIP(192,168,4,1);
   WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
-  WiFi.softAP(AP_NAME, AP_PASS, 6, 0, 4);
+  WiFi.softAP(AP_NAME, AP_PASS, 1, 0, 4);  // канал 1
   delay(500);
-  applyAPSecurityConfig();  // WPA2-PSK + PMF → macOS не покажет «Сбой подключения»
   esp_wifi_set_ps(WIFI_PS_NONE);
   WiFi.begin(ssid, pass);
 
@@ -2027,39 +2026,18 @@ void showConnecting() {
   FastLED.show();
 }
 
-// macOS Tahoe/Ventura/Sonoma показывает «Сбой подключения» если AP работает
-// в режиме WPA/WPA2-mixed (дефолт WiFi.softAP) или без PMF.
-// Строим конфиг с нуля (не get+patch): get_config может вернуть ssid_len=0,
-// тогда set_config поднимает AP с пустым SSID — невидимым для всех клиентов.
-static void applyAPSecurityConfig() {
-  wifi_config_t ap_cfg;
-  memset(&ap_cfg, 0, sizeof(ap_cfg));
-  strlcpy((char*)ap_cfg.ap.ssid,     AP_NAME, sizeof(ap_cfg.ap.ssid));
-  strlcpy((char*)ap_cfg.ap.password, AP_PASS, sizeof(ap_cfg.ap.password));
-  ap_cfg.ap.ssid_len        = (uint8_t)strlen(AP_NAME);
-  ap_cfg.ap.channel         = 6;
-  ap_cfg.ap.max_connection  = 4;
-  ap_cfg.ap.beacon_interval = 100;
-  ap_cfg.ap.authmode           = WIFI_AUTH_WPA2_PSK; // только WPA2, не mixed
-  ap_cfg.ap.pmf_cfg.capable    = true;               // PMF capable (нужен macOS)
-  ap_cfg.ap.pmf_cfg.required   = false;              // не обязателен (старые клиенты)
-  esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
-}
-
 // Старт AP — вызывать ТОЛЬКО когда WiFi уже в WIFI_OFF или WIFI_AP
 static void startAP() {
   WiFi.mode(WIFI_AP);
   delay(300);
   IPAddress apIP(192, 168, 4, 1);
   WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
-  // Канал 6, скрытый=false, макс.клиентов=4
-  WiFi.softAP(AP_NAME, AP_PASS, 6, 0, 4);
+  WiFi.softAP(AP_NAME, AP_PASS, 1, 0, 4);  // канал 1 — меньше помех, шире поддержка
   delay(500);
-  applyAPSecurityConfig();  // WPA2-PSK + PMF capable → совместимость с macOS
   // КРИТИЧНО для ESP32-C3: отключить power save, иначе клиенты не могут подключиться
   esp_wifi_set_ps(WIFI_PS_NONE);
   apMode = true;
-  Serial.printf("[AP] Запущена: %s / %s → %s  (ch6, WPA2+PMF, ps=none)\n",
+  Serial.printf("[AP] Запущена: %s / %s → %s  (ch1, ps=none)\n",
     AP_NAME, AP_PASS, WiFi.softAPIP().toString().c_str());
 }
 
@@ -2196,11 +2174,19 @@ void setup() {
     Serial.println("[DNS] Captive portal запущен");
   }
 
-  // Captive portal редиректы для разных ОС
-  server.on("/generate_204",        HTTP_GET, [](){ server.sendHeader("Location","/"); server.send(302); });
-  server.on("/fwlink",              HTTP_GET, [](){ server.sendHeader("Location","/"); server.send(302); });
-  server.on("/hotspot-detect.html", HTTP_GET, [](){ server.sendHeader("Location","/"); server.send(302); });
-  server.on("/connecttest.txt",     HTTP_GET, [](){ server.sendHeader("Location","/"); server.send(302); });
+  // Captive portal — правила для разных ОС:
+  // Android/Chrome: /generate_204 должен вернуть 204 No Content
+  // macOS/iOS Tahoe: /hotspot-detect.html и /library/test/success.html должны вернуть
+  //   200 с телом "Success" — иначе CNA считает портал неработающим и блокирует (Сбой подключения)
+  // Windows: /connecttest.txt → 200 "Microsoft Connect Test"
+  //          /fwlink → редирект на страницу
+  server.on("/generate_204",                  HTTP_GET, [](){ server.send(204); });
+  server.on("/hotspot-detect.html",           HTTP_GET, [](){ server.send(200, "text/html", "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>"); });
+  server.on("/library/test/success.html",     HTTP_GET, [](){ server.send(200, "text/html", "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>"); });
+  server.on("/connecttest.txt",               HTTP_GET, [](){ server.send(200, "text/plain", "Microsoft Connect Test"); });
+  server.on("/ncsi.txt",                      HTTP_GET, [](){ server.send(200, "text/plain", "Microsoft NCSI"); });
+  server.on("/fwlink",                        HTTP_GET, [](){ server.sendHeader("Location","/"); server.send(302); });
+  server.on("/redirect",                      HTTP_GET, [](){ server.sendHeader("Location","/"); server.send(302); });
 
   server.on("/",              HTTP_GET,  handleRoot);
   server.on("/api/settings",  HTTP_GET,  handleGetSettings);
