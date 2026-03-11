@@ -154,6 +154,10 @@ bool     wifiConnected  = false;
 bool     apMode         = true;   // стартуем всегда в AP
 volatile bool weatherRequested = false; // флаг запроса погоды для weatherTask
 
+// Мьютекс для доступа к WiFi-стеку между core 0 (weatherTask) и core 1 (loop/WebServer).
+// Любая операция с WiFi/HTTPClient должна удерживать этот мьютекс.
+SemaphoreHandle_t wifiMutex = NULL;
+
 uint32_t lastWeatherMs  = 0;
 uint32_t lastDrawMs     = 0;
 
@@ -893,13 +897,21 @@ void showLava() {
 void fetchWeather() {
   if (!wifiConnected) return;
 
+  // Защита от одновременного использования WiFi-стека с core 1 (handleConnectWifi).
+  // Таймаут 500 мс: если core 1 сейчас переконфигурирует WiFi — пропускаем цикл,
+  // следующий запрос придёт через updateMin минут.
+  if (xSemaphoreTake(wifiMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+    Serial.println("[Weather] wifiMutex занят, запрос отложен");
+    return;
+  }
+
   bool isYa = (cfg.weatherProv == 1);
   HTTPClient http;
   http.setTimeout(8000);
 
   if (isYa) {
     // Яндекс Погода — HTTPS, сертификат не проверяем (CA не встроен)
-    if (strlen(cfg.yaKey) == 0) return;
+    if (strlen(cfg.yaKey) == 0) { xSemaphoreGive(wifiMutex); return; }
     WiFiClientSecure sc;
     sc.setInsecure(); // без проверки TLS-сертификата
     String url = "https://api.weather.yandex.ru/v2/forecast?lat=" +
@@ -908,7 +920,7 @@ void fetchWeather() {
     http.addHeader("X-Yandex-API-Key", String(cfg.yaKey));
   } else {
     // OpenWeatherMap — обычный HTTP
-    if (strlen(cfg.apiKey) == 0) return;
+    if (strlen(cfg.apiKey) == 0) { xSemaphoreGive(wifiMutex); return; }
     String url = "http://api.openweathermap.org/data/2.5/weather?q=" +
                  String(cfg.city) + "&appid=" + String(cfg.apiKey) + "&units=metric";
     http.begin(url);
@@ -924,6 +936,7 @@ void fetchWeather() {
     }
   }
   http.end();
+  xSemaphoreGive(wifiMutex);
 }
 
 // ════════════════════════════════════════════════════════════
@@ -1761,6 +1774,15 @@ void handleConnectWifi() {
     return;
   }
 
+  // Берём мьютекс до любого обращения к WiFi-стеку.
+  // Ждём до 10 сек: weatherTask удерживает его максимум ~8 сек (http.setTimeout).
+  // Если не дождались — сообщаем клиенту об ошибке вместо краша.
+  if (xSemaphoreTake(wifiMutex, pdMS_TO_TICKS(10000)) != pdTRUE) {
+    server.send(503, "application/json", "{\"error\":\"WiFi busy, retry\"}");
+    Serial.println("[WiFi] Не удалось взять wifiMutex, подключение отменено");
+    return;
+  }
+
   // Переходим в AP+STA — AP остаётся, браузер не теряет соединение
   Serial.printf("[WiFi] Подключаемся к '%s'...\n", ssid);
   WiFi.mode(WIFI_OFF);
@@ -1774,7 +1796,9 @@ void handleConnectWifi() {
   esp_wifi_set_ps(WIFI_PS_NONE);
   WiFi.begin(ssid, pass);
 
-  // Ждём до 15 сек, периодически отдавая управление серверу
+  // Ждём до 15 сек, периодически отдавая управление серверу.
+  // wifiMutex удерживаем всё время — weatherTask не сможет начать HTTP-запрос,
+  // пока мы не завершим реконфигурацию и не отпустим мьютекс.
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
     dnsServer.processNextRequest();
@@ -1793,7 +1817,6 @@ void handleConnectWifi() {
     resp["ip"]   = WiFi.localIP().toString();
     resp["rssi"] = WiFi.RSSI();
     configTime(cfg.tzOffset * 3600L, 0, cfg.ntpServer);
-    weatherRequested = true;
     Serial.printf("[WiFi] Подключено! IP=%s\n", WiFi.localIP().toString().c_str());
   } else {
     int st = WiFi.status();
@@ -1805,6 +1828,13 @@ void handleConnectWifi() {
     startAP();
     dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
   }
+
+  xSemaphoreGive(wifiMutex);
+
+  // weatherRequested ставим ПОСЛЕ release мьютекса — иначе weatherTask
+  // немедленно войдёт в fetchWeather() раньше, чем мы успели send().
+  if (resp["ok"].as<bool>()) weatherRequested = true;
+
   String out; serializeJson(resp, out);
   server.send(200, "application/json", out);
 }
@@ -2020,6 +2050,11 @@ void setup() {
   server.onNotFound([](){ server.sendHeader("Location","/"); server.send(302); });
   server.begin();
   Serial.println("Server started");
+
+  // Создаём мьютекс ДО запуска weatherTask — он должен существовать
+  // раньше, чем задача попытается его взять.
+  wifiMutex = xSemaphoreCreateMutex();
+  configASSERT(wifiMutex); // паника при нехватке памяти
 
   // Запускаем веб-сервер на core 0, анимации остаются на core 1 (loop)
   xTaskCreatePinnedToCore(
