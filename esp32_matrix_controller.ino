@@ -1790,17 +1790,19 @@ void handleStatus() {
   server.send(200, "application/json", out);
 }
 
-// Сканирование WiFi: асинхронный запуск → быстрый ответ, результаты через polling
+// Сканирование WiFi: запускаем асинхронно, ждём завершения и отвечаем одним ответом.
+// server.handleClient() намеренно НЕ вызывается в цикле ожидания —
+// WebServer не реентерантен: повторный вызов из обработчика перезапишет
+// _currentClient и приведёт к мусорному ответу или Stack Overflow.
+// Браузер выдерживает 4 сек без проблем (HTTP-таймаут >> 4 сек).
 void handleScanWifi() {
   int n = WiFi.scanComplete();
   if (n == WIFI_SCAN_FAILED || n == WIFI_SCAN_RUNNING) {
-    // Запускаем асинхронное сканирование и ждём до 4 сек, отдавая сервер
     WiFi.scanDelete();
-    WiFi.scanNetworks(true);  // async=true — не блокирует
+    WiFi.scanNetworks(true);  // async=true — сканирование в фоне
     uint32_t t0 = millis();
     while (WiFi.scanComplete() < 0 && millis() - t0 < 4000) {
-      dnsServer.processNextRequest();
-      server.handleClient();
+      dnsServer.processNextRequest(); // captive-portal DNS — лёгкий, не реентерантен
       delay(100);
     }
     n = WiFi.scanComplete();
