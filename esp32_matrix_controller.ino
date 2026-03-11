@@ -923,9 +923,7 @@ void lavaSetup() {
 
 void showLava() {
   if (!lavaInit2) lavaSetup();
-  if (millis() - lavaLastMs < 80) {
-    FastLED.show(); return;
-  }
+  if (millis() - lavaLastMs < 80) return;  // НЗ-5: show() здесь недостижим (loop throttle = 80мс)
   lavaLastMs = millis();
 
   float lavaT = millis() / 1000.f;
@@ -1823,17 +1821,16 @@ void handleStatus() {
 // _currentClient и приведёт к мусорному ответу или Stack Overflow.
 // Браузер выдерживает 4 сек без проблем (HTTP-таймаут >> 4 сек).
 void handleScanWifi() {
-  int n = WiFi.scanComplete();
-  if (n == WIFI_SCAN_FAILED || n == WIFI_SCAN_RUNNING) {
-    WiFi.scanDelete();
-    WiFi.scanNetworks(true);  // async=true — сканирование в фоне
-    uint32_t t0 = millis();
-    while (WiFi.scanComplete() < 0 && millis() - t0 < 4000) {
-      dnsServer.processNextRequest(); // captive-portal DNS — лёгкий, не реентерантен
-      delay(100);
-    }
-    n = WiFi.scanComplete();
+  // НЗ-6: всегда запускаем свежее сканирование, чтобы повторный запрос из UI
+  // не возвращал кэшированный (и потенциально устаревший) список сетей.
+  WiFi.scanDelete();
+  WiFi.scanNetworks(true);  // async=true — сканирование в фоне
+  uint32_t t0 = millis();
+  while (WiFi.scanComplete() < 0 && millis() - t0 < 4000) {
+    dnsServer.processNextRequest(); // captive-portal DNS — лёгкий, не реентерантен
+    delay(100);
   }
+  int n = WiFi.scanComplete();
   JsonDocument doc;
   JsonArray arr = doc["networks"].to<JsonArray>();
   if (n > 0) {
@@ -1855,7 +1852,10 @@ void handleScanWifi() {
 void handleConnectWifi() {
   if (!server.hasArg("plain")) { server.send(400); return; }
   JsonDocument doc;
-  deserializeJson(doc, server.arg("plain"));
+  if (deserializeJson(doc, server.arg("plain"))) {        // НЗ-4: невалидный JSON → 400
+    server.send(400, "application/json", "{\"error\":\"invalid json\"}");
+    return;
+  }
   const char* ssid = doc["ssid"] | "";
   const char* pass = doc["password"] | "";
   if (strlen(ssid) == 0) {
@@ -1944,7 +1944,10 @@ void handleDisconnectWifi() {
 void handlePostWifi() {
   if (!server.hasArg("plain")) { server.send(400); return; }
   JsonDocument doc;
-  deserializeJson(doc, server.arg("plain"));
+  if (deserializeJson(doc, server.arg("plain"))) {        // НЗ-4: невалидный JSON → 400
+    server.send(400, "application/json", "{\"error\":\"invalid json\"}");
+    return;
+  }
   const char* ssid = doc["ssid"] | "";
   const char* pass = doc["password"] | "";
   if (strlen(ssid) == 0) {
