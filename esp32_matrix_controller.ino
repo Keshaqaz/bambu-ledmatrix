@@ -630,7 +630,7 @@ void showFire() {
       // Охлаждение
       float cool = 0.012f + (float)y / FH * 0.022f + fCool[y*FW+x] * 0.008f;
       if (random(1000) < 4) cool += 0.7f * random(100) / 100.f;
-      fB[y*FW+x] = constrain(sum * rk - cool, 0, 1);
+      fW2[y*FW+x] = constrain(sum * rk - cool, 0, 1);
     }
   }
 
