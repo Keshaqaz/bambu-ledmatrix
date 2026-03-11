@@ -2027,16 +2027,22 @@ void showConnecting() {
   FastLED.show();
 }
 
-// macOS Ventura/Sonoma показывает «Сбой подключения» если AP работает
+// macOS Tahoe/Ventura/Sonoma показывает «Сбой подключения» если AP работает
 // в режиме WPA/WPA2-mixed (дефолт WiFi.softAP) или без PMF.
-// Эта функция вызывается ПОСЛЕ softAP() и переключает AP на WPA2-PSK + PMF capable.
-// PMF required=false сохраняет совместимость со старыми Android/Windows-клиентами.
+// Строим конфиг с нуля (не get+patch): get_config может вернуть ssid_len=0,
+// тогда set_config поднимает AP с пустым SSID — невидимым для всех клиентов.
 static void applyAPSecurityConfig() {
   wifi_config_t ap_cfg;
-  esp_wifi_get_config(WIFI_IF_AP, &ap_cfg);
-  ap_cfg.ap.authmode          = WIFI_AUTH_WPA2_PSK; // только WPA2, не mixed
-  ap_cfg.ap.pmf_cfg.capable   = true;               // PMF поддерживается (нужен macOS)
-  ap_cfg.ap.pmf_cfg.required  = false;              // не обязателен (старые клиенты)
+  memset(&ap_cfg, 0, sizeof(ap_cfg));
+  strlcpy((char*)ap_cfg.ap.ssid,     AP_NAME, sizeof(ap_cfg.ap.ssid));
+  strlcpy((char*)ap_cfg.ap.password, AP_PASS, sizeof(ap_cfg.ap.password));
+  ap_cfg.ap.ssid_len        = (uint8_t)strlen(AP_NAME);
+  ap_cfg.ap.channel         = 6;
+  ap_cfg.ap.max_connection  = 4;
+  ap_cfg.ap.beacon_interval = 100;
+  ap_cfg.ap.authmode           = WIFI_AUTH_WPA2_PSK; // только WPA2, не mixed
+  ap_cfg.ap.pmf_cfg.capable    = true;               // PMF capable (нужен macOS)
+  ap_cfg.ap.pmf_cfg.required   = false;              // не обязателен (старые клиенты)
   esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
 }
 
