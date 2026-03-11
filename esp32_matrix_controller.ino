@@ -280,12 +280,12 @@ void drawStr3(int x, int y, const char* s, CRGB col, uint8_t font) {
   while ((cp = utf8Next(p)) != -1) {
     if (!first) cx++;
     first = false;
-    // Кириллические codepoints U+0410–U+044F → индексы 0–62 для F_EXT
-    // Цифры, латиница, спецсимволы — передаём raw (< 0x80)
     int ei;
-    if (cp >= 0x0410 && cp <= 0x044F) ei = cp - 0x0410;  // А=0 … я=62
-    else if (cp > 0xFF) ei = -1;                           // неизвестный → skip
-    else ei = cp;
+    // F_EXT раскладка: Latin A-Z = [0-25], Кириллица А-Я = [26-57], !?.,: = [58-62]
+    if      (cp >= 0x0410 && cp <= 0x042F) ei = 26 + (cp - 0x0410); // А-Я → F_EXT[26-57]
+    else if (cp >= 0x0430 && cp <= 0x044F) ei = 26 + (cp - 0x0430); // а-я → те же глифы
+    else if (cp <= 0x7F)                   ei = extIdx((char)cp);    // ASCII → через extIdx
+    else                                   ei = -1;                   // неизвестный → пропуск
     if (ei != -1) drawGlyph3(cx, y, ei, col, font);
     cx += 3;
   }
