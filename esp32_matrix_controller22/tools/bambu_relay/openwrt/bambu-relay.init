@@ -1,0 +1,54 @@
+#!/bin/sh /etc/rc.common
+
+USE_PROCD=1
+START=95
+STOP=10
+
+SERVICE_NAME="bambu-relay"
+PYTHON="/usr/bin/python3"
+SCRIPT="/root/bambu_relay.py"
+CONFIG="/root/bambu_relay.conf"
+
+load_relay_config() {
+  [ -f "$CONFIG" ] && . "$CONFIG"
+
+  : "${BAMBU_RELAY_HOST:=0.0.0.0}"
+  : "${BAMBU_RELAY_PORT:=8787}"
+  : "${BAMBU_MQTT_HOST:=us.mqtt.bambulab.com}"
+  : "${BAMBU_MQTT_PORT:=8883}"
+  : "${BAMBU_MQTT_USERNAME:=bblp}"
+}
+
+start_service() {
+  load_relay_config
+
+  [ -x "$PYTHON" ] || {
+    echo "$SERVICE_NAME: missing python at $PYTHON"
+    return 1
+  }
+  [ -f "$SCRIPT" ] || {
+    echo "$SERVICE_NAME: missing relay script at $SCRIPT"
+    return 1
+  }
+  [ -n "$BAMBU_PRINTER_SERIAL" ] || {
+    echo "$SERVICE_NAME: BAMBU_PRINTER_SERIAL is required in $CONFIG"
+    return 1
+  }
+
+  procd_open_instance
+  procd_set_param command /bin/sh -c \
+    ". \"$CONFIG\"; \
+     export BAMBU_PRINTER_SERIAL BAMBU_RELAY_HOST BAMBU_RELAY_PORT BAMBU_RELAY_KEY \
+            BAMBU_CLOUD_TOKEN BAMBU_CLOUD_UID BAMBU_PRINTER_HOST BAMBU_PRINTER_ACCESS_CODE \
+            BAMBU_MQTT_HOST BAMBU_MQTT_PORT BAMBU_MQTT_USERNAME; \
+     exec \"$PYTHON\" \"$SCRIPT\""
+
+  procd_set_param respawn 3600 5 5
+  procd_set_param stdout 1
+  procd_set_param stderr 1
+  procd_close_instance
+}
+
+service_triggers() {
+  procd_add_reload_trigger "$SERVICE_NAME"
+}

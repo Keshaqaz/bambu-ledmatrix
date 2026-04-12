@@ -1,0 +1,24 @@
+# macOS / local editor metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# PlatformIO / firmware build artifacts
+.pio/
+*.bin
+*.elf
+*.map
+*.o
+*.d
+*.a
+
+# Python helper/test artifacts
+__pycache__/
+*.py[cod]
+
+# Local assistant/tooling state
+.claude/
+
+# Temporary files
+*.tmp
+*.bak

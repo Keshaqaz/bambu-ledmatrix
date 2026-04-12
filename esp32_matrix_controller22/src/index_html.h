@@ -1,0 +1,588 @@
+#pragma once
+
+static const char INDEX_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
+<html lang="ru"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LED Matrix</title>
+<style>
+:root{--bg:#111010;--panel:#1a1816;--card:#201e1b;--border:#2e2a24;--border2:#3d3830;
+  --glow:#e8720c;--text:#e8ddd0;--muted:#6b6054;--muted2:#998880;--green:#4caf7d;--red:#d45656;
+  --cyan:#58bfd0;--cyan-dim:#24373d;--amber:#f0a644;--amber-dim:#3f2a12;--steel:#c6b7a6;--sky:#7cc6d8;}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:
+  radial-gradient(circle at top, rgba(232,114,12,.09), transparent 26%),
+  radial-gradient(circle at 100% 0, rgba(88,191,208,.07), transparent 24%),
+  linear-gradient(180deg,#110f0e,#141210 42%,#0f0e0d 100%);
+  color:var(--text);font-family:system-ui,sans-serif;min-height:100vh}
+.shell{max-width:560px;margin:0 auto;padding:0 14px 40px}
+header{padding:16px 0 12px;margin-bottom:18px}
+.hero{position:relative;overflow:hidden;padding:16px;border:1px solid rgba(255,255,255,.06);border-radius:18px;
+  background:
+  radial-gradient(circle at 0 0, rgba(232,114,12,.14), transparent 28%),
+  radial-gradient(circle at 100% 0, rgba(88,191,208,.12), transparent 24%),
+  linear-gradient(180deg, rgba(32,28,24,.92), rgba(22,20,18,.97));
+  box-shadow:0 18px 36px rgba(0,0,0,.22), inset 0 1px 0 rgba(255,255,255,.04)}
+.hero::after{content:'';position:absolute;inset:auto -10% -18% 18%;height:80px;background:radial-gradient(circle, rgba(255,255,255,.06), transparent 60%);pointer-events:none}
+.hero-top{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:14px}
+.brand-kicker{font-size:.62rem;letter-spacing:.24em;text-transform:uppercase;color:#c49b71;margin-bottom:6px}
+h1{font-size:1.12rem;font-weight:800;letter-spacing:.12em;color:#fff}
+.brand-sub{margin-top:5px;font-size:.78rem;color:var(--muted2);max-width:270px;line-height:1.35}
+.hero-status{display:flex;flex-direction:column;gap:8px;align-items:stretch;min-width:168px}
+.statpill{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border:1px solid rgba(255,255,255,.06);border-radius:12px;
+  background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.015));font-size:.76rem;color:var(--muted2)}
+.statpill strong{display:block;font-size:.68rem;letter-spacing:.14em;text-transform:uppercase;color:#b09174;margin-bottom:2px}
+.statpill span:last-child{font-size:.84rem;color:var(--text)}
+.statpill.netpill{border-color:rgba(88,191,208,.18);background:linear-gradient(180deg,rgba(88,191,208,.1),rgba(88,191,208,.03))}
+.statpill.netpill strong{color:#7ecedd}
+.statpill.bambupill{border-color:rgba(240,166,68,.18);background:linear-gradient(180deg,rgba(240,166,68,.1),rgba(240,166,68,.03))}
+.statpill.bambupill strong{color:#f0b96f}
+.hstats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.meter{position:relative;padding:12px 12px 11px;border:1px solid rgba(255,255,255,.06);border-radius:14px;
+  background:linear-gradient(180deg,rgba(255,255,255,.035),rgba(255,255,255,.015))}
+.meter::before{content:'';position:absolute;inset:0 auto 0 0;width:3px;border-radius:14px 0 0 14px;background:rgba(255,255,255,.08)}
+.meter.temp::before{background:linear-gradient(180deg,#f0a644,#d66a27)}
+.meter.cpu::before{background:linear-gradient(180deg,#58bfd0,#317ea6)}
+.meter.time::before{background:linear-gradient(180deg,#4caf7d,#2f7f59)}
+.meter label{display:block;font-size:.62rem;letter-spacing:.16em;text-transform:uppercase;color:#9f8c7e;margin-bottom:6px}
+.meter span{display:block;font-size:1rem;font-weight:700;color:#fff}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--border2);margin-right:4px}
+.dot.on{background:var(--green);box-shadow:0 0 6px var(--green)}
+.tabs{display:grid;grid-template-columns:repeat(2,1fr);gap:5px;margin-bottom:14px}
+.tab{padding:8px 4px;border:1px solid var(--border);background:var(--card);color:var(--muted2);
+  font-size:.8rem;font-weight:600;border-radius:8px;cursor:pointer;transition:.2s;text-align:center}
+.tab.active{background:rgba(232,114,12,.1);border-color:var(--glow);color:var(--glow)}
+.subtabs{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-bottom:12px}
+.subtab{padding:9px 8px;border:1px solid var(--border2);background:linear-gradient(180deg,rgba(255,255,255,.02),rgba(0,0,0,.02));
+  color:var(--muted2);font-size:.74rem;font-weight:700;border-radius:10px;cursor:pointer;transition:.2s;text-align:center;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.02)}
+.subtab.active{background:linear-gradient(180deg,rgba(232,114,12,.16),rgba(232,114,12,.05));border-color:var(--glow);color:var(--glow);box-shadow:0 0 0 1px rgba(232,114,12,.12),0 8px 18px rgba(0,0,0,.18)}
+.section{display:none}.section.visible{display:block}
+.subsection{display:none}.subsection.visible{display:block;animation:subFade .22s ease}
+@keyframes subFade{from{opacity:.0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+.syncbar{margin:-2px 0 14px;padding:10px 12px 10px 36px;border:1px solid var(--border);border-radius:12px;
+  background:linear-gradient(180deg,rgba(255,255,255,.025),rgba(255,255,255,.01));font-size:.78rem;color:var(--muted2);transition:.2s;
+  position:sticky;top:8px;z-index:8;backdrop-filter:blur(8px)}
+.syncbar::before{content:'';position:absolute;left:13px;top:50%;transform:translateY(-50%);width:10px;height:10px;border-radius:50%;
+  background:var(--muted);box-shadow:0 0 0 3px rgba(255,255,255,.03)}
+.syncbar.saving{border-color:rgba(232,114,12,.35);color:var(--glow);box-shadow:0 10px 20px rgba(0,0,0,.18),inset 0 1px 0 rgba(255,255,255,.03)}
+.syncbar.saving::before{background:var(--glow);box-shadow:0 0 0 4px rgba(232,114,12,.12),0 0 12px rgba(232,114,12,.45);animation:syncPulse .85s ease-in-out infinite}
+.syncbar.saved{border-color:rgba(76,175,125,.35);color:var(--green);box-shadow:0 10px 20px rgba(0,0,0,.14)}
+.syncbar.saved::before{background:var(--green);box-shadow:0 0 0 4px rgba(76,175,125,.12),0 0 10px rgba(76,175,125,.35)}
+.syncbar.error{border-color:rgba(212,86,86,.4);color:var(--red);box-shadow:0 10px 20px rgba(0,0,0,.14)}
+.syncbar.error::before{background:var(--red);box-shadow:0 0 0 4px rgba(212,86,86,.12),0 0 10px rgba(212,86,86,.35)}
+@keyframes syncPulse{0%,100%{transform:translateY(-50%) scale(.92)}50%{transform:translateY(-50%) scale(1.12)}}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:11px}
+.card::before{content:'';display:block;height:1px;background:linear-gradient(90deg,transparent,rgba(232,114,12,.2),transparent);margin:-16px -16px 13px}
+.net-card{background:
+  radial-gradient(circle at 88% 14%, rgba(88,191,208,.12), transparent 30%),
+  linear-gradient(180deg, rgba(13,29,32,.85), rgba(26,24,22,.98));
+  border-color:rgba(88,191,208,.2)}
+.net-card::before{background:linear-gradient(90deg,transparent,rgba(88,191,208,.32),transparent)}
+.net-card .ct{color:#88d9e6}
+.net-card .si{background:linear-gradient(180deg,rgba(17,31,34,.94),rgba(24,24,22,.96));border-color:rgba(88,191,208,.14)}
+.net-card .sv{color:#8fe5f1}
+.net-card .sv.a{color:#d3f4f8}
+.net-card .sv.p{color:#6ed0df}
+.bambu-card{background:
+  radial-gradient(circle at 88% 12%, rgba(240,166,68,.12), transparent 28%),
+  linear-gradient(180deg, rgba(39,25,14,.92), rgba(28,23,20,.98));
+  border-color:rgba(240,166,68,.18)}
+.bambu-card::before{background:linear-gradient(90deg,transparent,rgba(240,166,68,.32),transparent)}
+.bambu-card .ct{color:#f0b463}
+.bambu-card .mini{color:#c9a37a}
+.bambu-card .hint{background:linear-gradient(180deg,rgba(240,166,68,.09),rgba(240,166,68,.04));border-color:rgba(240,166,68,.18)}
+.bambu-card .btn-sec{border-color:rgba(240,166,68,.24)}
+.display-card{background:
+  radial-gradient(circle at 88% 12%, rgba(198,183,166,.1), transparent 28%),
+  linear-gradient(180deg, rgba(34,31,28,.95), rgba(24,22,20,.98));
+  border-color:rgba(198,183,166,.16)}
+.display-card::before{background:linear-gradient(90deg,transparent,rgba(198,183,166,.3),transparent)}
+.display-card .ct{color:#d8cabc}
+.display-card .mini{color:#b4a394}
+.display-card .sr.is-disabled{opacity:.38}
+.display-card .vb{color:#f3dec2}
+.weather-card{background:
+  radial-gradient(circle at 88% 12%, rgba(124,198,216,.12), transparent 30%),
+  linear-gradient(180deg, rgba(18,31,36,.94), rgba(23,22,21,.98));
+  border-color:rgba(124,198,216,.18)}
+.weather-card::before{background:linear-gradient(90deg,transparent,rgba(124,198,216,.32),transparent)}
+.weather-card .ct{color:#9edbe8}
+.weather-card .mini{color:#9bc4cc}
+.weather-card .btn-sec{border-color:rgba(124,198,216,.24)}
+.weather-card .vb{color:#aee8f3}
+.section-lead{margin:-3px 0 12px;padding:10px 12px;border:1px dashed var(--border2);border-radius:10px;font-size:.78rem;color:var(--muted2)}
+.net-card .section-lead{border-color:rgba(88,191,208,.24);background:rgba(88,191,208,.045);color:#9ddde6}
+.bambu-card .section-lead{border-color:rgba(240,166,68,.22);background:rgba(240,166,68,.05);color:#dfbc8f}
+.display-card .section-lead{border-color:rgba(198,183,166,.2);background:rgba(198,183,166,.045);color:#d2c2b1}
+.weather-card .section-lead{border-color:rgba(124,198,216,.22);background:rgba(124,198,216,.05);color:#a9deea}
+.ct{font-size:.58rem;letter-spacing:.18em;color:var(--muted2);text-transform:uppercase;margin-bottom:12px}
+.field{margin-bottom:10px}.field:last-child{margin-bottom:0}
+label{display:block;font-size:.73rem;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--muted2);margin-bottom:4px}
+input[type=text],input[type=password],input[type=number],input[type=color],select{width:100%;padding:8px 11px;
+  background:var(--panel);border:1px solid var(--border2);border-radius:7px;color:var(--text);
+  font-size:.83rem;outline:none;transition:.2s}
+input[type=color]{padding:4px;height:38px}
+input:focus,select:focus{border-color:var(--glow)}
+select option{background:var(--panel)}
+.sr{display:flex;align-items:center;gap:9px}
+.sr.is-disabled{opacity:.45}
+input[type=range]{flex:1;-webkit-appearance:none;height:4px;border-radius:2px;background:var(--border2)}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:17px;height:17px;border-radius:50%;
+  background:var(--glow);cursor:pointer;box-shadow:0 0 7px var(--glow);border:2px solid var(--card)}
+.vb{min-width:40px;text-align:center;padding:3px 6px;background:var(--panel);
+  border:1px solid var(--border2);border-radius:6px;font-size:.76rem;color:var(--glow)}
+.sr input.vb[type=number]{flex:0 0 56px;width:56px;min-width:56px;padding:3px 6px;text-align:center}
+.sr input.vb[type=number]::-webkit-outer-spin-button,
+.sr input.vb[type=number]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+.sr input.vb[type=number]{appearance:textfield;-moz-appearance:textfield}
+.tr{display:flex;align-items:center;justify-content:space-between;padding:3px 0;gap:12px}
+.tl{font-size:.84rem;font-weight:500}
+.tog{position:relative;width:42px;height:22px;flex-shrink:0}
+.tog input{opacity:0;width:0;height:0}
+.ts{position:absolute;inset:0;background:var(--border2);border-radius:11px;cursor:pointer;transition:.3s}
+.ts::before{content:'';position:absolute;width:16px;height:16px;left:3px;top:3px;
+  background:var(--muted2);border-radius:50%;transition:.3s}
+.tog input:checked+.ts{background:rgba(232,114,12,.3);border:1px solid var(--glow)}
+.tog input:checked+.ts::before{transform:translateX(20px);background:var(--glow)}
+.mg{display:grid;grid-template-columns:1fr 1fr;gap:7px}
+.mb{padding:11px 8px;border:1px solid var(--border2);border-radius:9px;background:var(--panel);
+  color:var(--muted2);font-size:.82rem;font-weight:600;cursor:pointer;text-align:center;transition:.2s}
+.mb:hover{border-color:var(--glow);color:var(--text)}
+.mb.active{border-color:var(--glow);background:rgba(232,114,12,.1);color:var(--glow)}
+.mb .mi{font-size:1.15rem;display:block;margin-bottom:3px}
+.fb{padding:9px 6px;border:1px solid var(--border2);border-radius:9px;background:var(--panel);
+  color:var(--muted2);font-size:.8rem;font-weight:600;cursor:pointer;text-align:center;transition:.2s;
+  display:flex;flex-direction:column;align-items:center;gap:3px}
+.fb:hover{border-color:var(--glow);color:var(--text)}
+.fb.active{border-color:var(--glow);background:rgba(232,114,12,.1);color:var(--glow)}
+.hint{background:rgba(232,114,12,.06);border:1px solid rgba(232,114,12,.18);border-radius:10px;
+  padding:10px 14px;display:flex;align-items:center;gap:10px;font-size:.82rem;color:var(--muted2);margin-bottom:11px}
+.hint strong{color:var(--text)}
+.ctx{margin-top:0}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:7px}
+.sg{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+.si{background:var(--panel);border:1px solid var(--border);border-radius:9px;padding:11px}
+.sl{font-size:.63rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:4px}
+.sv{font-size:1.05rem;color:var(--glow)}
+.sv.a{color:#f59e0b}.sv.p{color:#c98a5a}
+.btn-save{width:100%;padding:12px;background:linear-gradient(135deg,rgba(232,114,12,.16),rgba(232,114,12,.05));
+  border:1px solid var(--glow);border-radius:10px;color:var(--glow);font-size:.72rem;font-weight:700;
+  letter-spacing:.15em;text-transform:uppercase;cursor:pointer;margin-top:6px;transition:.2s}
+.btn-save:hover{box-shadow:0 0 18px rgba(232,114,12,.3)}
+.btn-sec{width:100%;padding:9px;background:transparent;border:1px solid var(--border2);
+  border-radius:8px;color:var(--muted2);font-size:.82rem;font-weight:600;cursor:pointer;transition:.2s;margin-top:7px}
+.btn-sec:hover{color:var(--text);border-color:var(--glow)}
+.btn-mini{padding:7px 10px;background:transparent;border:1px solid var(--border2);border-radius:8px;
+  color:var(--muted2);font-size:.74rem;font-weight:600;cursor:pointer;transition:.2s}
+.btn-mini:hover{color:var(--text);border-color:var(--glow)}
+.toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%) translateY(18px);
+  background:var(--card);border:1px solid var(--glow);color:var(--glow);padding:9px 20px;
+  border-radius:8px;font-size:.78rem;opacity:0;transition:all .3s;pointer-events:none;z-index:99}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.wbanner{background:rgba(232,114,12,.08);border:1px solid rgba(232,114,12,.3);border-radius:12px;
+  padding:14px 16px;margin-bottom:16px;text-align:center;font-size:.85rem;color:var(--muted2)}
+.wbanner b{color:var(--glow)}
+.wbanner .arrow{cursor:pointer;text-decoration:underline;color:var(--glow)}
+.net{padding:10px 12px;border:1px solid var(--border2);border-radius:8px;margin-bottom:5px;
+  cursor:pointer;display:flex;justify-content:space-between;align-items:center;transition:.2s;font-size:.82rem}
+.net:hover{border-color:var(--glow);background:rgba(232,114,12,.05)}
+.net.sel{border-color:var(--glow);background:rgba(232,114,12,.1)}
+.net .nm{font-weight:600;color:var(--text)}.net .lock{margin-right:4px;font-size:.7rem}
+.net .sig{color:var(--muted);font-family:monospace;font-size:.72rem}
+.spin{display:inline-block;animation:sp .8s linear infinite}@keyframes sp{to{transform:rotate(360deg)}}
+.conn-ok{color:var(--green);font-weight:600;font-size:.85rem;padding:8px 0}
+.conn-fail{color:var(--red);font-size:.82rem;padding:8px 0}
+.pass-wrap{position:relative}
+.pass-wrap input{padding-right:36px}
+.eye{position:absolute;right:8px;top:50%;transform:translateY(-50%);cursor:pointer;font-size:.9rem;user-select:none;opacity:.5}
+.eye:hover{opacity:1}
+.color-row{display:grid;grid-template-columns:1fr 48px;gap:8px;align-items:center;margin-bottom:8px}
+.color-row:last-child{margin-bottom:0}
+.mini{font-size:.75rem;color:var(--muted2)}
+@media (max-width:520px){
+  .mg,.g2,.sg{grid-template-columns:1fr}
+  .tabs{grid-template-columns:repeat(2,1fr)}
+  .subtabs{display:flex;gap:8px;overflow-x:auto;scroll-snap-type:x proximity;padding:2px 2px 8px;margin:0 -2px 12px;scrollbar-width:none}
+  .subtabs::-webkit-scrollbar{display:none}
+  .subtab{flex:0 0 auto;min-width:104px;scroll-snap-align:start}
+  .syncbar{top:6px}
+  .hero-top{flex-direction:column}
+  .hero-status{width:100%;min-width:0}
+  .hstats{grid-template-columns:1fr}
+  .brand-sub{max-width:none}
+}
+</style></head><body>
+<div class="shell">
+<header>
+  <div class="hero">
+    <div class="hero-top">
+      <div class="brand">
+        <div class="brand-kicker">Matrix Controller</div>
+        <h1>LED MATRIX</h1>
+        <div class="brand-sub">Панель управления матрицей, погодой, сетью и статусом печати в одном интерфейсе.</div>
+      </div>
+      <div class="hero-status">
+        <div class="statpill netpill">
+          <div><strong>Сеть</strong><span id="wstat">—</span></div>
+          <span><span class="dot" id="wdot"></span></span>
+        </div>
+        <div class="statpill bambupill">
+          <div><strong>Принтер</strong><span id="bstat">Bambu: —</span></div>
+          <span><span class="dot" id="bdot"></span></span>
+        </div>
+      </div>
+    </div>
+    <div class="hstats">
+      <div class="meter temp"><label>Температура</label><span id="htemp">—</span></div>
+      <div class="meter cpu"><label>CPU</label><span id="hcpu">—</span></div>
+      <div class="meter time"><label>Локальное время</label><span id="htime">—</span></div>
+    </div>
+  </div>
+</header>
+
+<div class="tabs">
+  <button class="tab active" data-tab="modes" onclick="showTab('modes')">⊞ Режим</button>
+  <button class="tab" data-tab="settings" onclick="showTab('settings')">🧩 Настройки</button>
+</div>
+<div class="syncbar" id="saveState">Изменения сохраняются автоматически</div>
+
+<div id="apBanner" class="wbanner" style="display:none">
+  📡 Точка доступа <b>ESP32-Matrix</b><br>
+  <span style="font-size:.78rem">Выберите сеть в разделе <span class="arrow" onclick="showTab('settings');showSettingsSub('network')">🧩 Настройки</span></span>
+</div>
+
+<div id="tab-modes" class="section visible">
+  <div class="card">
+    <div class="ct">Режим отображения</div>
+    <div class="mg">
+      <button class="mb active" data-m="6" onclick="setMode(6)"><span class="mi">🧭</span>Часы + темп</button>
+      <button class="mb" data-m="2" onclick="setMode(2)"><span class="mi">🔥</span>Огонь</button>
+      <button class="mb" data-m="4" onclick="setMode(4)"><span class="mi">🌊</span>Плазма</button>
+      <button class="mb" data-m="5" onclick="setMode(5)"><span class="mi">🫧</span>Лава</button>
+    </div>
+  </div>
+
+  <div class="ctx" id="ctx-clocktemp">
+    <div class="card">
+      <div class="ct">Часы + температура</div>
+      <div class="g2">
+        <div class="field"><label>Часы X</label><input type="number" id="ct6ClockX" min="0" max="1"></div>
+        <div class="field"><label>Часы Y</label><input type="number" id="ct6ClockY" min="0" max="11"></div>
+        <div class="field"><label>Темп X</label><input type="number" id="ct6TempX" min="0" max="15"></div>
+        <div class="field"><label>Темп Y</label><input type="number" id="ct6TempY" min="0" max="11"></div>
+      </div>
+      <div class="tr" style="margin-top:8px"><span class="tl">Авто X для температуры</span>
+        <label class="tog"><input type="checkbox" id="ct6TempXAuto" onchange="onCt6TempXAuto()"><span class="ts"></span></label></div>
+    </div>
+    <div class="card">
+      <div class="ct">Цвета строк</div>
+      <div class="color-row"><span class="mini">Цвет часов</span><input type="color" id="ct6ClockColor"></div>
+      <div class="color-row"><span class="mini">Цвет температуры</span><input type="color" id="ct6TempColor"></div>
+      <div class="mini" style="margin-top:8px">Автоцвет по температуре влияет только на температуру. Цвет часов задаётся отдельно всегда.</div>
+    </div>
+  </div>
+
+  <div class="ctx" id="ctx-lava" style="display:none">
+    <div class="card">
+      <div class="ct">Цвет лава-лампы</div>
+      <div class="tr" style="margin-bottom:13px">
+        <span class="tl">Авто-цвет по температуре</span>
+        <label class="tog"><input type="checkbox" id="lavaAuto" checked onchange="onLavaAuto()"><span class="ts"></span></label>
+      </div>
+      <div id="lavaHueWrap">
+        <div class="field" style="margin-bottom:0"><label>Оттенок</label>
+          <div class="sr"><input type="range" id="lavaHue" min="0" max="359" value="15" oninput="sv(this,'svLava')">
+          <input class="vb" type="number" id="svLava" min="0" max="359" value="15" oninput="nv(this,'lavaHue')" onblur="commitNv(this,'lavaHue')"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="tab-settings" class="section">
+  <div class="subtabs">
+    <button class="subtab active" data-subtab="display" onclick="showSettingsSub('display')">⚙ Экран</button>
+    <button class="subtab" data-subtab="network" onclick="showSettingsSub('network')">📡 Сеть</button>
+    <button class="subtab" data-subtab="weather" onclick="showSettingsSub('weather')">🌡 Погода</button>
+    <button class="subtab" data-subtab="bambu" onclick="showSettingsSub('bambu')">🖨 Bambu</button>
+    <button class="subtab" data-subtab="device" onclick="showSettingsSub('device')">🧰 Устройство</button>
+  </div>
+
+  <div id="settings-display" class="subsection visible">
+    <div class="card display-card">
+      <div class="ct">Экран</div>
+      <div class="section-lead">Базовая яркость использует мягкую шкалу 1–255: внизу больше точности для ночного режима.</div>
+      <div class="sr" id="brightnessWrap">
+        <input type="range" id="brightness" min="1" max="255" value="80" oninput="sv(this,'svBr')">
+        <input class="vb" type="number" id="svBr" min="1" max="255" value="80" oninput="nv(this,'brightness')" onblur="commitNv(this,'brightness')">
+      </div>
+    </div>
+    <div class="card display-card">
+      <div class="ct">Авто-яркость</div>
+      <div class="tr"><span class="tl">Включить режим день / ночь</span>
+        <label class="tog"><input type="checkbox" id="autoBrightness" onchange="onAutoBrightness()"><span class="ts"></span></label></div>
+      <div id="autoBrWrap" style="display:none;margin-top:10px">
+        <div class="field"><label>Яркость днём</label>
+          <div class="sr"><input type="range" id="brightnessDay" min="1" max="255" value="80" oninput="sv(this,'svBrDay')">
+          <input class="vb" type="number" id="svBrDay" min="1" max="255" value="80" oninput="nv(this,'brightnessDay')" onblur="commitNv(this,'brightnessDay')"></div></div>
+        <div class="field"><label>Яркость ночью</label>
+          <div class="sr"><input type="range" id="brightnessNight" min="1" max="255" value="20" oninput="sv(this,'svBrNight')">
+          <input class="vb" type="number" id="svBrNight" min="1" max="255" value="20" oninput="nv(this,'brightnessNight')" onblur="commitNv(this,'brightnessNight')"></div></div>
+        <div class="tr"><span class="tl">Использовать рассвет и закат</span>
+          <label class="tog"><input type="checkbox" id="autoBrSunMode" onchange="onSunMode()"><span class="ts"></span></label></div>
+        <div id="manualSunWrap" class="g2" style="margin-top:10px">
+          <div class="field" style="margin-bottom:0"><label>Начало дня</label><input type="number" id="dayStartHour" min="0" max="23"></div>
+          <div class="field" style="margin-bottom:0"><label>Начало ночи</label><input type="number" id="nightStartHour" min="0" max="23"></div>
+        </div>
+        <div id="sunWrap" class="mini" style="display:none;margin-top:10px">Солнце: <strong id="sunStatusTxt">—</strong></div>
+      </div>
+    </div>
+    <div class="card display-card">
+      <div class="ct">Автоцвет температуры</div>
+      <div class="tr" style="margin-bottom:11px">
+        <span class="tl">Авто-цвет по температуре</span>
+        <label class="tog"><input type="checkbox" id="autoColor" checked onchange="onAutoColor()"><span class="ts"></span></label>
+      </div>
+      <div class="mini">Если выключить автоцвет, температура в режиме «Часы + темп» берёт цвет из настроек этого режима.</div>
+    </div>
+    <div class="card display-card">
+      <div class="ct">Время и часы</div>
+      <div style="display:flex;flex-direction:column;gap:9px">
+        <div class="tr"><span class="tl">24-часовой формат</span>
+          <label class="tog"><input type="checkbox" id="use24h" checked><span class="ts"></span></label></div>
+        <div class="tr"><span class="tl">Показывать разделитель :</span>
+          <label class="tog"><input type="checkbox" id="showColon" checked><span class="ts"></span></label></div>
+      </div>
+      <div class="field" style="margin-top:10px"><label>Яркость разделителя</label>
+        <div class="sr"><input type="range" id="colonBright" min="0" max="255" value="90" oninput="sv(this,'svColon')">
+        <input class="vb" type="number" id="svColon" min="0" max="255" value="90" oninput="nv(this,'colonBright')" onblur="commitNv(this,'colonBright')"></div>
+      </div>
+      <div class="g2" style="margin-top:11px">
+        <div class="field" style="margin-bottom:0"><label>NTP сервер</label><input type="text" id="ntpServer" value="pool.ntp.org"></div>
+        <div class="field" style="margin-bottom:0"><label>UTC</label><input type="number" id="tzOffset" value="3" min="-12" max="14" step="0.25"></div>
+      </div>
+    </div>
+    <div class="card display-card">
+      <div class="ct">Ориентация матрицы</div>
+      <div class="mg">
+        <button class="mb active" data-r="0" onclick="setRotation(0)"><span class="mi">⬆</span>0°</button>
+        <button class="mb" data-r="1" onclick="setRotation(1)"><span class="mi">➡</span>90°</button>
+        <button class="mb" data-r="2" onclick="setRotation(2)"><span class="mi">⬇</span>180°</button>
+        <button class="mb" data-r="3" onclick="setRotation(3)"><span class="mi">⬅</span>270°</button>
+      </div>
+      <div class="g2" style="margin-top:10px">
+        <div class="tr" style="border:1px solid var(--border2);border-radius:9px;padding:10px 12px;background:var(--panel)">
+          <span class="tl" style="font-size:.85rem">↔ Горизонталь</span>
+          <label class="tog"><input type="checkbox" id="flipH" onchange="onFlip()"><span class="ts"></span></label>
+        </div>
+        <div class="tr" style="border:1px solid var(--border2);border-radius:9px;padding:10px 12px;background:var(--panel)">
+          <span class="tl" style="font-size:.85rem">↕ Вертикаль</span>
+          <label class="tog"><input type="checkbox" id="flipV" onchange="onFlip()"><span class="ts"></span></label>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="settings-network" class="subsection">
+    <div class="card net-card">
+      <div class="ct">Подключение к WiFi</div>
+      <div class="section-lead">Сканирование, подключение и переключение между домашней сетью и точкой доступа устройства.</div>
+      <div id="wifiStatus" style="margin-bottom:12px"></div>
+      <button class="btn-sec" style="margin-top:0;margin-bottom:12px" id="scanBtn" onclick="scanWifi()">📡 Сканировать сети</button>
+      <div id="netList" style="max-height:220px;overflow-y:auto;margin-bottom:12px"></div>
+      <div class="field"><label>Имя сети (SSID)</label><input type="text" id="ssid" placeholder="Выберите из списка или введите вручную"></div>
+      <div class="field"><label>Пароль</label>
+        <div class="pass-wrap"><input type="password" id="wifiPass" placeholder="Пароль сети">
+          <span class="eye" onclick="togglePass('wifiPass')">👁</span></div></div>
+      <div id="connResult"></div>
+      <button class="btn-save" style="margin-top:8px" id="connBtn" onclick="connectWifi()">⚡ ПОДКЛЮЧИТЬ</button>
+      <button class="btn-sec" id="disconnBtn" style="display:none" onclick="disconnWifi()">✕ Отключиться и забыть сеть</button>
+    </div>
+    <div class="card net-card">
+      <div class="ct">Текущее подключение</div>
+      <div class="sg">
+        <div class="si"><div class="sl">Сеть</div><div class="sv a" id="ssidVal" style="font-size:.85rem">—</div></div>
+        <div class="si"><div class="sl">IP адрес</div><div class="sv" id="ipVal" style="font-size:.85rem">—</div></div>
+        <div class="si"><div class="sl">WiFi сигнал</div><div class="sv p" id="rssiVal">—</div></div>
+        <div class="si"><div class="sl">Режим</div><div class="sv" id="wifiModeVal" style="font-size:.85rem">—</div></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="settings-weather" class="subsection">
+  <div class="card weather-card">
+    <div class="ct">OpenWeatherMap</div>
+    <div class="section-lead">Источник погодных данных для температуры, цвета и автояркости по солнцу.</div>
+    <div class="field"><label>API ключ</label><input type="password" id="apiKey" data-clear="false" placeholder="Вставьте ключ"></div>
+    <div class="tr"><span class="tl">Использовать координаты</span>
+      <label class="tog"><input type="checkbox" id="owmUseCoords" onchange="onOwmCoords()"><span class="ts"></span></label></div>
+    <div id="cityWrap" class="field" style="margin-top:10px"><label>Город</label><input type="text" id="city" value="Moscow"></div>
+    <div id="coordWrap" class="g2" style="display:none;margin-top:10px">
+      <div class="field" style="margin-bottom:0"><label>Широта</label><input type="number" id="owmLat" step="0.0001"></div>
+      <div class="field" style="margin-bottom:0"><label>Долгота</label><input type="number" id="owmLon" step="0.0001"></div>
+    </div>
+  </div>
+  <div class="card weather-card">
+    <div class="ct">Параметры обновления</div>
+    <div class="field" style="margin-bottom:11px"><label>Интервал (мин)</label>
+      <div class="sr"><input type="range" id="updateMin" min="1" max="60" value="10" oninput="sv(this,'svUpd')">
+      <input class="vb" type="number" id="svUpd" min="1" max="60" value="10" oninput="nv(this,'updateMin')" onblur="commitNv(this,'updateMin')"></div>
+    </div>
+    <button class="btn-sec" style="margin-top:0" onclick="requestWeatherRefresh()">🔄 Запросить сейчас</button>
+  </div>
+  </div>
+
+  <div id="settings-bambu" class="subsection">
+  <div class="card bambu-card">
+    <div class="ct">Отображение</div>
+    <div class="tr"><span class="tl">Показывать статус принтера в режиме Часы + темп</span>
+      <label class="tog"><input type="checkbox" id="bambuEnabled"><span class="ts"></span></label></div>
+  </div>
+  <div class="card bambu-card" id="bambuRelayCard">
+    <div class="ct">Источник данных</div>
+    <div class="section-lead">Статус принтера приходит только через relay. ESP больше не ходит напрямую в Bambu Cloud.</div>
+    <div class="field" style="margin-top:10px"><label>Relay URL</label><input type="text" id="bambuRelayUrl" placeholder="http://192.168.1.10:8787/status"></div>
+    <div class="field"><label>Relay Key</label>
+      <div class="pass-wrap"><input type="password" id="bambuRelayKey" placeholder="Необязательный ключ relay" oninput="markSecretEdited('bambuRelayKey','bambuRelayKeyStatus','Будет сохранён новый ключ relay')">
+        <span class="eye" onclick="togglePass('bambuRelayKey')">👁</span></div></div>
+    <div class="mini" id="bambuRelayKeyStatus">—</div>
+  </div>
+  <div class="card bambu-card">
+    <div class="ct">Статус</div>
+    <div class="hint" style="margin-bottom:0"><span>🖨</span><span id="bambuStatus">Bambu выключен</span></div>
+  </div>
+  </div>
+
+  <div id="settings-device" class="subsection">
+  <div class="card">
+    <div class="ct">Статус устройства</div>
+    <div class="sg">
+      <div class="si"><div class="sl">Uptime</div><div class="sv a" id="uptVal">—</div></div>
+      <div class="si"><div class="sl">Память</div><div class="sv" id="heapVal">—</div></div>
+      <div class="si"><div class="sl">CPU</div><div class="sv p" id="cpuVal">—</div></div>
+      <div class="si"><div class="sl">Сеть</div><div class="sv" id="deviceNetVal" style="font-size:.85rem">—</div></div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="ct">Управление устройством</div>
+    <button class="btn-sec" style="color:#e85050;border-color:#e85050" onclick="rebootDevice()">🔄 Перезагрузить устройство</button>
+  </div>
+  </div>
+</div>
+
+</div>
+<div class="toast" id="toastEl"></div>
+
+<script>
+const TABS=['modes','settings'];
+let settingsSub='display';
+const CTX={6:'ctx-clocktemp',5:'ctx-lava'};
+let st={mode:6,lavaHue:15,rotation:0,flipH:false,flipV:false};
+let connBusy=false, scanBusy=false, prevConnResult=0, toastTimer=0;
+let hydrating=false, autosaveReady=false, autosaveTimer=0, autosavePending=false, autosaveRunning=false, autosaveNoticeTimer=0;
+let saveAwaitPersist=false;
+function showTab(t){TABS.forEach(id=>{document.getElementById('tab-'+id).classList.toggle('visible',id===t);document.querySelectorAll('.tab').forEach(btn=>btn.classList.toggle('active',btn.dataset.tab===t));});}
+function showSettingsSub(id){settingsSub=id;let activeBtn=null;document.querySelectorAll('.subtab').forEach(btn=>{const on=btn.dataset.subtab===id;btn.classList.toggle('active',on);if(on)activeBtn=btn;});document.querySelectorAll('.subsection').forEach(el=>el.classList.toggle('visible',el.id==='settings-'+id));if(activeBtn&&window.innerWidth<=520)activeBtn.scrollIntoView({behavior:'smooth',inline:'center',block:'nearest'});}
+function setSaveState(state,msg){const el=document.getElementById('saveState');if(!el)return;el.className='syncbar'+(state?' '+state:'');el.textContent=msg;clearTimeout(autosaveNoticeTimer);if(state==='saved'){autosaveNoticeTimer=setTimeout(()=>{if(!autosaveRunning&&!autosavePending)setSaveState('', 'Автосохранение включено');},1400);}}
+function requestAutoSave(delay=260){if(hydrating)return;saveAwaitPersist=false;clearTimeout(autosaveTimer);if(!autosaveRunning)setSaveState('saving','Сохраняем изменения...');autosaveTimer=setTimeout(flushAutoSave,delay);}
+function setMode(m){st.mode=m;document.querySelectorAll('.mb').forEach(b=>b.classList.toggle('active',+b.dataset.m===m));document.querySelectorAll('.ctx').forEach(p=>p.style.display='none');const c=CTX[m];if(c)document.getElementById(c).style.display='block';if(!hydrating)requestAutoSave(0);}
+function setRotation(r){st.rotation=r;document.querySelectorAll('[data-r]').forEach(b=>b.classList.toggle('active',+b.dataset.r===r));if(!hydrating)requestAutoSave(0);}
+function onFlip(){st.flipH=document.getElementById('flipH').checked;st.flipV=document.getElementById('flipV').checked;}
+function onCt6TempXAuto(){const auto=document.getElementById('ct6TempXAuto').checked;document.getElementById('ct6TempX').disabled=auto;document.getElementById('ct6TempY').disabled=auto;}
+function onLavaAuto(){const a=document.getElementById('lavaAuto').checked;document.getElementById('lavaHueWrap').style.display=a?'none':'block';}
+function onAutoColor(){}
+function onAutoBrightness(){const on=document.getElementById('autoBrightness').checked;document.getElementById('autoBrWrap').style.display=on?'block':'none';document.getElementById('brightness').disabled=on;document.getElementById('brightnessWrap').classList.toggle('is-disabled',on);}
+function onSunMode(){const on=document.getElementById('autoBrSunMode').checked;document.getElementById('manualSunWrap').style.display=on?'none':'grid';document.getElementById('sunWrap').style.display=on?'block':'none';}
+function onOwmCoords(){const on=document.getElementById('owmUseCoords').checked;document.getElementById('cityWrap').style.display=on?'none':'block';document.getElementById('coordWrap').style.display=on?'grid':'none';}
+function sv(el,id){const out=document.getElementById(id);if(!out)return;if('value'in out)out.value=el.value;out.textContent=el.value;}
+function clampSliderValue(raw,range){const min=Number(range.min||0),max=Number(range.max||255);let v=Math.round(Number(raw));if(!Number.isFinite(v))return null;return Math.max(min,Math.min(max,v));}
+function nv(el,rangeId){const range=document.getElementById(rangeId);if(!range||el.value==='')return;const v=clampSliderValue(el.value,range);if(v===null)return;el.value=v;range.value=v;if(!hydrating)requestAutoSave(420);}
+function commitNv(el,rangeId){const range=document.getElementById(rangeId);if(!range)return;if(el.value===''){el.value=range.value;return;}nv(el,rangeId);}
+function setSlider(rangeId,valueId,value){const range=document.getElementById(rangeId);if(!range)return;const v=clampSliderValue(value,range)??range.value;range.value=v;sv(range,valueId);}
+function toast(msg){const el=document.getElementById('toastEl');el.textContent=msg;el.classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.classList.remove('show'),2600);}
+function fmtTime(){const n=new Date();return String(n.getHours()).padStart(2,'0')+':'+String(n.getMinutes()).padStart(2,'0')+':'+String(n.getSeconds()).padStart(2,'0');}
+function togglePass(id){const p=document.getElementById(id);p.type=p.type==='password'?'text':'password';}
+function escapeHtml(s){return String(s??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));}
+function markSecretEdited(id,statusId,msg){const el=document.getElementById(id);if(el.value)el.dataset.clear='false';if(statusId&&el.value)document.getElementById(statusId).textContent=msg||'Будет сохранено новое значение';}
+function rgbToHex(r,g,b){return '#'+[r,g,b].map(v=>Math.max(0,Math.min(255,+v||0)).toString(16).padStart(2,'0')).join('');}
+function hexToRgb(hex){const m=/^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex||'');return m?{r:parseInt(m[1],16),g:parseInt(m[2],16),b:parseInt(m[3],16)}:{r:255,g:128,b:0};}
+async function apiFetch(url,opts={}){const headers=new Headers(opts.headers||{});if(opts.body!==undefined&&!headers.has('Content-Type'))headers.set('Content-Type','application/json');const res=await fetch(url,Object.assign({},opts,{headers}));if(res.status===401)throw new Error('unauthorized');return res;}
+function updateBambuHeader(d){const dot=document.getElementById('bdot'),txt=document.getElementById('bstat');let label='Bambu: выкл',on=false;if(d.bambuPrinterOnline){label='Bambu: активен';on=true;}else if(d.bambuConnected){label='Bambu: relay';}else if(d.bambuEnabled){label='Bambu: нет';}dot.className='dot '+(on?'on':'');txt.textContent=label;}
+function finalizeSecretField(id,statusId,savedText,clearedText){const el=document.getElementById(id);if(!el)return;const status=statusId?document.getElementById(statusId):null;const wasClear=el.dataset&&el.dataset.clear==='true';const hadValue=!!el.value;if(!wasClear&&!hadValue)return;if(wasClear){el.dataset.clear='false';el.value='';if(status)status.textContent=clearedText;return;}el.value='';if(el.dataset)el.dataset.clear='false';if(status)status.textContent=savedText;}
+function afterAutoSaveSuccess(){finalizeSecretField('bambuRelayKey','bambuRelayKeyStatus','Ключ relay сохранён','Ключ relay не задан');}
+async function flushAutoSave(){clearTimeout(autosaveTimer);if(hydrating)return;if(autosaveRunning){autosavePending=true;return;}autosaveRunning=true;setSaveState('saving','Сохраняем изменения...');try{const res=await apiFetch('/api/settings',{method:'POST',body:JSON.stringify(buildSavePayload())});if(!res.ok)throw new Error('Ошибка сохранения');const data=await res.json();afterAutoSaveSuccess();if(data.persistPending){saveAwaitPersist=true;setSaveState('saving','Применено, записываем в память...');}else{saveAwaitPersist=false;setSaveState('saved','Все изменения сохранены');}}catch(e){saveAwaitPersist=false;if(e.message==='cancelled'||e.message==='unauthorized')setSaveState('', 'Автосохранение включено');else setSaveState('error',e.message||'Ошибка сохранения');}finally{autosaveRunning=false;if(autosavePending){autosavePending=false;requestAutoSave(0);}}}
+function bindAutosave(ids,eventName,delay){ids.forEach(id=>{const el=document.getElementById(id);if(el)el.addEventListener(eventName,()=>requestAutoSave(delay));});}
+function initAutoSave(){if(autosaveReady)return;autosaveReady=true;bindAutosave(['use24h','showColon','autoColor','autoBrightness','autoBrSunMode','ct6TempXAuto','owmUseCoords','lavaAuto','flipH','flipV','bambuEnabled'],'change',220);bindAutosave(['ntpServer','tzOffset','dayStartHour','nightStartHour','ct6ClockX','ct6ClockY','ct6TempX','ct6TempY','city','owmLat','owmLon','bambuRelayUrl','bambuRelayKey'],'change',320);bindAutosave(['brightness','brightnessDay','brightnessNight','colonBright','ct6ClockColor','ct6TempColor','updateMin','lavaHue','apiKey'],'input',420);}
+function describeWifiMode(d){if(d.wifi&&d.ap)return 'WiFi + AP';if(d.wifi)return 'WiFi';if(d.ap)return 'AP';return 'Оффлайн';}
+
+async function loadSettings(){
+  hydrating=true;
+  try{const d=await(await apiFetch('/api/settings')).json();
+    st.mode=d.mode??6; st.lavaHue=d.lavaHue??15; setMode(st.mode);
+    setSlider('brightness','svBr',d.brightness??80);
+    document.getElementById('autoColor').checked=d.autoColor!==false; onAutoColor();
+    document.getElementById('use24h').checked=d.use24h!==false; document.getElementById('showColon').checked=d.showColon!==false;
+    setSlider('colonBright','svColon',d.colonBright??90);
+    document.getElementById('ntpServer').value=d.ntpServer||'pool.ntp.org'; document.getElementById('tzOffset').value=d.tzOffset??3;
+    document.getElementById('autoBrightness').checked=!!d.autoBrightness; onAutoBrightness();
+    setSlider('brightnessDay','svBrDay',d.brightnessDay??80);
+    setSlider('brightnessNight','svBrNight',d.brightnessNight??20);
+    document.getElementById('dayStartHour').value=d.dayStartHour??7; document.getElementById('nightStartHour').value=d.nightStartHour??22;
+    document.getElementById('autoBrSunMode').checked=!!d.autoBrSunMode; onSunMode();
+    document.getElementById('ct6ClockX').value=d.ct6ClockX??0; document.getElementById('ct6ClockY').value=d.ct6ClockY??2;
+    const auto=(d.ct6TempX??-1)<0; document.getElementById('ct6TempXAuto').checked=auto; document.getElementById('ct6TempX').value=auto?4:(d.ct6TempX??4); document.getElementById('ct6TempY').value=d.ct6TempY??9; onCt6TempXAuto();
+    document.getElementById('ct6ClockColor').value=rgbToHex(d.ct6ClockR??255,d.ct6ClockG??128,d.ct6ClockB??0); document.getElementById('ct6TempColor').value=rgbToHex(d.ct6TempR??0,d.ct6TempG??200,d.ct6TempB??255);
+    setSlider('updateMin','svUpd',d.updateMin??10);
+    document.getElementById('apiKey').value=''; document.getElementById('city').value=d.city||'Moscow'; document.getElementById('owmLat').value=d.owmLat??0; document.getElementById('owmLon').value=d.owmLon??0; document.getElementById('owmUseCoords').checked=!!d.owmUseCoords; onOwmCoords();
+    document.getElementById('lavaAuto').checked=d.lavaAutoColor!==false; setSlider('lavaHue','svLava',d.lavaHue??15); onLavaAuto();
+    document.getElementById('ssid').value=''; st.rotation=d.rotation??0; setRotation(st.rotation); st.flipH=!!d.flipH; st.flipV=!!d.flipV; document.getElementById('flipH').checked=st.flipH; document.getElementById('flipV').checked=st.flipV;
+    document.getElementById('bambuEnabled').checked=!!d.bambuEnabled; document.getElementById('bambuRelayUrl').value=d.bambuRelayUrl||''; document.getElementById('bambuRelayKey').value='';
+    document.getElementById('bambuRelayKeyStatus').textContent=d.bambuRelayKeySet?'Ключ relay сохранён':'Ключ relay не задан';
+    document.getElementById('bambuStatus').textContent=d.bambuDetail||'Bambu выключен';
+    updateBambuHeader(d);
+    document.getElementById('sunStatusTxt').textContent=d.sunTimeValid?(String(d.sunriseH).padStart(2,'0')+':'+String(d.sunriseM).padStart(2,'0')+' / '+String(d.sunsetH).padStart(2,'0')+':'+String(d.sunsetM).padStart(2,'0')):'—';
+    setSaveState('', 'Автосохранение включено');
+  }catch(e){setSaveState('error','Не удалось загрузить настройки');}
+  finally{hydrating=false;initAutoSave();}}
+
+async function fetchStatus(){
+  try{const d=await(await apiFetch('/api/status')).json();
+    window._temp=d.temp; document.getElementById('wdot').className='dot '+(d.wifi?'on':''); document.getElementById('wstat').textContent=d.wifi?(d.ip||'OK'):(d.ap?'AP':'—');
+    const s=d.temp>-999?((d.temp>=0?'+':'')+d.temp.toFixed(1)+'°C'):'—'; document.getElementById('htemp').textContent=s;
+    const c=d.cpuTemp>-999?d.cpuTemp.toFixed(1)+'°C':'—'; document.getElementById('hcpu').textContent=c; document.getElementById('htime').textContent=fmtTime();
+    document.getElementById('ssidVal').textContent=d.wifi?(d.ssid||'—'):(d.ap?'ESP32-Matrix AP':'—'); document.getElementById('ipVal').textContent=d.ip||'—'; document.getElementById('uptVal').textContent=d.uptime||'—'; document.getElementById('heapVal').textContent=d.heap||'—'; document.getElementById('rssiVal').textContent=d.rssi||'—'; document.getElementById('wifiModeVal').textContent=describeWifiMode(d); document.getElementById('cpuVal').textContent=c; document.getElementById('deviceNetVal').textContent=d.wifi?(d.ip||'WiFi'):describeWifiMode(d);
+    document.getElementById('bambuStatus').textContent=d.bambuDetail||'Bambu выключен';
+    updateBambuHeader(d);
+    if(d.saveError){saveAwaitPersist=false;setSaveState('error','Ошибка записи в память');}
+    else if(saveAwaitPersist&&d.savePending){setSaveState('saving','Применено, записываем в память...');}
+    else if(saveAwaitPersist&&!d.savePending){saveAwaitPersist=false;setSaveState('saved','Изменения записаны в память');}
+    if(d.sunTimeValid!==undefined)document.getElementById('sunStatusTxt').textContent=d.sunTimeValid?(String(d.sunriseH).padStart(2,'0')+':'+String(d.sunriseM).padStart(2,'0')+' / '+String(d.sunsetH).padStart(2,'0')+':'+String(d.sunsetM).padStart(2,'0')):'—';
+    updateWifiUI(d); setConnBusy(d.connResult===1); if(d.connResult!==undefined&&d.connResult!==prevConnResult){prevConnResult=d.connResult; const res=document.getElementById('connResult'); if(d.connResult===2){res.innerHTML='<div class="conn-ok">✅ Подключено! IP: <b>'+(d.connIp||'—')+'</b></div>';toast('✅ WiFi: '+(d.connIp||''));document.getElementById('disconnBtn').style.display='block';}else if(d.connResult===3){const reasons={4:'ошибка подключения',5:'соединение потеряно',6:'соединение разорвано',1:'сеть не найдена'};const reason=d.connStatusText||reasons[d.connStatus]||('Ошибка, код: '+d.connStatus);res.innerHTML='<div class="conn-fail">❌ '+reason+'</div>';}}
+  }catch(e){}}
+
+function buildSavePayload(){const cc=hexToRgb(document.getElementById('ct6ClockColor').value),ct=hexToRgb(document.getElementById('ct6TempColor').value);const payload={
+  mode:st.mode,brightness:+document.getElementById('brightness').value,
+  autoColor:document.getElementById('autoColor').checked,use24h:document.getElementById('use24h').checked,showColon:document.getElementById('showColon').checked,
+  colonBright:+document.getElementById('colonBright').value,ntpServer:document.getElementById('ntpServer').value,
+  tzOffset:+document.getElementById('tzOffset').value,autoBrightness:document.getElementById('autoBrightness').checked,brightnessDay:+document.getElementById('brightnessDay').value,
+  brightnessNight:+document.getElementById('brightnessNight').value,dayStartHour:+document.getElementById('dayStartHour').value,nightStartHour:+document.getElementById('nightStartHour').value,
+  autoBrSunMode:document.getElementById('autoBrSunMode').checked,ct6ClockX:+document.getElementById('ct6ClockX').value,
+  ct6ClockY:+document.getElementById('ct6ClockY').value,ct6TempX:document.getElementById('ct6TempXAuto').checked?-1:+document.getElementById('ct6TempX').value,ct6TempY:+document.getElementById('ct6TempY').value,
+  ct6ClockR:cc.r,ct6ClockG:cc.g,ct6ClockB:cc.b,ct6TempR:ct.r,ct6TempG:ct.g,ct6TempB:ct.b,lavaAutoColor:document.getElementById('lavaAuto').checked,lavaHue:+document.getElementById('lavaHue').value,
+  rotation:st.rotation,flipH:st.flipH,flipV:st.flipV,updateMin:+document.getElementById('updateMin').value,apiKey:document.getElementById('apiKey').value||'***',
+  city:document.getElementById('city').value,owmLat:+document.getElementById('owmLat').value,owmLon:+document.getElementById('owmLon').value,owmUseCoords:document.getElementById('owmUseCoords').checked,
+  bambuEnabled:document.getElementById('bambuEnabled').checked,bambuRelayEnabled:true,bambuRelayUrl:document.getElementById('bambuRelayUrl').value.trim(),bambuRelayKey:document.getElementById('bambuRelayKey').value||'***'
+};return payload;}
+function rssiBar(r){return r>-50?'▂▄▆█':r>-65?'▂▄▆░':r>-75?'▂▄░░':'▂░░░';}
+function setConnBusy(b){connBusy=b;document.getElementById('connBtn').disabled=b||scanBusy;document.getElementById('scanBtn').disabled=b||scanBusy;document.getElementById('connBtn').textContent=b?'⏳ ПОДКЛЮЧЕНИЕ...':'⚡ ПОДКЛЮЧИТЬ';document.getElementById('scanBtn').textContent=scanBusy?'⏳ Сканирование...':'📡 Сканировать сети';}
+function setScanBusy(b){scanBusy=b;setConnBusy(connBusy);}
+async function scanWifi(){if(connBusy||scanBusy)return;const el=document.getElementById('netList');setScanBusy(true);el.innerHTML='';try{let d,tries=0;do{if(tries>0)await new Promise(r=>setTimeout(r,1000));d=await(await apiFetch('/api/scan')).json();tries++;}while(d.scanning&&tries<10);if(d.scanning){el.innerHTML='<div style="text-align:center;color:var(--muted2);padding:14px">Сканирование заняло слишком много времени</div>';return;}if(!d.networks||!d.networks.length){el.innerHTML='<div style="text-align:center;color:var(--muted2);padding:14px">Сети не найдены</div>';return;}const seen=new Set();d.networks.sort((a,b)=>b.rssi-a.rssi).forEach(n=>{if(!n.ssid||seen.has(n.ssid))return;seen.add(n.ssid);const div=document.createElement('div');div.className='net';div.innerHTML='<span>'+(n.enc?'<span class="lock">🔒</span>':'')+'<span class="nm">'+escapeHtml(n.ssid)+'</span></span>'+'<span class="sig">'+rssiBar(n.rssi)+' '+n.rssi+'</span>';div.onclick=()=>{document.getElementById('ssid').value=n.ssid;document.getElementById('wifiPass').value='';el.querySelectorAll('.net').forEach(x=>x.classList.remove('sel'));div.classList.add('sel');document.getElementById('connResult').innerHTML='';};el.appendChild(div);});}catch(e){el.innerHTML='<div style="text-align:center;color:var(--red);padding:14px">Ошибка сканирования</div>';}finally{setScanBusy(false);}}
+async function connectWifi(){if(connBusy||scanBusy)return;const ssid=document.getElementById('ssid').value.trim(),pass=document.getElementById('wifiPass').value;if(!ssid){toast('❌ Введите имя сети');return;}const res=document.getElementById('connResult');res.innerHTML='<span class="spin">⏳</span> Подключение к <b>'+escapeHtml(ssid)+'</b>…';prevConnResult=0;setConnBusy(true);try{const r=await apiFetch('/api/connect',{method:'POST',body:JSON.stringify({ssid,password:pass})});if(!r.ok)throw new Error('connect failed');}catch(e){setConnBusy(false);res.innerHTML='<div class="conn-fail">❌ Нет связи с устройством</div>';}}
+async function disconnWifi(){try{const res=await apiFetch('/api/disconnect',{method:'POST'});if(!res.ok)throw new Error('disconnect_failed');toast('WiFi отключён');document.getElementById('connResult').innerHTML='';document.getElementById('disconnBtn').style.display='none';document.getElementById('ssid').value='';setTimeout(fetchStatus,1000);}catch(e){toast('❌ Не удалось забыть WiFi');}}
+function updateWifiUI(d){const ws=document.getElementById('wifiStatus');const banner=document.getElementById('apBanner');const disc=document.getElementById('disconnBtn');if(d.wifi){ws.innerHTML='<div class="conn-ok">✅ Подключено к <b>'+escapeHtml(d.ssid||'')+'</b> — IP: <b>'+(d.ip||'—')+'</b></div>';banner.style.display='none';disc.style.display='block';}else{ws.innerHTML='<div style="color:var(--muted2);font-size:.83rem">⚠ Не подключено к WiFi'+(d.ap?' · устройство доступно через точку доступа':'')+'</div>';banner.style.display='block';disc.style.display='none';}}
+async function requestWeatherRefresh(){await apiFetch('/api/weather/refresh',{method:'POST',body:'{}'});toast('🔄 Запрос погоды отправлен');setTimeout(fetchStatus,4000);}
+async function rebootDevice(){if(!confirm('Перезагрузить устройство?'))return;try{const res=await apiFetch('/api/reboot',{method:'POST',body:'{}'});if(!res.ok)throw new Error('reboot_failed');toast('🔄 Перезагрузка...');}catch(e){toast('❌ Перезагрузка отменена: запись в память не удалась');}}
+
+showSettingsSub(settingsSub); loadSettings(); fetchStatus(); onAutoColor(); onLavaAuto(); onAutoBrightness(); onSunMode(); onOwmCoords(); setInterval(fetchStatus,3000);
+</script>
+</body></html>)HTML";
