@@ -208,7 +208,7 @@ Last updated: 2026-06-11
   - router copy `/root/bambu_relay.py`
 - Router IP is `192.168.1.1`, matrix is `192.168.1.65`; relay URL in matrix settings is `http://192.168.1.1:8787/status`
 - SSH to the router is password-only (no key installed); deploys need an interactive scp/ssh session
-- As of 2026-06-11 the router copy of relay.py predates `safe_int`/`stage_from_lifecycle`/auth hardening and must be redeployed
+- 2026-06-11: hardened relay.py and the init script were deployed to the router and verified live (`/status`, `/healthz`, matrix polling); `router_bambu_relay_backup_20260611.py` is the pre-deploy router snapshot
 
 ## Good Next Steps
 

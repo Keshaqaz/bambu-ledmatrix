@@ -9,8 +9,6 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import paho.mqtt.client as mqtt
-
 
 def env(name: str, default: str = "") -> str:
     return os.environ.get(name, default)
@@ -63,6 +61,14 @@ def retry_runtime(description: str, func, attempts: int = 24, delay: int = 5):
                 break
             time.sleep(delay)
     raise RuntimeError(f"{description} failed after {attempts} attempts: {last_exc}")
+
+
+
+def safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
 
 
 def callback_reason_code(args, default="unknown"):
@@ -142,6 +148,17 @@ def stage_label(stage_id: int) -> str:
     return labels.get(stage_id, "")
 
 
+def stage_from_lifecycle(lifecycle: str) -> str:
+    labels = {
+        "printing": "printing",
+        "preparing": "preparing",
+        "paused": "paused",
+        "finished": "finished",
+        "error": "error",
+    }
+    return labels.get(lifecycle, "")
+
+
 class RelayState:
     def __init__(self, serial: str, source: str):
         self.lock = threading.Lock()
@@ -172,33 +189,27 @@ class RelayState:
     def _has_printer_report(self) -> bool:
         return self.last_printer_report_at > 0.0
 
+    def _apply_unknown_printer_snapshot(self, payload: dict, detail: str):
+        payload["printerOnline"] = False
+        payload["lifecycle"] = "unknown"
+        payload["progress"] = 0.0
+        payload["status"] = ""
+        payload["stage"] = ""
+        payload["jobName"] = ""
+        payload["currentLayer"] = 0
+        payload["totalLayers"] = 0
+        payload["remainingSeconds"] = 0
+        payload["detail"] = detail
+
     def set_connected(self, connected: bool, detail: str):
         with self.lock:
             self.connected = connected
             self.payload["connected"] = connected
             if connected and not self._has_printer_report():
                 # MQTT broker connectivity does not mean the printer itself is online.
-                self.payload["printerOnline"] = False
-                self.payload["lifecycle"] = "unknown"
-                self.payload["progress"] = 0.0
-                self.payload["status"] = ""
-                self.payload["stage"] = ""
-                self.payload["jobName"] = ""
-                self.payload["currentLayer"] = 0
-                self.payload["totalLayers"] = 0
-                self.payload["remainingSeconds"] = 0
-                self.payload["detail"] = "MQTT подключен, ждём данные принтера"
+                self._apply_unknown_printer_snapshot(self.payload, "MQTT подключен, ждём данные принтера")
             elif not connected and not self._has_printer_report():
-                self.payload["printerOnline"] = False
-                self.payload["lifecycle"] = "unknown"
-                self.payload["progress"] = 0.0
-                self.payload["status"] = ""
-                self.payload["stage"] = ""
-                self.payload["jobName"] = ""
-                self.payload["currentLayer"] = 0
-                self.payload["totalLayers"] = 0
-                self.payload["remainingSeconds"] = 0
-                self.payload["detail"] = detail
+                self._apply_unknown_printer_snapshot(self.payload, detail)
             else:
                 # Keep the last valid printer snapshot across short MQTT reconnects.
                 self.payload["detail"] = detail
@@ -207,7 +218,7 @@ class RelayState:
     def update_from_print(self, print_obj: dict):
         gcode_state = str(print_obj.get("gcode_state", "") or "")
         stage_obj = print_obj.get("stage") if isinstance(print_obj.get("stage"), dict) else {}
-        stage_id = int(stage_obj.get("_id", print_obj.get("stg_cur", -1)) or -1)
+        stage_id = safe_int(stage_obj.get("_id", print_obj.get("stg_cur", -1)), -1)
         stage_name = str(stage_obj.get("name", stage_obj.get("stage", "")) or "")
         progress_raw = print_obj.get("mc_percent", None)
         progress = None
@@ -216,13 +227,13 @@ class RelayState:
                 progress = float(progress_raw)
             except Exception:
                 progress = None
-            if progress is not None and 0.0 <= progress <= 1.0:
+            if progress is not None and 0.0 <= progress < 1.0:
                 progress *= 100.0
         print_error_raw = print_obj.get("print_error", None)
         print_error = 0
         if print_error_raw is not None:
             try:
-                print_error = int(print_error_raw or 0)
+                print_error = safe_int(print_error_raw, 0)
             except Exception:
                 print_error = 0
         hms = print_obj.get("hms")
@@ -234,12 +245,12 @@ class RelayState:
         remaining_seconds = print_obj.get("remaining_seconds", print_obj.get("remainingSeconds", print_obj.get("remaining_time", print_obj.get("remainingTime"))))
         if remaining_minutes is not None:
             try:
-                remaining_seconds = int(remaining_minutes) * 60
+                remaining_seconds = safe_int(remaining_minutes, 0) * 60
             except Exception:
                 remaining_seconds = 0
         else:
             try:
-                remaining_seconds = int(remaining_seconds or 0)
+                remaining_seconds = safe_int(remaining_seconds, 0)
             except Exception:
                 remaining_seconds = 0
 
@@ -270,11 +281,13 @@ class RelayState:
             lifecycle = map_lifecycle(status_text, has_error)
             if lifecycle == "unknown":
                 lifecycle = str(prev.get("lifecycle", "unknown") or "unknown")
+            if (not stage_text or stage_text == "idle") and lifecycle not in ("idle", "unknown"):
+                stage_text = stage_from_lifecycle(lifecycle) or stage_text
             if not job_name:
                 job_name = str(prev.get("jobName", "") or "")
             if remaining_seconds <= 0:
                 try:
-                    remaining_seconds = int(prev.get("remainingSeconds", 0) or 0)
+                    remaining_seconds = safe_int(prev.get("remainingSeconds", 0), 0)
                 except Exception:
                     remaining_seconds = 0
 
@@ -282,6 +295,8 @@ class RelayState:
             if lifecycle == "finished":
                 if prev_lifecycle != "finished" or self.finished_since == 0.0:
                     self.finished_since = time.time()
+                if progress < 100.0:
+                    progress = 100.0
             else:
                 self.finished_since = 0.0
 
@@ -298,8 +313,8 @@ class RelayState:
                 "stage": stage_text,
                 "detail": job_name or stage_text or status_text or "MQTT payload received",
                 "jobName": job_name,
-                "currentLayer": int(print_obj.get("layer_num", prev.get("currentLayer", 0)) or 0),
-                "totalLayers": int(print_obj.get("total_layer_num", prev.get("totalLayers", 0)) or 0),
+                "currentLayer": safe_int(print_obj.get("layer_num", prev.get("currentLayer", 0)), 0),
+                "totalLayers": safe_int(print_obj.get("total_layer_num", prev.get("totalLayers", 0)), 0),
                 "remainingSeconds": remaining_seconds,
                 "updatedAt": int(time.time()),
             })
@@ -320,9 +335,7 @@ class RelayState:
                 payload["stage"] = "idle"
                 payload["detail"] = "idle"
             if self.last_printer_report_at and time.time() - self.last_printer_report_at > 70:
-                payload["printerOnline"] = False
-                payload["lifecycle"] = "unknown"
-                payload["detail"] = "MQTT stale, ждём новое сообщение"
+                self._apply_unknown_printer_snapshot(payload, "MQTT stale, ждём новое сообщение")
             return payload
 
 
@@ -355,6 +368,16 @@ class RelayHandler(BaseHTTPRequestHandler):
 
 def main():
     args = parse_args()
+    try:
+        import paho.mqtt.client as mqtt
+    except ModuleNotFoundError as exc:
+        if exc.name == "paho":
+            raise SystemExit(
+                "Missing dependency: paho-mqtt. Install it with: "
+                "python3 -m pip install -r tools/bambu_relay/requirements.txt"
+            ) from exc
+        raise
+
     cloud_mode = bool(args.cloud_token)
 
     if cloud_mode:
