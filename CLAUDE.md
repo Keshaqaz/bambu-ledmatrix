@@ -26,17 +26,21 @@ User-facing docs: `README.md` (repo map), `esp32_matrix_controller22/README.md`
 - Libraries installed via `arduino-cli lib install`: `FastLED@3.10.3`, `ArduinoJson@7.4.3`
 - PlatformIO is currently broken on this machine: it requires Python ≥3.10, only system 3.9.6 is available. `platformio.ini` is kept for when that is fixed.
 - arduino-cli uses esp32 core 3.3.8. **Core 3.x gotcha:** `NetworkClient::setTimeout()` takes milliseconds (core 2.x, which old PlatformIO builds used, took seconds); `setHandshakeTimeout()` still takes seconds. `setTimeout(8)` = 8 ms killed all weather TLS connections until fixed (commit 932e290). Audit client timeouts when porting code written for core 2.x.
-- **OTA (since 2026-06-11):** `min_spiffs` scheme, two 1.875MB app slots (binary limit 1 966 080 bytes, currently ~69%). The stock `default` scheme is forbidden — its 1.25MB slots don't fit the binary (that's why the original OTA attempt failed). Two upload paths: web UI `/api/update` (multipart, no auth, rejects non-app images via `esp_app_desc_t` magic — catches `merged.bin`) and ArduinoOTA/espota on port 3232 (no password, mDNS off). Bump `FW_VERSION` in `src/app.cpp` per iteration; verify via `/api/status` `fwVersion`/`fwPartition` (slot flips app0↔app1 on every successful OTA).
+- **OTA (since 2026-06-11):** `min_spiffs` scheme, two 1.875MB app slots (binary limit 1 966 080 bytes, currently ~68%). The stock `default` scheme is forbidden — its 1.25MB slots don't fit the binary (that's why the original OTA attempt failed). Two upload paths: web UI `/api/update` (multipart, no auth, rejects non-app images via `esp_app_desc_t` magic — catches `merged.bin`) and ArduinoOTA/espota on port 3232 (no password, mDNS off). Bump `FW_VERSION` in `src/app.cpp` per iteration; verify via `/api/status` `fwVersion`/`fwPartition` (slot flips app0↔app1 on every successful OTA).
 - **arduino-cli gotcha:** `compile --output-dir <dir>` also silently overwrites the sketch-local `build/` export — a test build (e.g. a deliberately crashing one) can poison the `build/.../*.ino.bin` you later OTA. Verify `build/` freshness (or recompile with `--export-binaries`) before uploading.
 - **Boot-guard anti-brick:** NVS namespace `bootguard` counts boots, cleared after 60 s uptime; 3 consecutive failures → `esp_ota_set_boot_partition()` rollback to the other slot (refuses cleanly if that slot is empty/corrupt). Known tradeoff: 3 manual resets within the first 60 s also trigger rollback.
 - ESP32-C3 is single-core: background FreeRTOS tasks and `loop()` time-slice on the same CPU. During OTA `otaInProgress` freezes weatherTask/bambuTask (no TLS handshakes mid flash write) and Wi-Fi power save is switched off.
 
 ## Display / UI State
 
-- Modes kept (numeric ids preserved, removed ids migrate to `6`): `Огонь` (2), `Плазма` (4), `Лава` (5), `Часы + темп` (6)
+- Single display mode: `Часы + темп` (id `6`); fire/plasma/lava render code deleted (freed ~17 KB static RAM), `normalizeMode()` always returns 6. `mode`/`lavaHue`/`showColon`/`colonBright` stay in `Config` for NVS layout only and are forced by `sanitizeLoadedConfig()`
+- Clock colon is gone entirely (drawColon2x2/colonOn deleted, `showColon` forced `false`); `colonBright` is NOT dead — it scales the printer-overlay track brightness, keep it at 90
+- Web UI (since 4.0.0): flat 5-section bottom nav (Экран/Сеть/Погода/Принтер/Система), autosave, secrets via `***` sentinel + `data-clear`; preview mode via `file://` mocks. After editing `src/index_html.h` run `sh tools/export_web_ui.sh`
+- Boot/Wi-Fi/OTA animations: amber ignition ring (`showBoot`), Wi-Fi icon with arcs (`showConnecting`), amber bottom-up progress column + green fill / red cross (`showOtaProgress`/`Done`/`Error`); all draw through `px()` so they follow rotation/flip (snapshot is refreshed in `setup()` before `showBoot`)
 - Only font is `F_MICRO` 3x5; font picker, weather icons, blinking colon, and the `Доступ` settings tab are removed
 - Brightness UI range `1..255` with a quadratic calibration curve before `FastLED.setBrightness()`
 - Legacy `Config` fields (`fontIndex`, `showDegree`, `clockFace`, `webPass`, `apPass`, direct Bambu credentials) exist only for NVS layout compatibility and are sanitized/ignored at runtime
+- **NVS padding gotcha:** new `Config` fields appended into former struct padding don't change `sizeof(Config)`, so old blobs load fine but the new fields read as `0` (not their compiled defaults) — happened with `tzFromWeather`/`weatherProvider` in 4.0.0; fixed by a one-time POST after deploy
 - AP password is fixed to `12345678`; web auth stays disabled
 - `showClockTemp()` owns the printer overlay rendering; overlay glyphs per lifecycle:
   - `preparing`: breathing first green column on gray track
@@ -69,7 +73,10 @@ User-facing docs: `README.md` (repo map), `esp32_matrix_controller22/README.md`
 
 ## Weather
 
-- Primary source OpenWeatherMap, automatic fallback to Open-Meteo; diagnostics (`weatherCode`, `weatherError`, `weatherSource`, `weatherKeyLen`) exposed in `/api/status`
+- Provider selectable via `weatherProvider` (0=auto OWM→Open-Meteo on any failure, 1=OWM only, 2=Open-Meteo only); diagnostics (`weatherCode`, `weatherError`, `weatherSource`, `weatherKeyLen`) exposed in `/api/status`
+- Open-Meteo works by coordinates only; in city mode coords are cached into `cfg.owmLat/Lon` from OWM responses
+- `tzFromWeather` (default on): UTC offset taken from the weather payload (OWM `timezone`, Open-Meteo `utc_offset_seconds` via `timezone=auto`) → `cfg.tzOffset` + `ntpPending`; UI sends manual `tzOffset` only when the toggle is off
+- NTP: `cfg.ntpServer` primary with hardcoded fallbacks `time.google.com` / `time.cloudflare.com` in both `configTime()` call sites
 - Sunrise/sunset is fetched only when `autoBrSunMode` is enabled; otherwise `sunTimeValid` stays `false` by design
 
 ## Operational Notes
