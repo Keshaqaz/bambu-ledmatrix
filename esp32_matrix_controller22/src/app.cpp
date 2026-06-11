@@ -52,15 +52,7 @@ void drawChar3(int x, int y, char c, CRGB col);
 int strW3(const char* s);
 void drawStr3(int x, int y, const char* s, CRGB col);
 CRGB tempToColor(float t);
-bool colonOn();
 void showClockTemp();
-void respawnTongue(int i);
-void fireSetup();
-CRGB fireColor(float v);
-void showFire();
-void showPlasma();
-void lavaSetup();
-void showLava();
 void fetchWeather();
 void fetchSunriseSunset();
 void bambuTask(void* param);
@@ -97,7 +89,7 @@ void loop();
 static constexpr uint16_t CONFIG_VERSION = 332;
 // Версия прошивки: поднимать при каждой OTA-итерации — по смене значения в
 // /api/status видно, что обновление реально применилось.
-static constexpr const char* FW_VERSION = "3.1.0-2026.06.11";
+static constexpr const char* FW_VERSION = "4.0.0-2026.06.11";
 static constexpr uint32_t STORED_STATE_MAGIC = 0x4D415458UL; // MATX
 static constexpr uint16_t STORED_STATE_VERSION = 1;
 static constexpr size_t BAMBU_TOKEN_CAPACITY = 384;
@@ -169,6 +161,8 @@ struct Config {
   bool    ct6ShowWeatherIcon = false; // legacy: настройка удалена, weather-иконки на матрице не рисуются
   uint8_t ct6ClockR  = 255; uint8_t ct6ClockG = 128; uint8_t ct6ClockB = 0;
   uint8_t ct6TempR   = 0;   uint8_t ct6TempG  = 200; uint8_t ct6TempB  = 255;
+  uint8_t weatherProvider = 0;   // 0=авто (OWM → Open-Meteo), 1=только OWM, 2=только Open-Meteo
+  bool    tzFromWeather   = true; // UTC-смещение из ответа погоды (OWM timezone / OM utc_offset_seconds)
   // Новые поля добавлять только в конец struct Config.
   // loadConfig() умеет частичную миграцию по csz, поэтому вставка в середину
   // ломает раскладку байтов старых NVS-конфигов.
@@ -542,6 +536,27 @@ struct RenderSnap {
 };
 static RenderSnap rSnap;
 
+// Снапшот полей рендера из cfg. Вызывать с захваченным cfgMtx. Используется
+// из loop() (раз в 100мс) и из setup() до boot-анимации — иначе px() рисует
+// её с дефолтной ориентацией, игнорируя rotation/flip пользователя.
+static void refreshRenderSnapLocked() {
+  rSnap.rotation       = cfg.rotation;
+  rSnap.flipH          = cfg.flipH;
+  rSnap.flipV          = cfg.flipV;
+  rSnap.autoColor      = cfg.autoColor;
+  rSnap.use24h         = cfg.use24h;
+  rSnap.showColon      = cfg.showColon;
+  rSnap.colonBright    = cfg.colonBright;
+  rSnap.lavaAutoColor  = cfg.lavaAutoColor;
+  rSnap.lavaHue        = cfg.lavaHue;
+  rSnap.ct6ClockX      = cfg.ct6ClockX;
+  rSnap.ct6ClockY      = cfg.ct6ClockY;
+  rSnap.ct6TempX       = cfg.ct6TempX;
+  rSnap.ct6TempY       = cfg.ct6TempY;
+  rSnap.ct6ClockR      = cfg.ct6ClockR; rSnap.ct6ClockG = cfg.ct6ClockG; rSnap.ct6ClockB = cfg.ct6ClockB;
+  rSnap.ct6TempR       = cfg.ct6TempR;  rSnap.ct6TempG  = cfg.ct6TempG;  rSnap.ct6TempB  = cfg.ct6TempB;
+}
+
 static void scheduleDeferredSave(uint32_t delayMs = 0) {
   saveDueMs.store(millis() + delayMs);
   saveError.store(false);
@@ -568,24 +583,10 @@ static void fatalHalt(const char* msg) {
 }
 
 static uint8_t normalizeMode(int mode) {
-  switch (mode) {
-    case 2:
-    case 4:
-    case 5:
-    case 6:
-      return (uint8_t)mode;
-    case 3:
-      // Старый режим Matrix убран; мигрируем ближайшим визуальным режимом.
-      return 4;
-    case 0:
-    case 1:
-    case 7:
-      // Отдельные "Температура", "Часы" и "Тест погоды" удалены;
-      // основным информационным режимом остаётся "Часы + темп".
-      return 6;
-    default:
-      return 6;
-  }
+  // Декоративные режимы (огонь/плазма/лава) удалены вместе с выбором режима
+  // в веб-интерфейсе; "Часы + темп" — единственный режим отображения.
+  (void)mode;
+  return 6;
 }
 
 static void sanitizeLoadedConfig(Config& loaded) {
@@ -598,7 +599,11 @@ static void sanitizeLoadedConfig(Config& loaded) {
   loaded.fontIndex = 0;
   loaded.showDegree = false;
   loaded.clockFace = 0;
-  loaded.colonBright = (uint8_t)constrain((int)loaded.colonBright, 0, 255);
+  // Разделитель часов удалён совсем; colonBright переиспользуется как
+  // яркость подложки принтер-оверлея, поэтому фиксируем его значение
+  loaded.showColon = false;
+  loaded.colonBright = 90;
+  loaded.weatherProvider = (uint8_t)constrain((int)loaded.weatherProvider, 0, 2);
   loaded.brightness = (uint8_t)constrain((int)loaded.brightness, (int)MIN_UI_BRIGHTNESS, 255);
   loaded.brightnessDay = (uint8_t)constrain((int)loaded.brightnessDay, (int)MIN_UI_BRIGHTNESS, 255);
   loaded.brightnessNight = (uint8_t)constrain((int)loaded.brightnessNight, (int)MIN_UI_BRIGHTNESS, 255);
@@ -661,7 +666,9 @@ static bool configEquals(const Config& a, const Config& b) {
     a.ct6ClockB == b.ct6ClockB &&
     a.ct6TempR == b.ct6TempR &&
     a.ct6TempG == b.ct6TempG &&
-    a.ct6TempB == b.ct6TempB;
+    a.ct6TempB == b.ct6TempB &&
+    a.weatherProvider == b.weatherProvider &&
+    a.tzFromWeather == b.tzFromWeather;
 }
 
 static bool bambuConfigEquals(const BambuConfig& a, const BambuConfig& b) {
@@ -1140,23 +1147,8 @@ CRGB tempToColor(float t) {
 }
 
 // ════════════════════════════════════════════════════════════
-//  РАЗДЕЛИТЕЛЬ ЧАСОВ
+//  РАЗДЕЛИТЕЛЬ ЧАСОВ: удалён — часы рисуются без двоеточия
 // ════════════════════════════════════════════════════════════
-
-bool colonOn() {
-  return rSnap.showColon;
-}
-
-void drawColon2x2(int x, int y, CRGB col, uint8_t brightness) {
-  CRGB dim = col;
-  dim.nscale8(brightness);
-  for (int dy = 0; dy < 2; dy++) {
-    px(x,     y + dy, dim);
-    px(x + 1, y + dy, dim);
-    px(x,     y + 3 + dy, dim);
-    px(x + 1, y + 3 + dy, dim);
-  }
-}
 
 // ════════════════════════════════════════════════════════════
 //  РЕЖИМ 6: ЧАСЫ + ТЕМПЕРАТУРА
@@ -1279,7 +1271,6 @@ void showClockTemp() {
   if (timeValid) {
     drawStr3(cx,     cy, hh, clockCol);
     drawStr3(cx + 9, cy, mm, clockCol);
-    if (colonOn()) drawColon2x2(cx + 7, cy, clockCol, rSnap.colonBright);
   } else {
     drawStr3(cx,     cy, "--", CRGB(60, 60, 60));
     drawStr3(cx + 9, cy, "--", CRGB(60, 60, 60));
@@ -1368,225 +1359,27 @@ void showClockTemp() {
 }
 
 // ════════════════════════════════════════════════════════════
-//  РЕЖИМ 2: ОГОНЬ — хаотичный 32×32 → downscale 2:1
-// ════════════════════════════════════════════════════════════
-#define FW 32
-#define FH 32
-
-static float fA[FW * FH];
-static float fB[FW * FH];
-static float fCool[FW * FH]; // статический шум охлаждения
-static float fWind[FW * FH]; // статический шум ветра
-static float *fR = fA, *fW2 = fB;
-
-struct Tongue { float x, y, heat, vx, vy; int life; };
-static Tongue tongues[6];
-
-static bool fireInit = false;
-static uint32_t fireTick = 0;
-
-void respawnTongue(int i) {
-  tongues[i].x    = random(FW);
-  tongues[i].y    = FH - 1;
-  tongues[i].heat = 0.7f + random(100) / 333.f;
-  tongues[i].vx   = (random(100) - 50) / 17.f;
-  tongues[i].vy   = -(2.f + random(100) / 25.f);
-  tongues[i].life = 4 + random(10);
-}
-
-void fireSetup() {
-  for (int i = 0; i < FW * FH; i++) {
-    fCool[i] = random(100) / 100.f;
-    fWind[i] = (random(100) - 50) / 50.f;
-    fA[i] = fB[i] = 0;
-  }
-  for (int i = 0; i < 6; i++) respawnTongue(i);
-  fireInit = true;
-}
-
-// 8-точечная палитра огня
-struct FirePal { float t; uint8_t r, g, b; };
-static const FirePal FPAL[] = {
-  {0.00f,  0,  0,  0}, {0.13f, 55,  0,  0}, {0.28f,200,  5,  0},
-  {0.44f,255, 55,  0}, {0.58f,255,138,  0}, {0.72f,255,215, 10},
-  {0.86f,255,250, 90}, {1.00f,255,255,210}
-};
-CRGB fireColor(float v) {
-  v = constrain(v, 0, 1);
-  for (int i = 1; i < 8; i++) {
-    if (v <= FPAL[i].t) {
-      float p = (v - FPAL[i-1].t) / (FPAL[i].t - FPAL[i-1].t);
-      return CRGB(
-        (uint8_t)(FPAL[i-1].r + (FPAL[i].r - FPAL[i-1].r) * p),
-        (uint8_t)(FPAL[i-1].g + (FPAL[i].g - FPAL[i-1].g) * p),
-        (uint8_t)(FPAL[i-1].b + (FPAL[i].b - FPAL[i-1].b) * p)
-      );
-    }
-  }
-  return CRGB(255, 255, 210);
-}
-
-void showFire() {
-  if (!fireInit) fireSetup();
-  fireTick++;
-
-  // 1. База: нижние 3 строки
-  for (int x = 0; x < FW; x++) {
-    float ph = sinf(x * 0.55f + fireTick * 0.22f) * cosf(x * 1.4f - fireTick * 0.17f);
-    float burst = (random(100) < 12) ? random(100) / 222.f : 0;
-    fR[(FH-1)*FW+x] = constrain(0.55f + ph * 0.22f + burst, 0, 1);
-    fR[(FH-2)*FW+x] = constrain(fR[(FH-1)*FW+x] * 0.82f + random(100)/1250.f, 0, 1);
-    fR[(FH-3)*FW+x] = constrain(fR[(FH-1)*FW+x] * 0.60f + random(100)/1667.f, 0, 1);
-  }
-
-  // 2. Язычки пламени
-  for (int i = 0; i < 6; i++) {
-    Tongue& t = tongues[i];
-    if (--t.life <= 0) { respawnTongue(i); continue; }
-    t.x += t.vx * 0.4f + (random(100) - 50) / 83.f;
-    t.y += t.vy * 0.4f;
-    t.vx += (random(100) - 50) / 125.f;
-    t.heat *= 0.92f;
-    int xi = ((int)t.x % FW + FW) % FW;
-    int yi = (int)t.y;
-    if (yi >= 0 && yi < FH - 3) {
-      for (int dy = -1; dy <= 1; dy++)
-        for (int dx = -1; dx <= 1; dx++) {
-          int nx = (xi + dx + FW) % FW, ny = constrain(yi + dy, 0, FH-1);
-          fR[ny * FW + nx] = constrain(fR[ny * FW + nx] + t.heat * 0.6f, 0, 1);
-        }
-    }
-  }
-
-  // 3. Диффузия с асимметричным ядром
-  for (int y = 0; y < FH - 1; y++) {
-    for (int x = 0; x < FW; x++) {
-      float rk = 0.85f + random(100) / 333.f;
-      float lw = fWind[y*FW+x] * sinf(fireTick * 0.08f + x * 0.3f) * 0.07f;
-      float sum =
-        fR[(y+1)*FW + (x-1+FW)%FW] * (0.20f + lw) +
-        fR[(y+1)*FW + x]            * 0.32f +
-        fR[(y+1)*FW + (x+1)%FW]    * (0.20f - lw) +
-        fR[y*FW     + (x-1+FW)%FW] * 0.10f +
-        fR[y*FW     + (x+1)%FW]    * 0.10f;
-      // Охлаждение
-      float cool = 0.012f + (float)y / FH * 0.022f + fCool[y*FW+x] * 0.008f;
-      if (random(1000) < 4) cool += 0.7f * random(100) / 100.f;
-      fW2[y*FW+x] = constrain(sum * rk - cool, 0, 1);
-    }
-  }
-
-  // Пинг-понг
-  float* tmp = fR; fR = fW2; fW2 = tmp;
-
-  // 4. Рисуем (32×32 → 16×16 downscale)
-  for (int y = 0; y < MH; y++)
-    for (int x = 0; x < MW; x++) {
-      float v = (fR[(y*2)*FW + x*2] + fR[(y*2)*FW + x*2+1] +
-                 fR[(y*2+1)*FW + x*2] + fR[(y*2+1)*FW + x*2+1]) * 0.25f;
-      px(x, y, fireColor(v));
-    }
-  matrixShow();
-}
-
-
-// ════════════════════════════════════════════════════════════
-//  РЕЖИМ 4: ПЛАЗМА
-// ════════════════════════════════════════════════════════════
-static float plasmaT = 0;
-// Радиальные расстояния от центра: вычисляются один раз, sqrtf убран из горячего пути
-static float plasmaR[MH * MW];
-static bool  plasmaRInited = false;
-
-void showPlasma() {
-  if (!plasmaRInited) {
-    for (int y = 0; y < MH; y++)
-      for (int x = 0; x < MW; x++)
-        plasmaR[y * MW + x] = sqrtf((x - 7.5f)*(x - 7.5f) + (y - 7.5f)*(y - 7.5f));
-    plasmaRInited = true;
-  }
-  for (int y = 0; y < MH; y++) {
-    for (int x = 0; x < MW; x++) {
-      float v = sinf(x * 0.7f + plasmaT)
-              + sinf(y * 0.5f + plasmaT * 1.3f)
-              + sinf((x + y) * 0.4f + plasmaT * 0.7f)
-              + sinf(plasmaR[y * MW + x] * 0.8f - plasmaT);
-      uint8_t hue = (uint8_t)((v + 4) / 8.0f * 255);
-      px(x, y, CHSV(hue, 255, 220));
-    }
-  }
-  matrixShow();
-  plasmaT = fmodf(plasmaT + 0.06f, 628.318f); // ~2π×100 — предотвращаем потерю точности float после ~12ч
-}
-
-
-// ════════════════════════════════════════════════════════════
-//  РЕЖИМ 5: ЛАВА-ЛАМПА (меташары)
-// ════════════════════════════════════════════════════════════
-#define LN 7
-struct Blob { float x, y, vx, vy, r, phase; };
-static Blob blobs[LN];
-static bool lavaInit2 = false;
-void lavaSetup() {
-  for (int i = 0; i < LN; i++) {
-    blobs[i].x     = 2 + random(MW - 4);
-    blobs[i].y     = 2 + random(MH - 4);
-    blobs[i].vx    = (random(100) - 50) / 500.f;
-    blobs[i].vy    = (random(100) - 50) / 500.f;
-    blobs[i].r     = 1.8f + random(100) / 100.f;
-    blobs[i].phase = random(628) / 100.f;
-  }
-  lavaInit2 = true;
-}
-
-void showLava() {
-  if (!lavaInit2) lavaSetup();
-
-  // Обновляем шары
-  for (int i = 0; i < LN; i++) {
-    Blob& b = blobs[i];
-    b.phase += 0.025f;
-    float ny = b.y / (MH - 1);
-    b.vy += (ny - 0.5f) * 0.006f; // плавучесть
-    b.vx += (b.y * 0.0004f - b.x * 0.0004f); // вращение
-    b.vx += sinf(b.phase * 0.9f) * 0.0012f;
-    b.vy += cosf(b.phase * 0.7f) * 0.0012f;
-    b.vx *= 0.92f; b.vy *= 0.92f;
-    b.vx = constrain(b.vx, -0.18f, 0.18f);
-    b.vy = constrain(b.vy, -0.18f, 0.18f);
-    b.x += b.vx; b.y += b.vy;
-    if (b.x < 0.5f) { b.x = 0.5f; b.vx *= -0.4f; }
-    if (b.x > MW-1.5f) { b.x = MW-1.5f; b.vx *= -0.4f; }
-    if (b.y < 0.5f) { b.y = 0.5f; b.vy *= -0.4f; }
-    if (b.y > MH-1.5f) { b.y = MH-1.5f; b.vy *= -0.4f; }
-    b.r = 1.9f + sinf(b.phase * 1.7f) * 0.55f + cosf(b.phase * 0.8f) * 0.35f;
-  }
-
-  // Рендер поля
-  float ct = safeGetTemp();
-  uint16_t hue = rSnap.lavaAutoColor ? (uint16_t)constrain(
-    (int)(240 - (ct > -999 ? (ct + 20) / 60.f : 0.5f) * 240), 0, 240) : rSnap.lavaHue;
-
-  for (int y = 0; y < MH; y++) {
-    for (int x = 0; x < MW; x++) {
-      float field = 0;
-      for (int i = 0; i < LN; i++) {
-        float dx = x - blobs[i].x, dy = y - blobs[i].y;
-        float d2 = dx*dx + dy*dy;
-        if (d2 < 0.01f) d2 = 0.01f;
-        field += blobs[i].r * blobs[i].r / d2;
-      }
-      float t = constrain((field - 0.4f) / 2.0f, 0, 1);
-      uint8_t h2 = (uint8_t)((uint32_t)hue * 255u / 359u); // uint32_t: hue*255 до 91545 > uint16_t max
-      px(x, y, CHSV(h2, 210 + (uint8_t)(45*t), (uint8_t)(25 + 230*t)));
-    }
-  }
-  matrixShow();
-}
-
-// ════════════════════════════════════════════════════════════
 //  ПОГОДА
 // ════════════════════════════════════════════════════════════
+// Применяет UTC-смещение из ответа погодного API при включённом tzFromWeather.
+// Вызывается из weatherTask; configTime дёрнет loop task через ntpPending.
+static void applyWeatherTz(long offsetSec) {
+  if (offsetSec < -12L * 3600 || offsetSec > 14L * 3600) return;
+  float tzH = offsetSec / 3600.0f;
+  bool changed = false;
+  xSemaphoreTake(cfgMtx, portMAX_DELAY);
+  if (cfg.tzFromWeather && fabsf(cfg.tzOffset - tzH) > 0.01f) {
+    cfg.tzOffset = tzH;
+    changed = true;
+  }
+  xSemaphoreGive(cfgMtx);
+  if (changed) {
+    Serial.printf("[Weather] TZ из локации погоды: UTC%+.2f\n", tzH);
+    ntpPending.store(true);     // loop task вызовет configTime с новым смещением
+    scheduleDeferredSave(1500);
+  }
+}
+
 void fetchWeather() {
   if (!wifiConnected) return;
   taskENTER_CRITICAL(&weatherMux);
@@ -1598,31 +1391,26 @@ void fetchWeather() {
   char city[sizeof(cfg.city)];
   float owmLat, owmLon;
   bool owmUseCoords;
+  uint8_t provider;
   xSemaphoreTake(cfgMtx, portMAX_DELAY);
   strlcpy(apiKey, cfg.apiKey, sizeof(apiKey));
   strlcpy(city,   cfg.city,   sizeof(city));
   owmLat = cfg.owmLat;
   owmLon = cfg.owmLon;
   owmUseCoords = cfg.owmUseCoords;
+  provider = cfg.weatherProvider;   // 0=авто (OWM→OM), 1=только OWM, 2=только Open-Meteo
   xSemaphoreGive(cfgMtx);
 
   uint8_t keyLen = (uint8_t)min(strlen(apiKey), (size_t)255);
-  if (keyLen == 0) {
+  bool tryOwm = (provider != 2);
+  bool owmOk = false;
+
+  if (tryOwm && keyLen == 0) {
     setWeatherDiag(0, "missing api key", keyLen, "owm");
     Serial.println("[Weather] OpenWeatherMap API key is missing");
-    return;
+    if (provider == 1) return;      // только OWM — без ключа делать нечего
+    tryOwm = false;                 // авто: сразу пробуем Open-Meteo
   }
-
-  WiFiClientSecure sc;
-  sc.setInsecure(); // HTTPS защищает API key от пассивного перехвата в LAN; CA не проверяем ради RAM.
-  // Ядро ESP32 Arduino 3.x: setTimeout() — миллисекунды, setHandshakeTimeout() — секунды.
-  sc.setTimeout(8000);
-  sc.setHandshakeTimeout(8);
-  HTTPClient http;
-  http.setConnectTimeout(8000);
-  http.setTimeout(8000);
-  http.setReuse(false);
-  http.useHTTP10(true);
 
   auto urlEncode = [](const char* s) -> String {
     String out;
@@ -1644,150 +1432,174 @@ void fetchWeather() {
     return out;
   };
 
-  String path;
-  if (owmUseCoords) {
-    path = String("/data/2.5/weather?lat=") + String(owmLat, 4) +
-           "&lon=" + String(owmLon, 4) +
-           "&appid=" + String(apiKey) + "&units=metric";
-    Serial.printf("[Weather] OWM coords lat=%.4f lon=%.4f keyLen=%u\n",
-                  owmLat, owmLon, keyLen);
-  } else {
-    path = String("/data/2.5/weather?q=") + urlEncode(city) +
-           "&appid=" + String(apiKey) + "&units=metric";
-    Serial.printf("[Weather] OWM city='%s' keyLen=%u\n", city, keyLen);
+  // ── OpenWeatherMap: основной источник (провайдеры «авто» и «только OWM») ──
+  if (tryOwm) {
+    WiFiClientSecure sc;
+    sc.setInsecure(); // HTTPS защищает API key от пассивного перехвата в LAN; CA не проверяем ради RAM.
+    // Ядро ESP32 Arduino 3.x: setTimeout() — миллисекунды, setHandshakeTimeout() — секунды.
+    sc.setTimeout(8000);
+    sc.setHandshakeTimeout(8);
+    HTTPClient http;
+    http.setConnectTimeout(8000);
+    http.setTimeout(8000);
+    http.setReuse(false);
+    http.useHTTP10(true);
+
+    String path;
+    if (owmUseCoords) {
+      path = String("/data/2.5/weather?lat=") + String(owmLat, 4) +
+             "&lon=" + String(owmLon, 4) +
+             "&appid=" + String(apiKey) + "&units=metric";
+      Serial.printf("[Weather] OWM coords lat=%.4f lon=%.4f keyLen=%u\n",
+                    owmLat, owmLon, keyLen);
+    } else {
+      path = String("/data/2.5/weather?q=") + urlEncode(city) +
+             "&appid=" + String(apiKey) + "&units=metric";
+      Serial.printf("[Weather] OWM city='%s' keyLen=%u\n", city, keyLen);
+    }
+
+    auto applyWeatherPayload = [&](Stream& body) -> bool {
+      JsonDocument doc;
+      // getStream() парсит прямо из потока — без промежуточного String в heap
+      DeserializationError err = deserializeJson(doc, body);
+      if (err) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "json: %s", err.c_str());
+        setWeatherDiag(200, msg, keyLen, "owm");
+        Serial.printf("[Weather] JSON error: %s\n", err.c_str());
+        return false;
+      }
+
+      float t = doc["main"]["temp"].as<float>();
+      taskENTER_CRITICAL(&weatherMux);
+      currentTemp   = t;
+      lastWeatherMs = millis();
+      lastWeatherHttpCode = 200;
+      lastWeatherKeyLen = keyLen;
+      lastWeatherError[0] = '\0';
+      strlcpy(lastWeatherSource, "owm", sizeof(lastWeatherSource));
+      taskEXIT_CRITICAL(&weatherMux);
+      Serial.printf("[Weather] OK %.1f C\n", t);
+
+      // OWM отдаёт смещение UTC в поле timezone (секунды)
+      if (doc["timezone"].is<long>()) applyWeatherTz(doc["timezone"].as<long>());
+
+      // В ответе OWM всегда присутствует coord.lat/coord.lon — кэшируем в cfg.
+      // В city-режиме это единственный источник координат для fetchSunriseSunset().
+      if (!owmUseCoords) {
+        float lat = doc["coord"]["lat"] | 0.0f;
+        float lon = doc["coord"]["lon"] | 0.0f;
+        if (lat != 0.0f || lon != 0.0f) {
+          bool sunMode;
+          xSemaphoreTake(cfgMtx, portMAX_DELAY);
+          cfg.owmLat = lat;
+          cfg.owmLon = lon;
+          sunMode = cfg.autoBrSunMode;
+          xSemaphoreGive(cfgMtx);
+          owmLat = lat; owmLon = lon; // для возможного фоллбэка в этом же вызове
+          // Координаты только что появились — запросить восход/закат если нужно
+          if (sunMode && !sunTimeValid.load()) sunFetchRequested.store(true);
+        }
+      }
+      return true;
+    };
+
+    // Сначала HTTPS, чтобы не передавать API key открытым текстом.
+    String url = "https://api.openweathermap.org" + path;
+    if (http.begin(sc, url)) {
+      int code = http.GET();
+      if (code == 200) {
+        owmOk = applyWeatherPayload(http.getStream());
+      } else {
+        String err = http.errorToString(code);
+        char tlsErr[64] = "";
+        int tlsCode = sc.lastError(tlsErr, sizeof(tlsErr));
+        char msg[96];
+        if (tlsCode != 0) {
+          snprintf(msg, sizeof(msg), "HTTP %d: %s; TLS %d: %s", code, err.c_str(), tlsCode, tlsErr);
+        } else {
+          snprintf(msg, sizeof(msg), "HTTP %d: %s", code, err.c_str());
+        }
+        setWeatherDiag(code, msg, keyLen, "owm");
+        Serial.printf("[Weather] %s\n", msg);
+      }
+      http.end();
+    } else {
+      setWeatherDiag(0, "http begin failed", keyLen, "owm");
+      Serial.println("[Weather] HTTP begin failed");
+    }
   }
 
-  auto applyWeatherPayload = [&](Stream& body) -> bool {
-    JsonDocument doc;
-    // getStream() парсит прямо из потока — без промежуточного String в heap
-    DeserializationError err = deserializeJson(doc, body);
-    if (err) {
-      char msg[64];
-      snprintf(msg, sizeof(msg), "json: %s", err.c_str());
-      setWeatherDiag(200, msg, keyLen, "owm");
-      Serial.printf("[Weather] JSON error: %s\n", err.c_str());
-      return false;
-    }
+  if (owmOk || provider == 1) return;
 
-    float t = doc["main"]["temp"].as<float>();
-    taskENTER_CRITICAL(&weatherMux);
-    currentTemp   = t;
-    lastWeatherMs = millis();
-    lastWeatherHttpCode = 200;
-    lastWeatherKeyLen = keyLen;
-    lastWeatherError[0] = '\0';
-    strlcpy(lastWeatherSource, "owm", sizeof(lastWeatherSource));
-    taskEXIT_CRITICAL(&weatherMux);
-    Serial.printf("[Weather] OK %.1f C\n", t);
-
-    // В ответе OWM всегда присутствует coord.lat/coord.lon — кэшируем в cfg.
-    // В city-режиме это единственный источник координат для fetchSunriseSunset().
-    if (!owmUseCoords) {
-      float lat = doc["coord"]["lat"] | 0.0f;
-      float lon = doc["coord"]["lon"] | 0.0f;
-      if (lat != 0.0f || lon != 0.0f) {
-        bool sunMode;
-        xSemaphoreTake(cfgMtx, portMAX_DELAY);
-        cfg.owmLat = lat;
-        cfg.owmLon = lon;
-        sunMode = cfg.autoBrSunMode;
-        xSemaphoreGive(cfgMtx);
-        // Координаты только что появились — запросить восход/закат если нужно
-        if (sunMode && !sunTimeValid.load()) sunFetchRequested.store(true);
-      }
-    }
-    return true;
-  };
-
-  // OpenWeatherMap — сначала HTTPS, чтобы не передавать API key открытым текстом.
-  const char* owmHost = "api.openweathermap.org";
-  String url = "https://" + String(owmHost) + path;
-  if (!http.begin(sc, url)) {
-    setWeatherDiag(0, "http begin failed", keyLen, "owm");
-    Serial.println("[Weather] HTTP begin failed");
+  // ── Open-Meteo: основной источник (провайдер 2) или фоллбэк в авто-режиме ──
+  // Работает только по координатам; в city-режиме они кэшируются из ответов OWM.
+  if (owmLat == 0.0f && owmLon == 0.0f) {
+    setWeatherDiag(0, provider == 2 ? "open-meteo: no coords"
+                                    : "open-meteo fallback skipped: no coords",
+                   keyLen, "open-meteo");
     return;
   }
 
-  int code = http.GET();
-  if (code == 200) {
-    applyWeatherPayload(http.getStream());
-  } else {
-    String err = http.errorToString(code);
-    char tlsErr[64] = "";
-    int tlsCode = sc.lastError(tlsErr, sizeof(tlsErr));
-    char msg[96];
-    if (tlsCode != 0) {
-      snprintf(msg, sizeof(msg), "HTTP %d: %s; TLS %d: %s", code, err.c_str(), tlsCode, tlsErr);
-    } else {
-      snprintf(msg, sizeof(msg), "HTTP %d: %s", code, err.c_str());
-    }
-    setWeatherDiag(code, msg, keyLen, "owm");
-    Serial.printf("[Weather] %s\n", msg);
+  WiFiClientSecure meteoClient;
+  meteoClient.setInsecure();
+  // Как фоллбэк — таймауты короче основного, чтобы при недоступности обоих API
+  // weatherTask не блокировался дольше необходимого; как основной — полные 8 с.
+  uint16_t meteoTimeout = (provider == 2) ? 8000 : 5000;
+  meteoClient.setTimeout(meteoTimeout);
+  meteoClient.setHandshakeTimeout(meteoTimeout / 1000);
+  HTTPClient meteoHttp;
+  meteoHttp.setConnectTimeout(meteoTimeout);
+  meteoHttp.setTimeout(meteoTimeout);
+  meteoHttp.setReuse(false);
+  meteoHttp.useHTTP10(true);
+  // timezone=auto: в ответ добавляется utc_offset_seconds локации
+  String meteoUrl = String("https://api.open-meteo.com/v1/forecast?latitude=") +
+                    String(owmLat, 4) + "&longitude=" + String(owmLon, 4) +
+                    "&current=temperature_2m&timezone=auto";
+  if (!meteoHttp.begin(meteoClient, meteoUrl)) {
+    setWeatherDiag(0, "open-meteo begin failed", keyLen, "open-meteo");
+    Serial.println("[Weather] Open-Meteo begin failed");
+    return;
   }
-  http.end();
 
-  if (code < 0) {
-    if (owmLat == 0.0f && owmLon == 0.0f) {
-      setWeatherDiag(code, "open-meteo fallback skipped: no coords", keyLen, "open-meteo");
-      return;
-    }
-
-    WiFiClientSecure meteoClient;
-    meteoClient.setInsecure();
-    // Fallback-источник: таймауты короче основного, чтобы при недоступности
-    // обоих API weatherTask не блокировался дольше необходимого.
-    meteoClient.setTimeout(5000);
-    meteoClient.setHandshakeTimeout(5);
-    HTTPClient meteoHttp;
-    meteoHttp.setConnectTimeout(5000);
-    meteoHttp.setTimeout(5000);
-    meteoHttp.setReuse(false);
-    meteoHttp.useHTTP10(true);
-    String meteoUrl = String("https://api.open-meteo.com/v1/forecast?latitude=") +
-                      String(owmLat, 4) + "&longitude=" + String(owmLon, 4) +
-                      "&current=temperature_2m";
-    if (!meteoHttp.begin(meteoClient, meteoUrl)) {
-      setWeatherDiag(0, "open-meteo begin failed", keyLen, "open-meteo");
-      Serial.println("[Weather] Open-Meteo begin failed");
-      return;
-    }
-
-    int meteoCode = meteoHttp.GET();
-    if (meteoCode == 200) {
-      JsonDocument doc;
-      DeserializationError err = deserializeJson(doc, meteoHttp.getStream());
-      if (err) {
-        char msg[64];
-        snprintf(msg, sizeof(msg), "open-meteo json: %s", err.c_str());
-        setWeatherDiag(meteoCode, msg, keyLen, "open-meteo");
-        Serial.printf("[Weather] %s\n", msg);
-      } else {
-        float t = doc["current"]["temperature_2m"] | NAN;
-        if (isnan(t)) t = doc["current_weather"]["temperature"] | NAN;
-        if (isnan(t)) {
-          setWeatherDiag(meteoCode, "open-meteo missing temperature", keyLen, "open-meteo");
-          Serial.println("[Weather] Open-Meteo missing temperature");
-        } else {
-          taskENTER_CRITICAL(&weatherMux);
-          currentTemp = t;
-          lastWeatherMs = millis();
-          lastWeatherHttpCode = meteoCode;
-          lastWeatherKeyLen = keyLen;
-          lastWeatherError[0] = '\0';
-          strlcpy(lastWeatherSource, "open-meteo", sizeof(lastWeatherSource));
-          taskEXIT_CRITICAL(&weatherMux);
-          Serial.printf("[Weather] Open-Meteo OK %.1f C\n", t);
-        }
-      }
-    } else {
-      String meteoErr = meteoHttp.errorToString(meteoCode);
-      char msg[96];
-      snprintf(msg, sizeof(msg), "open-meteo HTTP %d: %s", meteoCode, meteoErr.c_str());
+  int meteoCode = meteoHttp.GET();
+  if (meteoCode == 200) {
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, meteoHttp.getStream());
+    if (err) {
+      char msg[64];
+      snprintf(msg, sizeof(msg), "open-meteo json: %s", err.c_str());
       setWeatherDiag(meteoCode, msg, keyLen, "open-meteo");
       Serial.printf("[Weather] %s\n", msg);
+    } else {
+      float t = doc["current"]["temperature_2m"] | NAN;
+      if (isnan(t)) t = doc["current_weather"]["temperature"] | NAN;
+      if (isnan(t)) {
+        setWeatherDiag(meteoCode, "open-meteo missing temperature", keyLen, "open-meteo");
+        Serial.println("[Weather] Open-Meteo missing temperature");
+      } else {
+        taskENTER_CRITICAL(&weatherMux);
+        currentTemp = t;
+        lastWeatherMs = millis();
+        lastWeatherHttpCode = meteoCode;
+        lastWeatherKeyLen = keyLen;
+        lastWeatherError[0] = '\0';
+        strlcpy(lastWeatherSource, "open-meteo", sizeof(lastWeatherSource));
+        taskEXIT_CRITICAL(&weatherMux);
+        Serial.printf("[Weather] Open-Meteo OK %.1f C\n", t);
+        if (doc["utc_offset_seconds"].is<long>())
+          applyWeatherTz(doc["utc_offset_seconds"].as<long>());
+      }
     }
-    meteoHttp.end();
+  } else {
+    String meteoErr = meteoHttp.errorToString(meteoCode);
+    char msg[96];
+    snprintf(msg, sizeof(msg), "open-meteo HTTP %d: %s", meteoCode, meteoErr.c_str());
+    setWeatherDiag(meteoCode, msg, keyLen, "open-meteo");
+    Serial.printf("[Weather] %s\n", msg);
   }
+  meteoHttp.end();
 }
 
 // Запрашивает актуальные времена восхода и заката с api.sunrise-sunset.org.
@@ -2034,22 +1846,20 @@ void handleGetSettings() {
   if (!checkAuth()) { server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
   JsonDocument doc;
   xSemaphoreTake(cfgMtx, portMAX_DELAY);
-  doc["mode"]         = normalizeMode(cfg.mode);
   doc["brightness"]   = cfg.brightness;
   doc["autoColor"]    = cfg.autoColor;
   doc["use24h"]       = cfg.use24h;
-  doc["showColon"]    = cfg.showColon;
-  doc["colonBright"]  = cfg.colonBright;
   doc["ntpServer"]    = cfg.ntpServer;
   doc["tzOffset"]     = cfg.tzOffset;
+  doc["tzFromWeather"] = cfg.tzFromWeather;
   doc["updateMin"]    = cfg.updateMin;
+  doc["weatherProvider"] = cfg.weatherProvider;
+  doc["apiKeySet"]    = cfg.apiKey[0] != '\0';
   doc["apiKey"]       = cfg.apiKey[0] ? "***" : "";  // не отдаём ключ открытым текстом
   doc["city"]         = cfg.city;
   doc["owmLat"]       = cfg.owmLat;
   doc["owmLon"]       = cfg.owmLon;
   doc["owmUseCoords"] = cfg.owmUseCoords;
-  doc["lavaAutoColor"]    = cfg.lavaAutoColor;
-  doc["lavaHue"]          = cfg.lavaHue;
   doc["rotation"]         = cfg.rotation;
   doc["flipH"]            = cfg.flipH;
   doc["flipV"]            = cfg.flipV;
@@ -2118,19 +1928,16 @@ void handlePostSettings() {
   setStr("ntpServer", cfg.ntpServer, sizeof(cfg.ntpServer));
   setStr("city",      cfg.city,      sizeof(cfg.city));
   setKey("apiKey",    cfg.apiKey,    sizeof(cfg.apiKey));
-  if (!doc["mode"].isNull())          cfg.mode          = normalizeMode((int)doc["mode"]);
   if (!doc["brightness"].isNull())    cfg.brightness    = (uint8_t)constrain((int)doc["brightness"], (int)MIN_UI_BRIGHTNESS, 255);
   if (!doc["autoColor"].isNull())     cfg.autoColor     = doc["autoColor"];
   if (!doc["use24h"].isNull())        cfg.use24h        = doc["use24h"];
-  if (!doc["showColon"].isNull())     cfg.showColon     = doc["showColon"];
-  if (!doc["colonBright"].isNull())   cfg.colonBright   = (uint8_t)constrain((int)doc["colonBright"], 0, 255);
   if (!doc["tzOffset"].isNull())      cfg.tzOffset      = constrain((float)doc["tzOffset"], -12.0f, 14.0f);
+  if (!doc["tzFromWeather"].isNull()) cfg.tzFromWeather = doc["tzFromWeather"];
   if (!doc["updateMin"].isNull())     cfg.updateMin     = (uint16_t)constrain((int)doc["updateMin"], 1, 60);
+  if (!doc["weatherProvider"].isNull()) cfg.weatherProvider = (uint8_t)constrain((int)doc["weatherProvider"], 0, 2);
   if (!doc["owmLat"].isNull())        cfg.owmLat        = doc["owmLat"];
   if (!doc["owmLon"].isNull())        cfg.owmLon        = doc["owmLon"];
   if (!doc["owmUseCoords"].isNull())  cfg.owmUseCoords  = doc["owmUseCoords"];
-  if (!doc["lavaAutoColor"].isNull()) cfg.lavaAutoColor = doc["lavaAutoColor"];
-  if (!doc["lavaHue"].isNull())       cfg.lavaHue       = (uint16_t)constrain((int)doc["lavaHue"], 0, 359);
   if (!doc["rotation"].isNull())      cfg.rotation      = (uint8_t)constrain((int)doc["rotation"], 0, 3);
   if (!doc["flipH"].isNull())              cfg.flipH           = doc["flipH"];
   if (!doc["flipV"].isNull())              cfg.flipV           = doc["flipV"];
@@ -2155,6 +1962,9 @@ void handlePostSettings() {
   cfg.ct6ShowWeatherIcon = false;
   cfg.showDegree = false;
   cfg.clockFace = 0;
+  cfg.mode = 6;
+  cfg.showColon = false;  // разделитель часов удалён
+  cfg.colonBright = 90;   // переиспользуется как яркость подложки оверлея
   cfg.webPass[0] = '\0';
   strlcpy(cfg.apPass, LEGACY_DEFAULT_AP_PASS, sizeof(cfg.apPass));
   // Снимаем значения для использования вне мьютекса — cfg нельзя читать после Give
@@ -2164,6 +1974,9 @@ void handlePostSettings() {
   bool cfgChanged = !configEquals(prevCfg, cfg);
   bool ntpChanged = (prevCfg.tzOffset != cfg.tzOffset) ||
                     (strncmp(prevCfg.ntpServer, cfg.ntpServer, sizeof(cfg.ntpServer)) != 0);
+  bool weatherCfgChanged =
+      (prevCfg.weatherProvider != cfg.weatherProvider) ||
+      (prevCfg.tzFromWeather != cfg.tzFromWeather && cfg.tzFromWeather);
   xSemaphoreGive(cfgMtx);
   BambuConfig prevBambuCfg;
   xSemaphoreTake(bambuCfgMtx, portMAX_DELAY);
@@ -2189,6 +2002,7 @@ void handlePostSettings() {
   // Запросить восход/закат если данные устарели или отсутствуют
   if (snapSunMode && !sunTimeValid.load()) sunFetchRequested.store(true);
   if (ntpChanged) ntpPending.store(true); // configTime вызовет loop task — не дублируем вызов
+  if (weatherCfgChanged) weatherRequested = true; // сменили провайдера/tz-режим — обновим погоду сразу
   if (bambuChanged) {
     Serial.printf("[BambuRelay] Settings updated: changed=%d\n", (int)bambuChanged);
     wakeBambuTask();
@@ -2405,14 +2219,63 @@ void handleWeatherRefresh() {
 //  Образ пишется в неактивный слот; otadata переключается атомарно
 //  в Update.end() — до этого момента обрыв безвреден.
 // ════════════════════════════════════════════════════════════
+// Прогресс OTA на матрице: янтарный столб растёт снизу вверх (в тон boot-
+// анимации), дробная часть строки показывается яркостью. pct > 100 = размер
+// неизвестен — дышит нижняя строка. Перерисовка только при смене процента и
+// не чаще ~120 мс: FastLED.show() на 256 LED ≈ 8 мс, не тормозим приём.
+static void showOtaProgress(uint8_t pct) {
+  static uint32_t lastMs = 0;
+  static uint8_t lastPct = 254;
+  uint32_t now = millis();
+  if (pct <= 100) {                     // полоса: перерисовка на смене процента
+    if (pct == lastPct) return;
+  } else if (now - lastMs < 120) {      // «дыхание»: по таймеру
+    return;
+  }
+  lastMs = now; lastPct = pct;
+  clearMatrix();
+  if (pct > 100) {
+    for (int x = 0; x < MW; x++) px(x, MH - 1, CHSV(24, 255, beatsin8(30, 30, 160)));
+  } else {
+    uint16_t sub = (uint16_t)pct * MH * 255 / 100; // высота столба в 1/255 строки
+    int full = sub / 255;
+    uint8_t frac = sub % 255;
+    for (int fromBottom = 0; fromBottom <= full && fromBottom < MH; fromBottom++) {
+      uint8_t v = (fromBottom < full) ? 200 : scale8(200, frac);
+      if (!v) continue;
+      uint8_t hue = 16 + fromBottom * 2;  // снизу оранжевый, к верху желтее
+      for (int x = 0; x < MW; x++) px(x, MH - 1 - fromBottom, CHSV(hue, 255, v));
+    }
+  }
+  FastLED.show();
+}
+
+// Образ принят, ждём перезагрузку: ровная зелёная заливка до ресета.
+static void showOtaDone() {
+  fill_solid(leds, NUM_LEDS, CRGB(0, 150, 50));
+  FastLED.show();
+}
+
+// Ошибка/обрыв OTA: красный крест на полсекунды.
+static void showOtaError() {
+  clearMatrix();
+  for (int i = 0; i < MW; i++) {
+    px(i, i, CRGB(180, 20, 20));
+    px(MW - 1 - i, i, CRGB(180, 20, 20));
+  }
+  FastLED.show(); delay(500);
+  clearMatrix(); FastLED.show();
+}
+
 static void otaEnterUpdateMode() {
   otaInProgress.store(true);
-  clearMatrix(); FastLED.show();        // гасим RMT/LED на время записи флеша
+  clearMatrix(); FastLED.show();        // прежний кадр гасим; дальше рисуем прогресс
   esp_wifi_set_ps(WIFI_PS_NONE);        // power save рвёт приём при flash-операциях
 }
 
 static void otaAbortUpdateMode() {
   otaInProgress.store(false);
+  showOtaError();
   esp_wifi_set_ps(WIFI_PS_MIN_MODEM);   // steady state и в STA, и в AP
 }
 
@@ -2454,12 +2317,18 @@ void handleUpdateUpload() {
       }
       if (Update.write(up.buf, up.currentSize) != up.currentSize)
         Update.printError(Serial);      // ошибка запомнена в Update, отдадим в final
+      else {
+        size_t total = Update.size();
+        showOtaProgress((total && total != UPDATE_SIZE_UNKNOWN)
+          ? (uint8_t)((uint64_t)Update.progress() * 100 / total) : (uint8_t)255);
+      }
       break;
     }
     case UPLOAD_FILE_END:
-      if (Update.isRunning() && Update.end(true)) // true: завершить и при UNKNOWN size
+      if (Update.isRunning() && Update.end(true)) { // true: завершить и при UNKNOWN size
         Serial.printf("[OTA] Образ принят: %u байт\n", up.totalSize);
-      else
+        showOtaDone();                  // зелёная заливка висит до перезагрузки
+      } else
         Update.printError(Serial);
       break;
     case UPLOAD_FILE_ABORTED:
@@ -2495,20 +2364,48 @@ void handleUpdateFinal() {
 //  BOOT-АНИМАЦИЯ И СТАТУС
 // ════════════════════════════════════════════════════════════
 void showBoot() {
-  for (int y = MH - 1; y >= 0; y--) {
-    for (int x = 0; x < MW; x++)
-      px(x, y, CHSV((x + (MH-1-y)) * 10, 255, 180));
-    FastLED.show(); delay(28);
+  // «Зажигание»: янтарное кольцо расходится из центра, оставляя затухающий
+  // след, к краям уходит в жёлтый; в конце матрица мягко гаснет.
+  for (int f = 0; f < 26; f++) {
+    fadeToBlackBy(leds, NUM_LEDS, 60);
+    float r = f * 0.55f;
+    for (int y = 0; y < MH; y++)
+      for (int x = 0; x < MW; x++) {
+        float d = hypotf(x - 7.5f, y - 7.5f);
+        float t = fabsf(d - r);
+        if (t < 1.3f)
+          px(x, y, CHSV(24 + (uint8_t)(d * 5), 255, (uint8_t)(255 * (1.0f - t / 1.3f))));
+      }
+    FastLED.show(); delay(30);
   }
-  delay(250); clearMatrix(); FastLED.show();
+  for (int f = 0; f < 10; f++) { fadeToBlackBy(leds, NUM_LEDS, 70); FastLED.show(); delay(25); }
+  clearMatrix(); FastLED.show();
 }
 
 void showConnecting() {
-  static uint8_t pos = 0;
+  // Значок Wi-Fi: точка-источник внизу и три дуги, загорающиеся снизу вверх
+  // (шаг каждые ~320 мс при вызове раз в 80 мс), затем пауза с тусклой точкой.
+  static uint8_t frame = 0;
+  const uint8_t step = (frame / 4) % 5; // 0=точка, 1..3=дуги, 4=пауза
+  frame++;
   clearMatrix();
-  for (int i = 0; i < 5; i++)
-    leds[(pos + i * 5) % NUM_LEDS] = CHSV(160, 255, 180);
-  pos = (pos + 1) % NUM_LEDS;
+  const float cx = 7.5f, cy = 13.5f;
+  const uint8_t dotV = (step == 4) ? 60 : 220;
+  px(7, 12, CHSV(150, 220, dotV)); px(8, 12, CHSV(150, 220, dotV));
+  px(7, 13, CHSV(150, 220, dotV)); px(8, 13, CHSV(150, 220, dotV));
+  static const float R[3] = {3.6f, 6.1f, 8.6f};
+  if (step >= 1 && step <= 3) {
+    for (int y = 0; y < MH; y++)
+      for (int x = 0; x < MW; x++) {
+        float dx = x - cx, dy = cy - y;
+        if (dy < 0 || dy < fabsf(dx)) continue; // конус 90° вверх от точки
+        float d = hypotf(dx, dy);
+        for (int a = 0; a < step; a++) {
+          float t = fabsf(d - R[a]);
+          if (t < 0.9f) px(x, y, CHSV(150, 220, (uint8_t)(220 * (1.0f - t / 0.9f))));
+        }
+      }
+  }
   FastLED.show();
 }
 
@@ -2773,6 +2670,9 @@ void setup() {
   // значение, применяем его сразу. Как только NTP даст актуальное время, loop()
   // пересчитает день/ночь без прежней минутной задержки.
   applyConfiguredBrightnessNow(true);
+  xSemaphoreTake(cfgMtx, portMAX_DELAY);
+  refreshRenderSnapLocked();
+  xSemaphoreGive(cfgMtx);
   showBoot();
 
   // ── WiFi init ──
@@ -2823,7 +2723,9 @@ void setup() {
         esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
         Serial.printf("[WiFi] ✓ IP=%s  RSSI=%d dBm\n",
           WiFi.localIP().toString().c_str(), WiFi.RSSI());
-        configTime((long)roundf(cfg.tzOffset * 3600.0f), 0, cfg.ntpServer);
+        // Фоллбэк-серверы: SNTP сам опрашивает их при недоступности основного
+        configTime((long)roundf(cfg.tzOffset * 3600.0f), 0, cfg.ntpServer,
+                   "time.google.com", "time.cloudflare.com");
         brightnessRefreshRequested.store(true);
         weatherRequested = true;  // погода через task, не блокируя
         { bool sunMode; xSemaphoreTake(cfgMtx, portMAX_DELAY); sunMode = cfg.autoBrSunMode; xSemaphoreGive(cfgMtx);
@@ -2887,12 +2789,16 @@ void setup() {
     flushDeferredSave(true);
     Serial.println("[OTA] ArduinoOTA start");
   });
+  ArduinoOTA.onProgress([](unsigned int done, unsigned int total) {
+    showOtaProgress(total ? (uint8_t)((uint64_t)done * 100 / total) : (uint8_t)255);
+  });
   ArduinoOTA.onEnd([]() {
     // espota перезагружает устройство сам, final-обработчика нет — счётчик
     // boot-guard сбрасываем здесь, чтобы он не уехал в новую прошивку.
     xSemaphoreTake(prefsMtx, portMAX_DELAY);
     bootGuardReset();
     xSemaphoreGive(prefsMtx);
+    showOtaDone();
     Serial.println("[OTA] ArduinoOTA done");
   });
   ArduinoOTA.onError([](ota_error_t err) {
@@ -2934,10 +2840,6 @@ void setup() {
   if (wifiConnTaskOk != pdPASS) fatalHalt("Failed to create WiFi connect task");
   if (bambuTaskOk != pdPASS) fatalHalt("Failed to create Bambu task");
   Serial.println("Background tasks started; WebServer stays in loop task");
-
-  memset(fA, 0, sizeof(fA)); memset(fB, 0, sizeof(fB));
-  fireInit = false;
-  lavaInit2 = false;
 }
 
 // ════════════════════════════════════════════════════════════
@@ -3118,7 +3020,7 @@ void loop() {
     char ntp[sizeof(cfg.ntpServer)];
     strlcpy(ntp, cfg.ntpServer, sizeof(ntp));
     xSemaphoreGive(cfgMtx);
-    configTime(tz, 0, ntp);
+    configTime(tz, 0, ntp, "time.google.com", "time.cloudflare.com");
     brightnessRefreshRequested.store(true);
   }
 
@@ -3126,34 +3028,12 @@ void loop() {
   // в tight-loop между кадрами. 100мс лаг смены настроек незаметен пользователю.
   static uint32_t rSnapMs = 0;
   static uint16_t snapUpdateMin = 10;
-  static uint8_t  snapMode = 6;
   if (millis() - rSnapMs >= 100) {
     rSnapMs = millis();
     xSemaphoreTake(cfgMtx, portMAX_DELAY);
     snapUpdateMin        = cfg.updateMin;
-    snapMode             = normalizeMode(cfg.mode);
-    rSnap.rotation       = cfg.rotation;
-    rSnap.flipH          = cfg.flipH;
-    rSnap.flipV          = cfg.flipV;
-    rSnap.autoColor      = cfg.autoColor;
-    rSnap.use24h         = cfg.use24h;
-    rSnap.showColon      = cfg.showColon;
-    rSnap.colonBright    = cfg.colonBright;
-    rSnap.lavaAutoColor  = cfg.lavaAutoColor;
-    rSnap.lavaHue        = cfg.lavaHue;
-    rSnap.ct6ClockX      = cfg.ct6ClockX;
-    rSnap.ct6ClockY      = cfg.ct6ClockY;
-    rSnap.ct6TempX       = cfg.ct6TempX;
-    rSnap.ct6TempY       = cfg.ct6TempY;
-    rSnap.ct6ClockR      = cfg.ct6ClockR; rSnap.ct6ClockG = cfg.ct6ClockG; rSnap.ct6ClockB = cfg.ct6ClockB;
-    rSnap.ct6TempR       = cfg.ct6TempR;  rSnap.ct6TempG  = cfg.ct6TempG;  rSnap.ct6TempB  = cfg.ct6TempB;
+    refreshRenderSnapLocked();
     xSemaphoreGive(cfgMtx);
-  }
-
-  static uint8_t lastScreenMode = 255;
-  if (snapMode != lastScreenMode) {
-    lastScreenMode = snapMode;
-    displayInvalidationSeq.fetch_add(1);
   }
 
   // Обновление погоды — через флаг weatherTask (не блокирует loop).
@@ -3171,27 +3051,13 @@ void loop() {
     if (needUpdate) weatherRequested = true;
   }
 
-  uint32_t fi2 = 100;
-  switch (snapMode) {
-    case 2: fi2 = 84;   break;
-    case 4: fi2 = 70;   break;
-    case 5: fi2 = 80;   break;
-    case 6: fi2 = 250;  break;
-  }
-
-  if (millis() - lastDrawMs < fi2) {
+  // Единственный режим отображения — «Часы + темп», кадр раз в 250 мс
+  if (millis() - lastDrawMs < 250) {
     // Без yield loop() крутится почти на 100% между кадрами и заметно греет ESP32-C3.
     // 4мс сохраняют отзывчивость WebServer и заметно уменьшают idle-polling.
     delay(4);
     return;
   }
   lastDrawMs = millis();
-
-  switch (snapMode) {
-    case 2: showFire();        break;
-    case 4: showPlasma();      break;
-    case 5: showLava();        break;
-    case 6: showClockTemp();   break;
-    default: showClockTemp();  break;
-  }
+  showClockTemp();
 }
