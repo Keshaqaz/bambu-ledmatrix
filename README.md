@@ -6,7 +6,8 @@
 Система из двух частей:
 
 - **Прошивка ESP32** (`esp32_matrix_controller22/`) — рендер матрицы, веб-интерфейс
-  настроек, Wi-Fi, погода. Матрица живёт на `192.168.1.65`.
+  настроек, Wi-Fi, погода, OTA-обновления с авто-откатом при неудачной прошивке.
+  Матрица живёт на `192.168.1.65`.
 - **Bambu relay** (`esp32_matrix_controller22/tools/bambu_relay/`) — Python-сервис на
   OpenWrt-роутере (`192.168.1.1:8787`): подписывается на MQTT принтера/облака и отдаёт
   статус печати прошивке по HTTP.
@@ -18,3 +19,4 @@
 | Собрать/прошить плату, режимы, веб-превью | [`esp32_matrix_controller22/README.md`](esp32_matrix_controller22/README.md) |
 | Запустить/задеплоить relay, его API и конфиг | [`esp32_matrix_controller22/tools/bambu_relay/README.md`](esp32_matrix_controller22/tools/bambu_relay/README.md) |
 | Рабочий контекст: сеть, тулчейн, принятые решения, грабли | [`CLAUDE.md`](CLAUDE.md) |
+| Как устроена OTA: дизайн, защита от кирпича, протокол проверки | [`OTA_PLAN.md`](OTA_PLAN.md) |

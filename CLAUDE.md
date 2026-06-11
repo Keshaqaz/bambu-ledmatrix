@@ -9,7 +9,7 @@ User-facing docs: `README.md` (repo map), `esp32_matrix_controller22/README.md`
 ## Project
 
 - Firmware project: `esp32_matrix_controller22/`
-- Target board: `ESP32C3 Dev Module` / FQBN `esp32:esp32:esp32c3:PartitionScheme=huge_app`
+- Target board: `ESP32C3 Dev Module` / FQBN `esp32:esp32:esp32c3:PartitionScheme=min_spiffs`
 - Main firmware: `src/app.cpp`; web UI source: `src/index_html.h`; browser preview export: `web/index.html` (re-export via `tools/export_web_ui.sh`, verify via `tools/check_web_ui_export.sh`)
 - Relay: `tools/bambu_relay/relay.py` (deployed on the OpenWrt router)
 
@@ -22,12 +22,14 @@ User-facing docs: `README.md` (repo map), `esp32_matrix_controller22/README.md`
 
 ## Build & Flash
 
-- Working toolchain: `arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=huge_app .` from the project root; flash with `-u -p /dev/cu.usbmodem101`
+- Working toolchain: `arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs --export-binaries .` from the project root; flash over USB with `-u -p /dev/cu.usbmodem101`. Network flash: `espota.py -i 192.168.1.65 -p 3232 -f build/.../*.ino.bin` directly (the `arduino-cli -l network` route needs mDNS discovery, which is disabled on the device)
 - Libraries installed via `arduino-cli lib install`: `FastLED@3.10.3`, `ArduinoJson@7.4.3`
 - PlatformIO is currently broken on this machine: it requires Python ≥3.10, only system 3.9.6 is available. `platformio.ini` is kept for when that is fixed.
 - arduino-cli uses esp32 core 3.3.8. **Core 3.x gotcha:** `NetworkClient::setTimeout()` takes milliseconds (core 2.x, which old PlatformIO builds used, took seconds); `setHandshakeTimeout()` still takes seconds. `setTimeout(8)` = 8 ms killed all weather TLS connections until fixed (commit 932e290). Audit client timeouts when porting code written for core 2.x.
-- OTA is deliberately not supported: one large app partition (`partitions_huge_app.csv`, 3MB app + ~1MB SPIFFS); firmware updates go over USB only. Do not reintroduce OTA slots.
-- ESP32-C3 is single-core: background FreeRTOS tasks and `loop()` time-slice on the same CPU.
+- **OTA (since 2026-06-11):** `min_spiffs` scheme, two 1.875MB app slots (binary limit 1 966 080 bytes, currently ~69%). The stock `default` scheme is forbidden — its 1.25MB slots don't fit the binary (that's why the original OTA attempt failed). Two upload paths: web UI `/api/update` (multipart, no auth, rejects non-app images via `esp_app_desc_t` magic — catches `merged.bin`) and ArduinoOTA/espota on port 3232 (no password, mDNS off). Bump `FW_VERSION` in `src/app.cpp` per iteration; verify via `/api/status` `fwVersion`/`fwPartition` (slot flips app0↔app1 on every successful OTA).
+- **arduino-cli gotcha:** `compile --output-dir <dir>` also silently overwrites the sketch-local `build/` export — a test build (e.g. a deliberately crashing one) can poison the `build/.../*.ino.bin` you later OTA. Verify `build/` freshness (or recompile with `--export-binaries`) before uploading.
+- **Boot-guard anti-brick:** NVS namespace `bootguard` counts boots, cleared after 60 s uptime; 3 consecutive failures → `esp_ota_set_boot_partition()` rollback to the other slot (refuses cleanly if that slot is empty/corrupt). Known tradeoff: 3 manual resets within the first 60 s also trigger rollback.
+- ESP32-C3 is single-core: background FreeRTOS tasks and `loop()` time-slice on the same CPU. During OTA `otaInProgress` freezes weatherTask/bambuTask (no TLS handshakes mid flash write) and Wi-Fi power save is switched off.
 
 ## Display / UI State
 

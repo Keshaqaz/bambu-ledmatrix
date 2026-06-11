@@ -10,7 +10,7 @@
   Recommended board in Arduino IDE:
     ESP32C3 Dev Module
   Partition Scheme:
-    Huge APP (3MB No OTA/1MB SPIFFS)
+    Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS)
 
   Required libraries:
     FastLED

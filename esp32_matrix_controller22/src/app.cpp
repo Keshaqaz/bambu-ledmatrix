@@ -31,6 +31,10 @@
 #include <stddef.h>
 #include <esp_arduino_version.h>
 #include <esp_wifi.h>
+#include <Update.h>
+#include <ArduinoOTA.h>
+#include <esp_ota_ops.h>
+#include <esp_app_format.h>
 #include <atomic>
 #include "app.hpp"
 
@@ -72,6 +76,8 @@ void handleConnectWifi();
 void handleDisconnectWifi();
 void handleReboot();
 void handleWeatherRefresh();
+void handleUpdateUpload();
+void handleUpdateFinal();
 void showBoot();
 void showConnecting();
 static void startAP();
@@ -89,6 +95,9 @@ void loop();
 #define MH           16
 
 static constexpr uint16_t CONFIG_VERSION = 332;
+// Версия прошивки: поднимать при каждой OTA-итерации — по смене значения в
+// /api/status видно, что обновление реально применилось.
+static constexpr const char* FW_VERSION = "3.1.0-2026.06.11";
 static constexpr uint32_t STORED_STATE_MAGIC = 0x4D415458UL; // MATX
 static constexpr uint16_t STORED_STATE_VERSION = 1;
 static constexpr size_t BAMBU_TOKEN_CAPACITY = 384;
@@ -318,6 +327,23 @@ std::atomic<bool> hasSsid{false};
 // после 500 мс — TCP-стек успевает сбросить ответ, анимация не блокируется.
 static std::atomic<bool>     rebootPending{false};
 static std::atomic<uint32_t> rebootMs{0};
+
+// OTA: пока идёт приём образа, weatherTask/bambuTask приостанавливаются, чтобы
+// TLS-handshake (~12 KB heap) не стартовал посреди записи флеша.
+static std::atomic<bool> otaInProgress{false};
+
+// Boot-guard / анти-кирпич: счётчик незавершённых загрузок в отдельном NVS
+// namespace "bootguard" (StoredStateBlob в "matrix" не трогаем). 3 сбоя подряд →
+// откат на другой OTA-слот. 3 ручных ресета в первые 60 с дают тот же эффект —
+// это осознанный компромисс.
+static constexpr uint8_t  BOOT_GUARD_MAX_FAILS = 3;
+static constexpr uint32_t BOOT_GUARD_STABLE_MS = 60000;
+static bool bootGuardCleared = false;
+
+static void bootGuardReset() {
+  Preferences bg;
+  if (bg.begin("bootguard", false)) { bg.putUChar("cnt", 0); bg.end(); }
+}
 
 uint32_t lastWeatherMs  = 0;
 uint32_t lastWeatherAttemptMs = 0;
@@ -2217,6 +2243,8 @@ void handleStatus() {
   }
   doc["uptime"]     = String(millis() / 1000 / 3600, DEC) + "ч " +
                       String((millis() / 1000 % 3600) / 60, DEC) + "м";
+  doc["fwVersion"]  = FW_VERSION;
+  doc["fwPartition"] = esp_ota_get_running_partition()->label; // app0/app1 — виден фактический слот
   doc["heap"]       = String(ESP.getFreeHeap() / 1024) + " KB";
   doc["rssi"]       = wifiConnected.load() ? String(WiFi.RSSI()) + " dBm" : "—";
   doc["connResult"] = wifiConnResult.load();
@@ -2373,6 +2401,97 @@ void handleWeatherRefresh() {
 }
 
 // ════════════════════════════════════════════════════════════
+//  OTA: веб-загрузка /api/update + ArduinoOTA (espota)
+//  Образ пишется в неактивный слот; otadata переключается атомарно
+//  в Update.end() — до этого момента обрыв безвреден.
+// ════════════════════════════════════════════════════════════
+static void otaEnterUpdateMode() {
+  otaInProgress.store(true);
+  clearMatrix(); FastLED.show();        // гасим RMT/LED на время записи флеша
+  esp_wifi_set_ps(WIFI_PS_NONE);        // power save рвёт приём при flash-операциях
+}
+
+static void otaAbortUpdateMode() {
+  otaInProgress.store(false);
+  esp_wifi_set_ps(WIFI_PS_MIN_MODEM);   // steady state и в STA, и в AP
+}
+
+// Upload-callback: вызывается из server.handleClient() порциями ~1.4 КБ.
+// Пока идёт приём, loop() заблокирован внутри handleClient — рендер
+// останавливается сам, дополнительной синхронизации не нужно.
+void handleUpdateUpload() {
+  HTTPUpload& up = server.upload();
+  switch (up.status) {
+    case UPLOAD_FILE_START: {
+      otaEnterUpdateMode();
+      flushDeferredSave(true);          // дописать отложенный конфиг до перешивки
+      // Точный размер приходит query-параметром (?size=N от веб-UI): Update.begin
+      // проверит влезание в слот до первой записи. Без параметра — UNKNOWN.
+      size_t expected = UPDATE_SIZE_UNKNOWN;
+      if (server.hasArg("size")) {
+        long sz = server.arg("size").toInt();
+        if (sz > 0) expected = (size_t)sz;
+      }
+      Serial.printf("[OTA] Web upload: %s (%u bytes)\n",
+                    up.filename.c_str(), (unsigned)(expected == UPDATE_SIZE_UNKNOWN ? 0 : expected));
+      if (!Update.begin(expected)) Update.printError(Serial);
+      break;
+    }
+    case UPLOAD_FILE_WRITE: {
+      if (!Update.isRunning()) break;
+      if (up.totalSize == 0 && up.currentSize >= 0x24) {
+        // Первый чанк: отличаем app-образ от bootloader/merged.bin — оба
+        // начинаются с 0xE9, но esp_app_desc_t (magic 0xABCD5432 по смещению
+        // 0x20) есть только у приложения. merged.bin влезает в слот и без этой
+        // проверки прошёл бы Update до битого слота.
+        uint32_t descMagic = 0;
+        memcpy(&descMagic, up.buf + 0x20, sizeof(descMagic));
+        if (up.buf[0] != 0xE9 || descMagic != ESP_APP_DESC_MAGIC_WORD) {
+          Serial.println("[OTA] Отклонено: не app-образ (загружайте .ino.bin, не merged.bin)");
+          Update.abort();
+          break;
+        }
+      }
+      if (Update.write(up.buf, up.currentSize) != up.currentSize)
+        Update.printError(Serial);      // ошибка запомнена в Update, отдадим в final
+      break;
+    }
+    case UPLOAD_FILE_END:
+      if (Update.isRunning() && Update.end(true)) // true: завершить и при UNKNOWN size
+        Serial.printf("[OTA] Образ принят: %u байт\n", up.totalSize);
+      else
+        Update.printError(Serial);
+      break;
+    case UPLOAD_FILE_ABORTED:
+      Update.abort();
+      otaAbortUpdateMode();
+      Serial.println("[OTA] Upload прерван клиентом");
+      break;
+    default: break;
+  }
+}
+
+void handleUpdateFinal() {
+  if (!checkAuth()) { server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
+  if (Update.hasError() || !Update.isFinished()) {
+    JsonDocument doc;
+    doc["ok"] = false;
+    doc["error"] = Update.errorString();
+    String out; serializeJson(doc, out);
+    Update.abort();
+    otaAbortUpdateMode();
+    server.send(500, "application/json", out);
+    return;
+  }
+  // Новая прошивка не должна унаследовать счётчик, если OTA прошло в первые 60 с
+  xSemaphoreTake(prefsMtx, portMAX_DELAY);
+  bootGuardReset();
+  xSemaphoreGive(prefsMtx);
+  server.send(200, "application/json", "{\"ok\":true}");
+  rebootMs.store(millis()); rebootPending.store(true); // ответ успевает уйти клиенту
+}
+
+// ════════════════════════════════════════════════════════════
 //  BOOT-АНИМАЦИЯ И СТАТУС
 // ════════════════════════════════════════════════════════════
 void showBoot() {
@@ -2502,6 +2621,7 @@ void wifiConnTask(void* param) {
 // ════════════════════════════════════════════════════════════
 void weatherTask(void* param) {
   for (;;) {
+    if (otaInProgress.load()) { vTaskDelay(200 / portTICK_PERIOD_MS); continue; }
     if (weatherRequested.exchange(false)) {
       if (wifiConnected) {
         Serial.println("[Weather] Запрос погоды...");
@@ -2522,6 +2642,7 @@ void weatherTask(void* param) {
 
 void bambuTask(void* param) {
   for (;;) {
+    if (otaInProgress.load()) { vTaskDelay(200 / portTICK_PERIOD_MS); continue; }
     char relayUrl[sizeof(bambuCfg.relayUrl)];
     char relayKey[sizeof(bambuCfg.relayKey)];
     bool enabled = false;
@@ -2601,6 +2722,38 @@ void setup() {
   Serial.println("\n╔════════════════════════╗");
   Serial.println("║  ESP32 LED Matrix v3.0 ║");
   Serial.println("╚════════════════════════╝");
+  Serial.printf("FW %s, partition %s\n", FW_VERSION, esp_ota_get_running_partition()->label);
+
+  // ── Boot-guard / анти-кирпич ──
+  // Максимально рано, до FastLED/loadConfig: краш в ранней инициализации тоже
+  // должен учитываться. Задачи ещё не созданы — NVS доступен без мьютекса.
+  {
+    Preferences bg;
+    if (bg.begin("bootguard", false)) {
+      uint8_t cnt = bg.getUChar("cnt", 0) + 1;
+      if (cnt > BOOT_GUARD_MAX_FAILS) {
+        const esp_partition_t* run  = esp_ota_get_running_partition();
+        const esp_partition_t* next = esp_ota_get_next_update_partition(NULL);
+        Serial.printf("[BootGuard] %u сбоев подряд, пробуем откат %s → %s\n",
+                      (unsigned)(cnt - 1), run ? run->label : "?", next ? next->label : "?");
+        // Счётчик обнуляем до отката, иначе пинг-понг между слотами без шанса
+        // на стабильные 60 с. esp_ota_set_boot_partition сам верифицирует образ:
+        // на пустом/битом слоте вернёт ошибку и останемся на текущей прошивке.
+        bg.putUChar("cnt", 0);
+        if (next && next != run && esp_ota_set_boot_partition(next) == ESP_OK) {
+          bg.end();
+          Serial.println("[BootGuard] Откат принят, перезагрузка");
+          delay(100);
+          ESP.restart();
+        }
+        Serial.println("[BootGuard] Откат невозможен (второй слот пуст/битый) — продолжаем");
+        cnt = 1;
+      }
+      bg.putUChar("cnt", cnt);
+      bg.end();
+      Serial.printf("[BootGuard] boot count = %u\n", (unsigned)cnt);
+    }
+  }
 
   FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
   FastLED.setMaxPowerInVoltsAndMilliamps(5, 2500);
@@ -2721,9 +2874,33 @@ void setup() {
 
   server.on("/api/reboot",    HTTP_POST, handleReboot);
   server.on("/api/weather/refresh", HTTP_POST, handleWeatherRefresh);
+  server.on("/api/update",    HTTP_POST, handleUpdateFinal, handleUpdateUpload);
   server.onNotFound([](){ server.sendHeader("Location","/"); server.send(302); });
   server.begin();
   Serial.println("Server started");
+
+  // ── ArduinoOTA (espota, порт 3232): arduino-cli upload --protocol network ──
+  ArduinoOTA.setHostname("esp32-matrix");
+  ArduinoOTA.setMdnsEnabled(false);     // IP статичный, espota работает по IP — mDNS не нужен (и ~5-10 KB heap целее)
+  ArduinoOTA.onStart([]() {
+    otaEnterUpdateMode();
+    flushDeferredSave(true);
+    Serial.println("[OTA] ArduinoOTA start");
+  });
+  ArduinoOTA.onEnd([]() {
+    // espota перезагружает устройство сам, final-обработчика нет — счётчик
+    // boot-guard сбрасываем здесь, чтобы он не уехал в новую прошивку.
+    xSemaphoreTake(prefsMtx, portMAX_DELAY);
+    bootGuardReset();
+    xSemaphoreGive(prefsMtx);
+    Serial.println("[OTA] ArduinoOTA done");
+  });
+  ArduinoOTA.onError([](ota_error_t err) {
+    otaAbortUpdateMode();
+    Serial.printf("[OTA] ArduinoOTA error %u\n", (unsigned)err);
+  });
+  ArduinoOTA.begin();
+  Serial.println("ArduinoOTA listening on :3232");
 
   // ESP32-C3 одноядерный: фоновые задачи time-slice на том же ядре, WebServer остаётся в loop task.
   BaseType_t weatherTaskOk = xTaskCreatePinnedToCore(
@@ -2773,6 +2950,18 @@ void loop() {
   // Веб-сервер в loop task (WebServer не потокобезопасен)
   dnsServer.processNextRequest();
   server.handleClient();
+  ArduinoOTA.handle();
+
+  // Boot-guard: 60 с аптайма без краша = загрузка успешна. Критерий — только
+  // millis(): прошивка в AP-режиме без Wi-Fi тоже валидна, привязка к Wi-Fi
+  // давала бы ложные откаты.
+  if (!bootGuardCleared && millis() >= BOOT_GUARD_STABLE_MS) {
+    bootGuardCleared = true;
+    xSemaphoreTake(prefsMtx, portMAX_DELAY);
+    bootGuardReset();
+    xSemaphoreGive(prefsMtx);
+    Serial.println("[BootGuard] Загрузка стабильна, счётчик сброшен");
+  }
 
   // Loop-task: WiFi.mode/begin вызываем из loop task (единая точка доступа к WiFi API).
   // wifiConnTask выставляет wifiDoConnect с уже сохранёнными ssid/pass.

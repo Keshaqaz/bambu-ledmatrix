@@ -467,6 +467,15 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:17px;heigh
     <div class="ct">Управление устройством</div>
     <button class="btn-sec" style="color:#e85050;border-color:#e85050" onclick="rebootDevice()">🔄 Перезагрузить устройство</button>
   </div>
+  <div class="card">
+    <div class="ct">Обновление прошивки</div>
+    <div class="section-lead">Файл <b>esp32_matrix_controller22.ino.bin</b> (сборка min_spiffs), не merged.bin. Образ пишется в запасной слот — до перезагрузки работает текущая прошивка, обрыв загрузки безопасен.</div>
+    <div class="mini" style="margin-bottom:8px">Версия: <span id="fwVer">—</span> · слот <span id="fwPart">—</span></div>
+    <input type="file" id="fwFile" accept=".bin" style="margin-bottom:10px;width:100%;color:var(--muted2);font-size:.8rem">
+    <div id="fwProgWrap" style="display:none;margin:0 0 10px"><div style="height:8px;background:var(--card);border:1px solid var(--border);border-radius:4px;overflow:hidden"><div id="fwProgBar" style="height:100%;background:var(--glow);width:0%"></div></div><div class="mini" id="fwProgTxt" style="margin-top:4px">0%</div></div>
+    <button class="btn-sec" id="fwBtn" onclick="uploadFirmware()">⬆ Обновить прошивку</button>
+    <div class="mini" id="fwResult" style="margin-top:8px">—</div>
+  </div>
   </div>
 </div>
 
@@ -484,7 +493,7 @@ let saveAwaitPersist=false;
 const PREVIEW_MODE=window.location.protocol==='file:';
 let mockConnResult=0,mockSettings={mode:6,brightness:80,autoColor:true,use24h:true,showColon:true,colonBright:90,ntpServer:'pool.ntp.org',tzOffset:3,autoBrightness:false,brightnessDay:80,brightnessNight:20,dayStartHour:7,nightStartHour:22,autoBrSunMode:false,ct6ClockX:0,ct6ClockY:2,ct6TempX:-1,ct6TempY:9,ct6ClockR:255,ct6ClockG:128,ct6ClockB:0,ct6TempR:0,ct6TempG:200,ct6TempB:255,updateMin:10,city:'Moscow',owmLat:55.7558,owmLon:37.6173,owmUseCoords:false,lavaAutoColor:true,lavaHue:15,rotation:0,flipH:false,flipV:false,bambuEnabled:true,bambuRelayUrl:'http://router.local:8787/status',bambuRelayKeySet:false,bambuDetail:'Preview relay: печать, 42%',bambuConnected:true,bambuPrinterOnline:true,sunTimeValid:true,sunriseH:6,sunriseM:12,sunsetH:20,sunsetM:4};
 function mockJson(payload,status=200){return new Response(JSON.stringify(payload),{status,headers:{'Content-Type':'application/json'}});}
-function mockStatus(){return {wifi:false,ap:true,ssid:'',ip:'192.168.4.1',temp:23.4,cpuTemp:41.2,uptime:'0ч 12м',heap:'214 KB',rssi:'—',connResult:mockConnResult,connIp:mockConnResult===2?'192.168.1.88':'',connStatus:0,connStatusText:'',savePending:false,saveError:false,bambuEnabled:mockSettings.bambuEnabled,bambuConfigured:!!mockSettings.bambuRelayUrl,bambuConnected:mockSettings.bambuConnected,bambuPrinterOnline:mockSettings.bambuPrinterOnline,bambuLifecycle:3,bambuProgress:42,bambuDetail:mockSettings.bambuDetail,sunTimeValid:mockSettings.sunTimeValid,sunriseH:mockSettings.sunriseH,sunriseM:mockSettings.sunriseM,sunsetH:mockSettings.sunsetH,sunsetM:mockSettings.sunsetM};}
+function mockStatus(){return {wifi:false,ap:true,ssid:'',ip:'192.168.4.1',temp:23.4,cpuTemp:41.2,uptime:'0ч 12м',heap:'214 KB',fwVersion:'preview',fwPartition:'app0',rssi:'—',connResult:mockConnResult,connIp:mockConnResult===2?'192.168.1.88':'',connStatus:0,connStatusText:'',savePending:false,saveError:false,bambuEnabled:mockSettings.bambuEnabled,bambuConfigured:!!mockSettings.bambuRelayUrl,bambuConnected:mockSettings.bambuConnected,bambuPrinterOnline:mockSettings.bambuPrinterOnline,bambuLifecycle:3,bambuProgress:42,bambuDetail:mockSettings.bambuDetail,sunTimeValid:mockSettings.sunTimeValid,sunriseH:mockSettings.sunriseH,sunriseM:mockSettings.sunriseM,sunsetH:mockSettings.sunsetH,sunsetM:mockSettings.sunsetM};}
 function showTab(t){TABS.forEach(id=>{document.getElementById('tab-'+id).classList.toggle('visible',id===t);document.querySelectorAll('.tab').forEach(btn=>btn.classList.toggle('active',btn.dataset.tab===t));});}
 function showSettingsSub(id){settingsSub=id;let activeBtn=null;document.querySelectorAll('.subtab').forEach(btn=>{const on=btn.dataset.subtab===id;btn.classList.toggle('active',on);if(on)activeBtn=btn;});document.querySelectorAll('.subsection').forEach(el=>el.classList.toggle('visible',el.id==='settings-'+id));if(activeBtn&&window.innerWidth<=520)activeBtn.scrollIntoView({behavior:'smooth',inline:'center',block:'nearest'});}
 function setSaveState(state,msg){const el=document.getElementById('saveState');if(!el)return;el.className='syncbar'+(state?' '+state:'');el.textContent=msg;clearTimeout(autosaveNoticeTimer);if(state==='saved'){autosaveNoticeTimer=setTimeout(()=>{if(!autosaveRunning&&!autosavePending)setSaveState('', 'Автосохранение включено');},1400);}}
@@ -560,6 +569,8 @@ async function fetchStatus(){
     document.getElementById('ssidVal').textContent=d.wifi?(d.ssid||'—'):(d.ap?'ESP32-Matrix AP':'—'); document.getElementById('ipVal').textContent=d.ip||'—'; document.getElementById('uptVal').textContent=d.uptime||'—'; document.getElementById('heapVal').textContent=d.heap||'—'; document.getElementById('rssiVal').textContent=d.rssi||'—'; document.getElementById('wifiModeVal').textContent=describeWifiMode(d); document.getElementById('cpuVal').textContent=c; document.getElementById('deviceNetVal').textContent=d.wifi?(d.ip||'WiFi'):describeWifiMode(d);
     document.getElementById('bambuStatus').textContent=d.bambuDetail||'Bambu выключен';
     updateBambuHeader(d);
+    if(d.fwVersion)document.getElementById('fwVer').textContent=d.fwVersion;
+    if(d.fwPartition)document.getElementById('fwPart').textContent=d.fwPartition;
     if(d.saveError){saveAwaitPersist=false;setSaveState('error','Ошибка записи в память');}
     else if(saveAwaitPersist&&d.savePending){setSaveState('saving','Применено, записываем в память...');}
     else if(saveAwaitPersist&&!d.savePending){saveAwaitPersist=false;setSaveState('saved','Изменения записаны в память');}
@@ -590,9 +601,44 @@ function updateWifiUI(d){const ws=document.getElementById('wifiStatus');const ba
 async function requestWeatherRefresh(){try{const res=await apiFetch('/api/weather/refresh',{method:'POST',body:'{}'});if(!res.ok)throw new Error('refresh_failed');toast('🔄 Запрос погоды отправлен');setTimeout(fetchStatus,4000);}catch(e){toast('❌ Не удалось запросить погоду');}}
 async function rebootDevice(){if(!confirm('Перезагрузить устройство?'))return;try{const res=await apiFetch('/api/reboot',{method:'POST',body:'{}'});if(!res.ok)throw new Error('reboot_failed');toast('🔄 Перезагрузка...');}catch(e){toast('❌ Не удалось перезагрузить устройство');}}
 
+let fwBusy=false;
+function fwMsg(t,color){const el=document.getElementById('fwResult');el.textContent=t;el.style.color=color||'';}
+function uploadFirmware(){
+  if(fwBusy)return;
+  const f=document.getElementById('fwFile').files[0];
+  if(!f){toast('❌ Выберите .bin файл');return;}
+  if(!/\.bin$/i.test(f.name)){toast('❌ Нужен файл .bin');return;}
+  if(/merged/i.test(f.name)){fwMsg('Это merged.bin — загружайте esp32_matrix_controller22.ino.bin','var(--red)');return;}
+  if(!confirm('Прошить устройство файлом «'+f.name+'» ('+Math.round(f.size/1024)+' КБ)? Во время загрузки не отключайте питание.'))return;
+  fwBusy=true;
+  const btn=document.getElementById('fwBtn');btn.disabled=true;
+  const bar=document.getElementById('fwProgBar'),txt=document.getElementById('fwProgTxt');
+  document.getElementById('fwProgWrap').style.display='block';bar.style.width='0%';txt.textContent='0%';
+  // WebServer однопоточный: на время загрузки прекращаем опрос /api/status
+  clearInterval(statusInterval);statusInterval=0;
+  const prevVer=document.getElementById('fwVer').textContent,prevPart=document.getElementById('fwPart').textContent;
+  const finish=ok=>{fwBusy=false;btn.disabled=false;if(!statusInterval){fetchStatus();statusInterval=setInterval(fetchStatus,3000);}};
+  if(PREVIEW_MODE){let p=0;const t=setInterval(()=>{p=Math.min(100,p+7);bar.style.width=p+'%';txt.textContent=p+'%';if(p===100){clearInterval(t);fwMsg('Preview: загрузка смоделирована','var(--green)');finish(false);}},120);return;}
+  const fd=new FormData();fd.append('firmware',f,f.name);
+  const xhr=new XMLHttpRequest();
+  xhr.open('POST','/api/update?size='+f.size);
+  xhr.timeout=300000;
+  xhr.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded*100/e.total);bar.style.width=p+'%';txt.textContent=p+'%'+(p===100?' — проверка и запись…':'');}};
+  xhr.onload=()=>{
+    if(xhr.status===200){
+      fwMsg('Прошивка загружена, устройство перезагружается…','var(--green)');toast('🔄 Перезагрузка...');
+      // После OTA слот всегда меняется (app0↔app1) — ждём смены fwPartition/fwVersion
+      const poll=setInterval(async()=>{try{const d=await(await fetch('/api/status')).json();if(d.fwVersion&&(d.fwVersion!==prevVer||d.fwPartition!==prevPart)){clearInterval(poll);fwMsg('✅ Обновлено до '+d.fwVersion+' (слот '+(d.fwPartition||'?')+')','var(--green)');finish(true);}}catch(e){}},2000);
+      setTimeout(()=>{clearInterval(poll);if(fwBusy){fwMsg('Устройство не ответило после перезагрузки — обновите страницу и проверьте версию','var(--red)');finish(false);}},120000);
+    }else{let msg='HTTP '+xhr.status;try{msg=JSON.parse(xhr.responseText).error||msg;}catch(e){}fwMsg('❌ '+msg,'var(--red)');finish(false);}
+  };
+  xhr.onerror=xhr.ontimeout=()=>{fwMsg('Связь потеряна — если загрузка не завершилась, устройство продолжит работать на старой прошивке','var(--red)');finish(false);};
+  xhr.send(fd);
+}
+
 showSettingsSub(settingsSub); loadSettings(); fetchStatus(); onAutoColor(); onLavaAuto(); onAutoBrightness(); onSunMode(); onOwmCoords();
 let statusInterval=setInterval(fetchStatus,3000);
-document.addEventListener('visibilitychange',()=>{clearInterval(statusInterval);statusInterval=0;if(!document.hidden){fetchStatus();statusInterval=setInterval(fetchStatus,3000);}});
+document.addEventListener('visibilitychange',()=>{if(fwBusy)return;clearInterval(statusInterval);statusInterval=0;if(!document.hidden){fetchStatus();statusInterval=setInterval(fetchStatus,3000);}});
 window.addEventListener('beforeunload',e=>{if(autosaveRunning||autosavePending||autosaveQueued){e.preventDefault();e.returnValue='Изменения ещё сохраняются';}});
 </script>
 </body></html>

@@ -16,11 +16,13 @@
 
 - Board package: `esp32 by Espressif Systems`
 - Board: `ESP32C3 Dev Module`
-- Partition Scheme: `Huge APP (3MB No OTA/1MB SPIFFS)`
+- Partition Scheme: `Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS)`
 
-OTA-обновления в этом проекте сознательно не поддерживаются. Целевой сценарий обновления
-прошивки — через USB/serial из Arduino IDE или PlatformIO. Поэтому разметка использует один
-большой app-раздел вместо двух OTA-слотов.
+Прошивка поддерживает OTA-обновления: два app-слота по 1.875 MB (`min_spiffs`),
+образ пишется в неактивный слот, переключение происходит атомарно в конце загрузки.
+Подробности — в разделе «OTA-обновления» ниже. Схему `default` (слоты ~1.25 MB)
+использовать нельзя: бинарник в неё не влезает — именно поэтому первая попытка
+OTA в этом проекте когда-то провалилась.
 
 Какие библиотеки должны быть установлены:
 
@@ -30,16 +32,56 @@ OTA-обновления в этом проекте сознательно не 
 Основной путь сборки и прошивки — `arduino-cli`:
 
 ```bash
-arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=huge_app .
-# сборка + прошивка подключённой платы:
-arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=huge_app -u -p /dev/cu.usbmodem101 .
+arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs --export-binaries .
+# сборка + прошивка по USB:
+arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs -u -p /dev/cu.usbmodem101 .
+# прошивка по сети (OTA, устройство уже на min_spiffs; mDNS на устройстве
+# выключен, поэтому arduino-cli «-l network» порт не найдёт — зовём espota напрямую):
+python3 ~/Library/Arduino15/packages/esp32/hardware/esp32/3.3.8/tools/espota.py \
+  -i 192.168.1.65 -p 3232 -f build/esp32.esp32.esp32c3/esp32_matrix_controller22.ino.bin
 ```
+
+## OTA-обновления
+
+Два способа:
+
+1. **Веб-интерфейс**: `Настройки → Устройство → Обновление прошивки`. Загружать
+   `build/esp32.esp32.esp32c3/esp32_matrix_controller22.ino.bin` (появляется при
+   сборке с `--export-binaries`). **Не** `merged.bin` — прошивка отклонит его
+   (нет app-дескриптора), но лучше не путать. Перед заливкой проверяйте свежесть
+   `build/`: `arduino-cli compile --output-dir <dir>` молча перезаписывает и его,
+   так что там может лежать не та сборка, что вы думаете.
+2. **espota по сети**: команда `espota.py` выше (порт 3232). Через
+   `arduino-cli -l network` не работает: discovery сетевых портов требует mDNS,
+   а он на устройстве выключен за ненадобностью — IP матрицы фактически
+   статичный, espota работает по IP напрямую; заодно это экономит ~5–10 KB
+   heap и одну фоновую задачу. Если понадобится discovery —
+   `ArduinoOTA.setMdnsEnabled(true)` в `src/app.cpp`.
+
+Защита от кирпича:
+
+- Образ пишется в неактивный слот; обрыв связи/питания во время загрузки
+  безвреден — устройство продолжает работать на старой прошивке.
+- Boot-guard: счётчик загрузок в NVS (namespace `bootguard`) сбрасывается после
+  60 с стабильной работы. 3 сбоя подряд → автоматический откат на предыдущий
+  слот. Побочный эффект: 3 ручных ресета подряд в первые 60 с тоже вызовут
+  откат — это осознанный компромисс.
+- USB-прошивка всегда остаётся запасным путём.
+
+Проверка после OTA: `/api/status` отдаёт `fwVersion` (поднимайте `FW_VERSION`
+в `src/app.cpp` при каждой итерации) и `fwPartition` (`app0`/`app1` — слот
+меняется при каждом успешном OTA).
+
+Переход со старой разметки `huge_app` на `min_spiffs` требует одной прошивки по
+USB (смена таблицы партиций по OTA невозможна). NVS-раздел расположен по тому же
+смещению — настройки при этом сохраняются. Для матрицы на `192.168.1.65` переход
+выполнен 2026-06-11, оба слота проверены.
 
 Важно: arduino-cli использует ядро esp32 3.x, где `NetworkClient::setTimeout()`
 принимает миллисекунды (в ядре 2.x были секунды). При портировании кода со старого
 ядра проверяйте клиентские таймауты.
 
-PlatformIO-конфигурация (`platformio.ini`, `partitions_huge_app.csv` — 3MB app + ~1MB SPIFFS)
+PlatformIO-конфигурация (`platformio.ini`, разметка `min_spiffs.csv` из ядра)
 сохранена, но PlatformIO требует Python ≥3.10 и на текущей машине не работает
 (системный Python 3.9).
 
@@ -83,7 +125,7 @@ for f in tools/export_web_ui.sh tools/check_web_ui_export.sh tools/bambu_relay/o
 Для проверки прошивки:
 
 ```bash
-arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=huge_app .
+arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs .
 ```
 
 ## Bambu Relay
