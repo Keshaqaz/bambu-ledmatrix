@@ -850,6 +850,7 @@ static bool bambuFetchRelayStatus(const char* relayUrl, const char* relayKey) {
   if (!relayUrl || !relayUrl[0]) return false;
 
   HTTPClient http;
+  http.setConnectTimeout(5000);
   http.setTimeout(5000);
   if (!http.begin(relayUrl)) {
     Serial.println("[BambuRelay] begin failed");
@@ -1706,11 +1707,13 @@ void fetchWeather() {
 
     WiFiClientSecure meteoClient;
     meteoClient.setInsecure();
-    meteoClient.setTimeout(8);
-    meteoClient.setHandshakeTimeout(8);
+    // Fallback-источник: таймауты короче основного, чтобы при недоступности
+    // обоих API weatherTask не блокировался дольше необходимого.
+    meteoClient.setTimeout(5);
+    meteoClient.setHandshakeTimeout(5);
     HTTPClient meteoHttp;
-    meteoHttp.setConnectTimeout(8000);
-    meteoHttp.setTimeout(8000);
+    meteoHttp.setConnectTimeout(5000);
+    meteoHttp.setTimeout(5000);
     meteoHttp.setReuse(false);
     meteoHttp.useHTTP10(true);
     String meteoUrl = String("https://api.open-meteo.com/v1/forecast?latitude=") +
@@ -1783,6 +1786,7 @@ void fetchSunriseSunset() {
   WiFiClientSecure sc;
   sc.setInsecure(); // сертификат не проверяем — экономим RAM, API публичный
   HTTPClient http;
+  http.setConnectTimeout(5000);
   http.setTimeout(8000);
   // Для ArduinoJson надёжнее получить небольшой JSON-ответ целиком:
   // потоковый разбор через HTTPClient::getStream() здесь иногда ловил
@@ -1806,7 +1810,12 @@ void fetchSunriseSunset() {
       const char* rStr = doc["results"]["sunrise"] | "";
       const char* sStr = doc["results"]["sunset"]  | "";
       Serial.printf("[Sun] sunrise='%s' sunset='%s'\n", rStr, sStr);
-      if (strlen(rStr) >= 16 && strlen(sStr) >= 16) {
+      auto isoTimeDigitsOk = [](const char* s) {
+        return isdigit((unsigned char)s[11]) && isdigit((unsigned char)s[12]) &&
+               isdigit((unsigned char)s[14]) && isdigit((unsigned char)s[15]);
+      };
+      if (strlen(rStr) >= 16 && strlen(sStr) >= 16 &&
+          isoTimeDigitsOk(rStr) && isoTimeDigitsOk(sStr)) {
         // Извлекаем UTC HH:MM из позиций 11-15 ISO-строки
         int rH = (rStr[11]-'0')*10 + (rStr[12]-'0');
         int rM = (rStr[14]-'0')*10 + (rStr[15]-'0');
@@ -1829,8 +1838,8 @@ void fetchSunriseSunset() {
         Serial.printf("[Sun] Восход %02d:%02d  Закат %02d:%02d (local UTC%+.2g)\n",
                       rH, rM, sH, sM, tzF);
       } else {
-        Serial.printf("[Sun] Строки слишком короткие: rise=%u set=%u\n",
-                      strlen(rStr), strlen(sStr));
+        Serial.printf("[Sun] Неожиданный формат времени: rise='%s' set='%s'\n",
+                      rStr, sStr);
       }
     }
   } else {

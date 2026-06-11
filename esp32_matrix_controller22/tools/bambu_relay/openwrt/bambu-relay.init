@@ -10,10 +10,18 @@ SCRIPT="/root/bambu_relay.py"
 CONFIG="/root/bambu_relay.conf"
 
 load_relay_config() {
-  [ -f "$CONFIG" ] && . "$CONFIG"
+  if [ -f "$CONFIG" ]; then
+    # Config holds BAMBU_CLOUD_TOKEN / BAMBU_PRINTER_ACCESS_CODE.
+    case "$(ls -l "$CONFIG" 2>/dev/null | cut -c5-10)" in
+      ------) ;;
+      *) echo "$SERVICE_NAME: warning: $CONFIG is readable by group/others, run: chmod 600 $CONFIG" ;;
+    esac
+    . "$CONFIG"
+  fi
 
   : "${BAMBU_RELAY_HOST:=0.0.0.0}"
   : "${BAMBU_RELAY_PORT:=8787}"
+  : "${BAMBU_RELAY_STALE_SECONDS:=70}"
   : "${BAMBU_MQTT_HOST:=us.mqtt.bambulab.com}"
   : "${BAMBU_MQTT_PORT:=8883}"
   : "${BAMBU_MQTT_USERNAME:=bblp}"
@@ -39,6 +47,7 @@ start_service() {
   procd_set_param command /bin/sh -c \
     ". \"$CONFIG\"; \
      export BAMBU_PRINTER_SERIAL BAMBU_RELAY_HOST BAMBU_RELAY_PORT BAMBU_RELAY_KEY \
+            BAMBU_RELAY_STALE_SECONDS \
             BAMBU_CLOUD_TOKEN BAMBU_CLOUD_UID BAMBU_PRINTER_HOST BAMBU_PRINTER_ACCESS_CODE \
             BAMBU_MQTT_HOST BAMBU_MQTT_PORT BAMBU_MQTT_USERNAME; \
      exec \"$PYTHON\" \"$SCRIPT\""

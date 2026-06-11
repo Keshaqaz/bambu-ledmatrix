@@ -1,6 +1,6 @@
 # ESP32 Matrix Controller: Working Context
 
-Last updated: 2026-04-12 12:33 MSK
+Last updated: 2026-06-11
 
 ## Project
 
@@ -123,6 +123,13 @@ Last updated: 2026-04-12 12:33 MSK
 - Relay now has a grace-period rule for `finished`:
   - it keeps `finished` briefly
   - then auto-demotes to `idle`
+- Relay hardening (2026-06-11):
+  - `X-Relay-Key` is compared with `hmac.compare_digest` (timing-safe)
+  - `/healthz` answers `{"ok": true}` without auth and without print data
+  - SIGTERM handler shuts the HTTP server down gracefully so MQTT disconnects cleanly under procd restart
+  - keepalive thread survives publish exceptions
+  - stale TTL is configurable via `BAMBU_RELAY_STALE_SECONDS` (default 70)
+  - init script warns when `/root/bambu_relay.conf` is readable by group/others
 
 ## Current Working Point
 
@@ -199,6 +206,9 @@ Last updated: 2026-04-12 12:33 MSK
 - If changing relay logic, update both:
   - local project copy `tools/bambu_relay/relay.py`
   - router copy `/root/bambu_relay.py`
+- Router IP is `192.168.1.1`, matrix is `192.168.1.65`; relay URL in matrix settings is `http://192.168.1.1:8787/status`
+- SSH to the router is password-only (no key installed); deploys need an interactive scp/ssh session
+- As of 2026-06-11 the router copy of relay.py predates `safe_int`/`stage_from_lifecycle`/auth hardening and must be redeployed
 
 ## Good Next Steps
 

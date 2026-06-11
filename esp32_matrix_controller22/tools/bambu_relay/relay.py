@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+import hmac
 import json
 import os
+import signal
 import ssl
 import threading
 import time
@@ -20,6 +22,7 @@ def parse_args():
     parser.add_argument("--listen-host", default=env("BAMBU_RELAY_HOST", "0.0.0.0"))
     parser.add_argument("--listen-port", type=int, default=int(env("BAMBU_RELAY_PORT", "8787")))
     parser.add_argument("--auth-key", default=env("BAMBU_RELAY_KEY"))
+    parser.add_argument("--stale-seconds", type=float, default=float(env("BAMBU_RELAY_STALE_SECONDS", "70")))
 
     parser.add_argument("--cloud-token", default=env("BAMBU_CLOUD_TOKEN"))
     parser.add_argument("--cloud-uid", default=env("BAMBU_CLOUD_UID"))
@@ -160,10 +163,11 @@ def stage_from_lifecycle(lifecycle: str) -> str:
 
 
 class RelayState:
-    def __init__(self, serial: str, source: str):
+    def __init__(self, serial: str, source: str, stale_seconds: float = 70.0):
         self.lock = threading.Lock()
         self.serial = serial
         self.source = source
+        self.stale_seconds = stale_seconds
         self.connected = False
         self.last_message_at = 0.0
         self.last_printer_report_at = 0.0
@@ -334,7 +338,7 @@ class RelayState:
                 payload["status"] = "IDLE"
                 payload["stage"] = "idle"
                 payload["detail"] = "idle"
-            if self.last_printer_report_at and time.time() - self.last_printer_report_at > 70:
+            if self.last_printer_report_at and time.time() - self.last_printer_report_at > self.stale_seconds:
                 self._apply_unknown_printer_snapshot(payload, "MQTT stale, ждём новое сообщение")
             return payload
 
@@ -353,11 +357,14 @@ class RelayHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path not in ("/status", "/healthz", "/"):
+        if self.path == "/healthz":
+            self._send_json(200, {"ok": True})
+            return
+        if self.path not in ("/status", "/"):
             self._send_json(404, {"ok": False, "error": "not_found"})
             return
         if self.auth_key:
-            if self.headers.get("X-Relay-Key", "") != self.auth_key:
+            if not hmac.compare_digest(self.headers.get("X-Relay-Key", ""), self.auth_key):
                 self._send_json(401, {"ok": False, "error": "unauthorized"})
                 return
         self._send_json(200, self.state.get_payload())
@@ -398,7 +405,7 @@ def main():
         mqtt_password = args.printer_access_code
         source = "lan_mqtt"
 
-    state = RelayState(serial, source)
+    state = RelayState(serial, source, stale_seconds=args.stale_seconds)
     report_topic = f"device/{serial}/report"
     request_topic = f"device/{serial}/request"
 
@@ -434,7 +441,8 @@ def main():
     def on_message(_client, _userdata, msg):
         try:
             root = json.loads(msg.payload.decode("utf-8", "ignore"))
-        except Exception:
+        except Exception as exc:
+            print(f"[relay] bad MQTT payload on {msg.topic}: {exc}")
             return
         print_obj = root.get("print")
         if isinstance(print_obj, dict):
@@ -454,14 +462,26 @@ def main():
     def keepalive_loop():
         while True:
             time.sleep(30)
-            if client.is_connected():
-                client.publish(request_topic, '{"pushing":{"sequence_id":"0","command":"start"}}', qos=1)
+            try:
+                if client.is_connected():
+                    client.publish(request_topic, '{"pushing":{"sequence_id":"0","command":"start"}}', qos=1)
+            except Exception as exc:
+                print(f"[relay] keepalive publish failed: {exc}")
 
     threading.Thread(target=keepalive_loop, daemon=True).start()
 
     RelayHandler.state = state
     RelayHandler.auth_key = args.auth_key or ""
     server = ThreadingHTTPServer((args.listen_host, args.listen_port), RelayHandler)
+
+    def on_sigterm(_sig, _frame):
+        # procd sends SIGTERM on restart/stop; without a handler Python dies
+        # before the finally below can stop the MQTT loop cleanly.
+        print("[relay] SIGTERM received, shutting down")
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, on_sigterm)
+
     print(f"[relay] HTTP listening on http://{args.listen_host}:{args.listen_port}/status")
     print(f"[relay] MQTT target {mqtt_host}:{mqtt_port} serial={serial} mode={source}")
     if cloud_mode:

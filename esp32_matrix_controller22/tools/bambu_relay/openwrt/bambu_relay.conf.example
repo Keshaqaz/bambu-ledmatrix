@@ -9,6 +9,9 @@ BAMBU_RELAY_KEY=''
 BAMBU_RELAY_HOST='0.0.0.0'
 BAMBU_RELAY_PORT='8787'
 
+# Seconds without printer MQTT reports before /status degrades to unknown.
+BAMBU_RELAY_STALE_SECONDS='70'
+
 # Optional LAN mode. Leave empty when using cloud MQTT mode.
 BAMBU_PRINTER_HOST=''
 BAMBU_PRINTER_ACCESS_CODE=''
