@@ -1589,7 +1589,8 @@ void fetchWeather() {
 
   WiFiClientSecure sc;
   sc.setInsecure(); // HTTPS защищает API key от пассивного перехвата в LAN; CA не проверяем ради RAM.
-  sc.setTimeout(8);
+  // Ядро ESP32 Arduino 3.x: setTimeout() — миллисекунды, setHandshakeTimeout() — секунды.
+  sc.setTimeout(8000);
   sc.setHandshakeTimeout(8);
   HTTPClient http;
   http.setConnectTimeout(8000);
@@ -1709,7 +1710,7 @@ void fetchWeather() {
     meteoClient.setInsecure();
     // Fallback-источник: таймауты короче основного, чтобы при недоступности
     // обоих API weatherTask не блокировался дольше необходимого.
-    meteoClient.setTimeout(5);
+    meteoClient.setTimeout(5000);
     meteoClient.setHandshakeTimeout(5);
     HTTPClient meteoHttp;
     meteoHttp.setConnectTimeout(5000);
