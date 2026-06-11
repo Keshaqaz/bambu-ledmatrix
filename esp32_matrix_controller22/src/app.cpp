@@ -98,14 +98,14 @@ static constexpr uint8_t MIN_UI_BRIGHTNESS = 1;
 CRGB leds[NUM_LEDS];
 
 // ════════════════════════════════════════════════════════════
-//  ШРИФТ 3×5: цифры/знаки (индекс 0-14)
-//  0-9='0'-'9'  10='-'  11='+'  12='°'  13='C'  14=space
+//  ШРИФТ 3×5: цифры/знаки (индекс 0-12)
+//  0-9='0'-'9'  10='-'  11='+'  12=space
 // ════════════════════════════════════════════════════════════
-static const uint8_t F_MICRO[15][5] PROGMEM = {
+static const uint8_t F_MICRO[13][5] PROGMEM = {
   {7,5,5,5,7},{2,6,2,2,7},{7,1,7,4,7},{7,1,7,1,7},
   {5,5,7,1,1},{7,4,7,1,7},{7,4,7,5,7},{7,1,1,1,1},
   {7,5,7,5,7},{7,5,7,1,7},
-  {0,0,7,0,0},{0,2,7,2,0},{2,5,2,0,0},{7,4,4,4,7},{0,0,0,0,0}
+  {0,0,7,0,0},{0,2,7,2,0},{0,0,0,0,0}
 };
 
 // ════════════════════════════════════════════════════════════
@@ -321,6 +321,10 @@ static std::atomic<uint32_t> rebootMs{0};
 
 uint32_t lastWeatherMs  = 0;
 uint32_t lastWeatherAttemptMs = 0;
+int      lastWeatherHttpCode = 0;
+uint8_t  lastWeatherKeyLen = 0;
+char     lastWeatherError[96] = "";
+char     lastWeatherSource[16] = "";
 uint32_t lastDrawMs     = 0;
 static std::atomic<uint32_t> displayInvalidationSeq{0};
 
@@ -352,6 +356,15 @@ inline float safeGetTemp() {
   return t;
 }
 
+static void setWeatherDiag(int code, const char* error, uint8_t keyLen, const char* source = nullptr) {
+  taskENTER_CRITICAL(&weatherMux);
+  lastWeatherHttpCode = code;
+  lastWeatherKeyLen = keyLen;
+  strlcpy(lastWeatherError, error ? error : "", sizeof(lastWeatherError));
+  if (source) strlcpy(lastWeatherSource, source, sizeof(lastWeatherSource));
+  taskEXIT_CRITICAL(&weatherMux);
+}
+
 enum BambuLifecycle : uint8_t {
   BAMBU_UNKNOWN   = 0,
   BAMBU_IDLE      = 1,
@@ -378,8 +391,6 @@ struct BambuState {
 
 static BambuState bambuState;
 static portMUX_TYPE bambuStateMux = portMUX_INITIALIZER_UNLOCKED;
-static std::atomic<bool> bambuPollRequested{false};
-static std::atomic<bool> bambuResetSession{false};
 
 static BambuState getBambuStateSnapshot() {
   taskENTER_CRITICAL(&bambuStateMux);
@@ -394,7 +405,7 @@ static void setBambuStateSnapshot(const BambuState& next) {
   taskEXIT_CRITICAL(&bambuStateMux);
 }
 
-static uint8_t bambuOverlayLifecycle(uint8_t currentDisplay, uint8_t nextLifecycle) {
+static uint8_t bambuOverlayLifecycle(uint8_t nextLifecycle) {
   switch (nextLifecycle) {
     case BAMBU_PREPARING:
       return BAMBU_PREPARING;
@@ -408,25 +419,12 @@ static uint8_t bambuOverlayLifecycle(uint8_t currentDisplay, uint8_t nextLifecyc
     case BAMBU_OFFLINE:
     case BAMBU_UNKNOWN:
     default:
-      return currentDisplay == BAMBU_FINISHED ? BAMBU_FINISHED : BAMBU_UNKNOWN;
+      return BAMBU_UNKNOWN;
   }
 }
 
 static void setBambuDetail(BambuState& st, const char* detail) {
   strlcpy(st.detail, detail ? detail : "", sizeof(st.detail));
-}
-
-static void resetBambuState(const char* detail) {
-  BambuState next;
-  next.enabled = false;
-  next.configured = false;
-  next.connected = false;
-  next.printerOnline = false;
-  next.lifecycle = BAMBU_UNKNOWN;
-  next.displayLifecycle = BAMBU_UNKNOWN;
-  next.progress = 0;
-  setBambuDetail(next, detail);
-  setBambuStateSnapshot(next);
 }
 
 static bool bambuHasRelayConfig(bool* enabledOut = nullptr,
@@ -877,7 +875,7 @@ static bool bambuFetchRelayStatus(const char* relayUrl, const char* relayKey) {
   bool connected = doc["connected"] | false;
   bool printerOnline = doc["printerOnline"].isNull() ? connected : doc["printerOnline"].as<bool>();
   float progress = doc["progress"] | 0.0f;
-  if (progress >= 0.0f && progress <= 1.0f) progress *= 100.0f;
+  if (progress >= 0.0f && progress < 1.0f) progress *= 100.0f;
   String rawStatus = String(doc["status"] | "");
   String rawStage = String(doc["stage"] | "");
   String detail = String(doc["detail"] | "");
@@ -893,9 +891,9 @@ static bool bambuFetchRelayStatus(const char* relayUrl, const char* relayKey) {
   st.connected = connected;
   st.printerOnline = printerOnline;
   st.lifecycle = lifecycle;
-  st.displayLifecycle = (lifecycle == BAMBU_IDLE || lifecycle == BAMBU_UNKNOWN)
+  st.displayLifecycle = (lifecycle == BAMBU_IDLE || lifecycle == BAMBU_OFFLINE || lifecycle == BAMBU_UNKNOWN)
     ? BAMBU_UNKNOWN
-    : bambuOverlayLifecycle(st.displayLifecycle, lifecycle);
+    : bambuOverlayLifecycle(lifecycle);
   st.progress = (uint8_t)constrain((int)lroundf(progress), 0, 100);
   strlcpy(st.rawStatus, rawStatus.c_str(), sizeof(st.rawStatus));
   strlcpy(st.rawStage, rawStage.c_str(), sizeof(st.rawStage));
@@ -1048,7 +1046,7 @@ static bool applyConfiguredBrightnessNow(bool fallbackToCached) {
       uint32_t snt = sunTimes.load();
       uint16_t rise = (uint16_t)((snt >> 24) & 0xFF) * 60 + ((snt >> 16) & 0xFF);
       uint16_t set_ = (uint16_t)((snt >>  8) & 0xFF) * 60 + ( snt        & 0xFF);
-      isDay = (nowMins >= rise && nowMins < set_);
+      isDay = isWithinDayWindow(nowMins, rise, set_);
     } else {
       isDay = isWithinDayWindow(nowMins, (uint16_t)dayH * 60, (uint16_t)nightH * 60);
     }
@@ -1075,9 +1073,7 @@ static int microGlyphIndex(char c) {
   if (u >= '0' && u <= '9') return (int)(u - '0');
   if (c == '-') return 10;
   if (c == '+') return 11;
-  if (c == '^' || u == 0xB0) return 12; // °
-  if (c == 'C') return 13;
-  return 14; // space
+  return 12; // space
 }
 
 void drawChar3(int x, int y, char c, CRGB col) {
@@ -1270,7 +1266,7 @@ void showClockTemp() {
 
   auto drawAutoTempText = [&](const char* text, CRGB color) {
     int tx = centeredTextX(text, 0, MW);
-    drawStr3(tx, 10, text, color);
+    drawStr3(tx, ty, text, color);
   };
 
   if (autoCompactTempLayout) {
@@ -1583,12 +1579,22 @@ void fetchWeather() {
   owmUseCoords = cfg.owmUseCoords;
   xSemaphoreGive(cfgMtx);
 
-  if (strlen(apiKey) == 0) return;
+  uint8_t keyLen = (uint8_t)min(strlen(apiKey), (size_t)255);
+  if (keyLen == 0) {
+    setWeatherDiag(0, "missing api key", keyLen, "owm");
+    Serial.println("[Weather] OpenWeatherMap API key is missing");
+    return;
+  }
 
   WiFiClientSecure sc;
   sc.setInsecure(); // HTTPS защищает API key от пассивного перехвата в LAN; CA не проверяем ради RAM.
+  sc.setTimeout(8);
+  sc.setHandshakeTimeout(8);
   HTTPClient http;
+  http.setConnectTimeout(8000);
   http.setTimeout(8000);
+  http.setReuse(false);
+  http.useHTTP10(true);
 
   auto urlEncode = [](const char* s) -> String {
     String out;
@@ -1610,48 +1616,148 @@ void fetchWeather() {
     return out;
   };
 
-  // OpenWeatherMap — HTTPS, чтобы не передавать API key открытым текстом.
-  String url;
+  String path;
   if (owmUseCoords) {
-    url = "https://api.openweathermap.org/data/2.5/weather?lat=" +
-          String(owmLat, 4) + "&lon=" + String(owmLon, 4) +
-          "&appid=" + String(apiKey) + "&units=metric";
+    path = String("/data/2.5/weather?lat=") + String(owmLat, 4) +
+           "&lon=" + String(owmLon, 4) +
+           "&appid=" + String(apiKey) + "&units=metric";
+    Serial.printf("[Weather] OWM coords lat=%.4f lon=%.4f keyLen=%u\n",
+                  owmLat, owmLon, keyLen);
   } else {
-    url = "https://api.openweathermap.org/data/2.5/weather?q=" +
-          urlEncode(city) + "&appid=" + String(apiKey) + "&units=metric";
+    path = String("/data/2.5/weather?q=") + urlEncode(city) +
+           "&appid=" + String(apiKey) + "&units=metric";
+    Serial.printf("[Weather] OWM city='%s' keyLen=%u\n", city, keyLen);
   }
-  http.begin(sc, url);
+
+  auto applyWeatherPayload = [&](Stream& body) -> bool {
+    JsonDocument doc;
+    // getStream() парсит прямо из потока — без промежуточного String в heap
+    DeserializationError err = deserializeJson(doc, body);
+    if (err) {
+      char msg[64];
+      snprintf(msg, sizeof(msg), "json: %s", err.c_str());
+      setWeatherDiag(200, msg, keyLen, "owm");
+      Serial.printf("[Weather] JSON error: %s\n", err.c_str());
+      return false;
+    }
+
+    float t = doc["main"]["temp"].as<float>();
+    taskENTER_CRITICAL(&weatherMux);
+    currentTemp   = t;
+    lastWeatherMs = millis();
+    lastWeatherHttpCode = 200;
+    lastWeatherKeyLen = keyLen;
+    lastWeatherError[0] = '\0';
+    strlcpy(lastWeatherSource, "owm", sizeof(lastWeatherSource));
+    taskEXIT_CRITICAL(&weatherMux);
+    Serial.printf("[Weather] OK %.1f C\n", t);
+
+    // В ответе OWM всегда присутствует coord.lat/coord.lon — кэшируем в cfg.
+    // В city-режиме это единственный источник координат для fetchSunriseSunset().
+    if (!owmUseCoords) {
+      float lat = doc["coord"]["lat"] | 0.0f;
+      float lon = doc["coord"]["lon"] | 0.0f;
+      if (lat != 0.0f || lon != 0.0f) {
+        bool sunMode;
+        xSemaphoreTake(cfgMtx, portMAX_DELAY);
+        cfg.owmLat = lat;
+        cfg.owmLon = lon;
+        sunMode = cfg.autoBrSunMode;
+        xSemaphoreGive(cfgMtx);
+        // Координаты только что появились — запросить восход/закат если нужно
+        if (sunMode && !sunTimeValid.load()) sunFetchRequested.store(true);
+      }
+    }
+    return true;
+  };
+
+  // OpenWeatherMap — сначала HTTPS, чтобы не передавать API key открытым текстом.
+  const char* owmHost = "api.openweathermap.org";
+  String url = "https://" + String(owmHost) + path;
+  if (!http.begin(sc, url)) {
+    setWeatherDiag(0, "http begin failed", keyLen, "owm");
+    Serial.println("[Weather] HTTP begin failed");
+    return;
+  }
 
   int code = http.GET();
   if (code == 200) {
-    JsonDocument doc;
-    // getStream() парсит прямо из потока — без промежуточного String в heap
-    if (!deserializeJson(doc, http.getStream())) {
-      float t = doc["main"]["temp"].as<float>();
-      taskENTER_CRITICAL(&weatherMux);
-      currentTemp   = t;
-      lastWeatherMs = millis();
-      taskEXIT_CRITICAL(&weatherMux);
-
-      // В ответе OWM всегда присутствует coord.lat/coord.lon — кэшируем в cfg.
-      // В city-режиме это единственный источник координат для fetchSunriseSunset().
-      if (!owmUseCoords) {
-        float lat = doc["coord"]["lat"] | 0.0f;
-        float lon = doc["coord"]["lon"] | 0.0f;
-        if (lat != 0.0f || lon != 0.0f) {
-          bool sunMode;
-          xSemaphoreTake(cfgMtx, portMAX_DELAY);
-          cfg.owmLat = lat;
-          cfg.owmLon = lon;
-          sunMode = cfg.autoBrSunMode;
-          xSemaphoreGive(cfgMtx);
-          // Координаты только что появились — запросить восход/закат если нужно
-          if (sunMode && !sunTimeValid.load()) sunFetchRequested.store(true);
-        }
-      }
+    applyWeatherPayload(http.getStream());
+  } else {
+    String err = http.errorToString(code);
+    char tlsErr[64] = "";
+    int tlsCode = sc.lastError(tlsErr, sizeof(tlsErr));
+    char msg[96];
+    if (tlsCode != 0) {
+      snprintf(msg, sizeof(msg), "HTTP %d: %s; TLS %d: %s", code, err.c_str(), tlsCode, tlsErr);
+    } else {
+      snprintf(msg, sizeof(msg), "HTTP %d: %s", code, err.c_str());
     }
+    setWeatherDiag(code, msg, keyLen, "owm");
+    Serial.printf("[Weather] %s\n", msg);
   }
   http.end();
+
+  if (code < 0) {
+    if (owmLat == 0.0f && owmLon == 0.0f) {
+      setWeatherDiag(code, "open-meteo fallback skipped: no coords", keyLen, "open-meteo");
+      return;
+    }
+
+    WiFiClientSecure meteoClient;
+    meteoClient.setInsecure();
+    meteoClient.setTimeout(8);
+    meteoClient.setHandshakeTimeout(8);
+    HTTPClient meteoHttp;
+    meteoHttp.setConnectTimeout(8000);
+    meteoHttp.setTimeout(8000);
+    meteoHttp.setReuse(false);
+    meteoHttp.useHTTP10(true);
+    String meteoUrl = String("https://api.open-meteo.com/v1/forecast?latitude=") +
+                      String(owmLat, 4) + "&longitude=" + String(owmLon, 4) +
+                      "&current=temperature_2m";
+    if (!meteoHttp.begin(meteoClient, meteoUrl)) {
+      setWeatherDiag(0, "open-meteo begin failed", keyLen, "open-meteo");
+      Serial.println("[Weather] Open-Meteo begin failed");
+      return;
+    }
+
+    int meteoCode = meteoHttp.GET();
+    if (meteoCode == 200) {
+      JsonDocument doc;
+      DeserializationError err = deserializeJson(doc, meteoHttp.getStream());
+      if (err) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "open-meteo json: %s", err.c_str());
+        setWeatherDiag(meteoCode, msg, keyLen, "open-meteo");
+        Serial.printf("[Weather] %s\n", msg);
+      } else {
+        float t = doc["current"]["temperature_2m"] | NAN;
+        if (isnan(t)) t = doc["current_weather"]["temperature"] | NAN;
+        if (isnan(t)) {
+          setWeatherDiag(meteoCode, "open-meteo missing temperature", keyLen, "open-meteo");
+          Serial.println("[Weather] Open-Meteo missing temperature");
+        } else {
+          taskENTER_CRITICAL(&weatherMux);
+          currentTemp = t;
+          lastWeatherMs = millis();
+          lastWeatherHttpCode = meteoCode;
+          lastWeatherKeyLen = keyLen;
+          lastWeatherError[0] = '\0';
+          strlcpy(lastWeatherSource, "open-meteo", sizeof(lastWeatherSource));
+          taskEXIT_CRITICAL(&weatherMux);
+          Serial.printf("[Weather] Open-Meteo OK %.1f C\n", t);
+        }
+      }
+    } else {
+      String meteoErr = meteoHttp.errorToString(meteoCode);
+      char msg[96];
+      snprintf(msg, sizeof(msg), "open-meteo HTTP %d: %s", meteoCode, meteoErr.c_str());
+      setWeatherDiag(meteoCode, msg, keyLen, "open-meteo");
+      Serial.printf("[Weather] %s\n", msg);
+    }
+    meteoHttp.end();
+  }
 }
 
 // Запрашивает актуальные времена восхода и заката с api.sunrise-sunset.org.
@@ -2049,8 +2155,6 @@ void handlePostSettings() {
   if (ntpChanged) ntpPending.store(true); // configTime вызовет loop task — не дублируем вызов
   if (bambuChanged) {
     Serial.printf("[BambuRelay] Settings updated: changed=%d\n", (int)bambuChanged);
-    bambuResetSession.store(true);
-    bambuPollRequested.store(true);
     wakeBambuTask();
   }
   bool persistPending = cfgChanged || bambuChanged;
@@ -2078,6 +2182,29 @@ void handleStatus() {
   doc["apIP"]   = "192.168.4.1";
   doc["cpuTemp"]    = temperatureRead(); // встроенный датчик температуры ESP32 (°C)
   doc["temp"]       = safeGetTemp();
+  {
+    uint32_t nowMs = millis();
+    uint32_t weatherMs;
+    uint32_t weatherAttemptMs;
+    int weatherCode;
+    uint8_t weatherKeyLen;
+    char weatherError[sizeof(lastWeatherError)];
+    char weatherSource[sizeof(lastWeatherSource)];
+    taskENTER_CRITICAL(&weatherMux);
+    weatherMs = lastWeatherMs;
+    weatherAttemptMs = lastWeatherAttemptMs;
+    weatherCode = lastWeatherHttpCode;
+    weatherKeyLen = lastWeatherKeyLen;
+    strlcpy(weatherError, lastWeatherError, sizeof(weatherError));
+    strlcpy(weatherSource, lastWeatherSource, sizeof(weatherSource));
+    taskEXIT_CRITICAL(&weatherMux);
+    doc["weatherCode"] = weatherCode;
+    doc["weatherError"] = weatherError;
+    doc["weatherSource"] = weatherSource;
+    doc["weatherKeyLen"] = weatherKeyLen;
+    doc["weatherAgeSec"] = weatherMs ? (int32_t)((nowMs - weatherMs) / 1000UL) : -1;
+    doc["weatherAttemptAgeSec"] = weatherAttemptMs ? (int32_t)((nowMs - weatherAttemptMs) / 1000UL) : -1;
+  }
   doc["uptime"]     = String(millis() / 1000 / 3600, DEC) + "ч " +
                       String((millis() / 1000 % 3600) / 60, DEC) + "м";
   doc["heap"]       = String(ESP.getFreeHeap() / 1024) + " KB";
@@ -2180,6 +2307,7 @@ void handleConnectWifi() {
   strlcpy(wifiPendSsid, ssid, sizeof(wifiPendSsid));
   strlcpy(wifiPendPass, pass, sizeof(wifiPendPass));
   taskEXIT_CRITICAL(&wifiConnMux);
+  wifiConnFailStatus.store(0);
   wifiConnResult.store(1);      // сразу показываем "connecting" в браузере
   wifiConnPending.store(true);  // будит wifiConnTask
   server.send(200, "application/json", "{\"ok\":true,\"pending\":true}");
@@ -2199,6 +2327,8 @@ void handleDisconnectWifi() {
   xSemaphoreGive(cfgMtx);
   hasSsid.store(false);
   wifiConnected.store(false);
+  wifiConnResult.store(0);
+  wifiConnFailStatus.store(0);
   if (!saveConfig()) {
     xSemaphoreTake(cfgMtx, portMAX_DELAY);
     strlcpy(cfg.ssid, prevSsid, sizeof(cfg.ssid));
@@ -2228,7 +2358,6 @@ void handleReboot() {
 void handleWeatherRefresh() {
   if (!checkAuth()) { server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
   weatherRequested = true;
-  bambuPollRequested.store(true);
   wakeBambuTask();
   server.send(200, "application/json", "{\"ok\":true}");
 }
@@ -2339,10 +2468,10 @@ void wifiConnTask(void* param) {
         apOffMs.store(0); // loop() начнёт 60-сек отсчёт заново
         ntpPending.store(true); // loop task вызовет configTime
         weatherRequested.store(true);
-        bambuPollRequested.store(true);
         wakeBambuTask();
         if (snapSunMode) sunFetchRequested.store(true);
         wifiConnInProgress.store(false); // сбрасываем для корректной повторной попытки
+        wifiConnFailStatus.store(0);
         wifiConnResult.store(2); // ok
         Serial.println("[WiFi] Подключено!"); // WiFi.localIP() читаем в loop/status path
       } else {
@@ -2388,11 +2517,6 @@ void bambuTask(void* param) {
     bool enabled = false;
     bool configured = bambuHasRelayConfig(&enabled, relayUrl, sizeof(relayUrl), relayKey, sizeof(relayKey));
 
-    if (bambuResetSession.exchange(false)) {
-      // Reserved for future relay runtime reset needs.
-    }
-    bambuPollRequested.exchange(false);
-
     BambuState st = getBambuStateSnapshot();
     st.enabled = enabled;
     st.configured = configured;
@@ -2412,8 +2536,8 @@ void bambuTask(void* param) {
     if (!configured) {
       st.connected = false;
       st.printerOnline = false;
-          st.lifecycle = BAMBU_UNKNOWN;
-      st.displayLifecycle = bambuOverlayLifecycle(st.displayLifecycle, BAMBU_UNKNOWN);
+      st.lifecycle = BAMBU_UNKNOWN;
+      st.displayLifecycle = BAMBU_UNKNOWN;
       st.progress = 0;
       setBambuDetail(st, "Заполните Relay URL");
       setBambuStateSnapshot(st);
@@ -2424,8 +2548,8 @@ void bambuTask(void* param) {
     if (!wifiConnected.load()) {
       st.connected = false;
       st.printerOnline = false;
-          st.lifecycle = BAMBU_UNKNOWN;
-      st.displayLifecycle = bambuOverlayLifecycle(st.displayLifecycle, BAMBU_UNKNOWN);
+      st.lifecycle = BAMBU_UNKNOWN;
+      st.displayLifecycle = BAMBU_UNKNOWN;
       st.progress = 0;
       setBambuDetail(st, "Bambu Relay ждёт WiFi");
       setBambuStateSnapshot(st);
@@ -2536,7 +2660,6 @@ void setup() {
         esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
         Serial.printf("[WiFi] ✓ IP=%s  RSSI=%d dBm\n",
           WiFi.localIP().toString().c_str(), WiFi.RSSI());
-        bambuPollRequested.store(true);
         configTime((long)roundf(cfg.tzOffset * 3600.0f), 0, cfg.ntpServer);
         brightnessRefreshRequested.store(true);
         weatherRequested = true;  // погода через task, не блокируя
@@ -2589,8 +2712,6 @@ void setup() {
   server.on("/api/reboot",    HTTP_POST, handleReboot);
   server.on("/api/weather/refresh", HTTP_POST, handleWeatherRefresh);
   server.onNotFound([](){ server.sendHeader("Location","/"); server.send(302); });
-  const char* hdrs[] = {"X-Web-Pass"};
-  server.collectHeaders(hdrs, 1);
   server.begin();
   Serial.println("Server started");
 
@@ -2706,6 +2827,7 @@ void loop() {
         strlcpy(wifiPendSsid, ssid, sizeof(wifiPendSsid));
         strlcpy(wifiPendPass, pass, sizeof(wifiPendPass));
         taskEXIT_CRITICAL(&wifiConnMux);
+        wifiConnFailStatus.store(0);
         wifiConnResult.store(1); // "connecting" в браузере
         wifiConnPending.store(true); // передаём управление wifiConnTask
       }
@@ -2739,6 +2861,8 @@ void loop() {
     if (wifiConnected.load() && !apMode.load() && WiFi.status() != WL_CONNECTED) {
       Serial.println("[WiFi] Соединение потеряно — перейдём в AP, авто-реконнект через 10 мин");
       wifiConnected.store(false);
+      wifiConnFailStatus.store(WL_CONNECTION_LOST);
+      wifiConnResult.store(3);
       WiFi.mode(WIFI_OFF);
       wifiDropOffMs = millis() | 1u; // |1 чтобы 0 означало «не в процессе»
     }

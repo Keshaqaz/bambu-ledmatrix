@@ -227,7 +227,7 @@ class RelayState:
                 progress = float(progress_raw)
             except Exception:
                 progress = None
-            if progress is not None and 0.0 <= progress <= 1.0:
+            if progress is not None and 0.0 <= progress < 1.0:
                 progress *= 100.0
         print_error_raw = print_obj.get("print_error", None)
         print_error = 0
@@ -295,6 +295,8 @@ class RelayState:
             if lifecycle == "finished":
                 if prev_lifecycle != "finished" or self.finished_since == 0.0:
                     self.finished_since = time.time()
+                if progress < 100.0:
+                    progress = 100.0
             else:
                 self.finished_since = 0.0
 

@@ -70,6 +70,14 @@ class RelayStateTest(unittest.TestCase):
         self.assertEqual(payload["progress"], 51.0)
         self.assertEqual(payload["remainingSeconds"], 780)
 
+    def test_progress_one_means_one_percent_while_finished_is_complete(self):
+        st = relay.RelayState("SERIAL", "test")
+        st.update_from_print({"gcode_state": "RUNNING", "mc_percent": 1})
+        self.assertEqual(st.get_payload()["progress"], 1.0)
+
+        st.update_from_print({"gcode_state": "FINISH", "mc_percent": 1})
+        self.assertEqual(st.get_payload()["progress"], 100.0)
+
 
 if __name__ == "__main__":
     unittest.main()
