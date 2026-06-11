@@ -24,20 +24,24 @@ OTA-обновления в этом проекте сознательно не 
 
 Какие библиотеки должны быть установлены:
 
-- `FastLED`
-- `ArduinoJson`
+- `FastLED` (проверено на 3.10.3)
+- `ArduinoJson` (проверено на 7.4.3)
 
-Быстрая проверка уже пройдена:
+Основной путь сборки и прошивки — `arduino-cli`:
 
-- `arduino-cli compile --fqbn esp32:esp32:esp32c3 .`
-- `arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=huge_app .`
-- `platformio run`
+```bash
+arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=huge_app .
+# сборка + прошивка подключённой платы:
+arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=huge_app -u -p /dev/cu.usbmodem101 .
+```
 
-Если захотите собирать через PlatformIO, в проекте уже есть:
+Важно: arduino-cli использует ядро esp32 3.x, где `NetworkClient::setTimeout()`
+принимает миллисекунды (в ядре 2.x были секунды). При портировании кода со старого
+ядра проверяйте клиентские таймауты.
 
-- `platformio.ini`
-- `board_build.partitions = partitions_huge_app.csv`, чтобы PlatformIO использовал тот же Huge APP layout без OTA, что и Arduino IDE
-- `partitions_huge_app.csv` — project-local partition table: 3MB app + ~1MB SPIFFS
+PlatformIO-конфигурация (`platformio.ini`, `partitions_huge_app.csv` — 3MB app + ~1MB SPIFFS)
+сохранена, но PlatformIO требует Python ≥3.10 и на текущей машине не работает
+(системный Python 3.9).
 
 Для локального предпросмотра веб-интерфейса без прошивки:
 
@@ -76,10 +80,9 @@ python3 -m unittest discover -s tools/bambu_relay -p "test_*.py"
 for f in tools/export_web_ui.sh tools/check_web_ui_export.sh tools/bambu_relay/openwrt/bambu-relay.init; do sh -n "$f" || exit 1; done
 ```
 
-Для проверки прошивки используйте один из вариантов:
+Для проверки прошивки:
 
 ```bash
-platformio run
 arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=huge_app .
 ```
 
@@ -89,9 +92,11 @@ arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=huge_app .
 
 - `tools/bambu_relay/relay.py`
 - `tools/bambu_relay/requirements.txt`
+- деплой на OpenWrt-роутер описан в `tools/bambu_relay/README.md`
 
 Прошивка ESP больше не выполняет прямой вход в Bambu Cloud. Она только опрашивает
-`Relay URL`, а relay уже получает статус принтера по MQTT.
+`Relay URL`, а relay уже получает статус принтера по MQTT. Для мониторинга у relay
+есть `GET /healthz` — отвечает `{"ok": true}` без авторизации и без данных печати.
 
 Relay умеет два режима:
 
@@ -153,4 +158,6 @@ python3 tools/bambu_relay/relay.py \
 - `Bambu -> Показывать статус принтера в режиме Часы + темп`
 - `Relay URL = http://<IP_компьютера_с_relay>:8787/status`
 
-Опционально можно задать `Relay Key` и передавать его relay-сервису через `--auth-key`.
+Опционально можно задать `Relay Key` и передавать его relay-сервису через `--auth-key`
+(или `BAMBU_RELAY_KEY` в конфиге). Ключ проверяется timing-safe сравнением;
+запросы без заголовка `X-Relay-Key` получают `401`.

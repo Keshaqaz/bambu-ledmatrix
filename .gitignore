@@ -22,3 +22,6 @@ __pycache__/
 # Temporary files
 *.tmp
 *.bak
+
+# Pre-deploy router snapshots (take them into a temp dir, not the repo)
+router_bambu_relay_backup_*.py

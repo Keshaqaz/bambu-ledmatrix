@@ -21,15 +21,33 @@ Then fill `/root/bambu_relay.conf`, enable the service, and start it:
 
 ```sh
 chmod 755 /root/bambu_relay.py /etc/init.d/bambu-relay
+chmod 600 /root/bambu_relay.conf   # holds cloud token / access code
 /etc/init.d/bambu-relay enable
 /etc/init.d/bambu-relay restart
 ```
 
-The default HTTP endpoint is:
+The init script warns at startup if the conf is readable by group/others.
+The service handles SIGTERM gracefully (clean MQTT disconnect on procd restart).
+
+## HTTP Endpoints
+
+- `GET /status` (also `/`) — full printer state JSON; requires the `X-Relay-Key`
+  header when `BAMBU_RELAY_KEY` is set (timing-safe comparison, `401` otherwise)
+- `GET /healthz` — `{"ok": true}` without auth and without print data; use for monitoring
 
 ```text
 http://<router-ip>:8787/status
 ```
+
+## Config Options
+
+All options are env variables in `/root/bambu_relay.conf` (or CLI flags, see `--help`):
+
+- `BAMBU_RELAY_KEY` — optional auth key for `/status`
+- `BAMBU_RELAY_STALE_SECONDS` — seconds without printer MQTT reports before
+  `/status` degrades to `unknown` (default 70)
+- After restart, MQTT reconnect to Bambu Cloud takes ~1–2 minutes; until the first
+  printer report `/status` shows `connected: true, printerOnline: false`
 
 ## Mock Relay
 
