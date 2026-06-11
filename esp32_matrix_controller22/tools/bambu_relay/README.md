@@ -1,6 +1,9 @@
 # Bambu Relay
 
-HTTP relay over Bambu MQTT for the ESP32 matrix firmware.
+HTTP relay over Bambu MQTT for the ESP32 matrix firmware. Two modes:
+
+- `cloud MQTT` (default, recommended): keeps the printer in cloud mode
+- `LAN MQTT`: optional fallback when the printer is in `LAN only`
 
 ## Files
 
@@ -8,6 +11,33 @@ HTTP relay over Bambu MQTT for the ESP32 matrix firmware.
 - `mock_relay.py`: tiny synthetic relay for local/UI testing
 - `openwrt/bambu-relay.init`: OpenWrt `procd` service template
 - `openwrt/bambu_relay.conf.example`: shell-style config example
+
+## Local Run
+
+Cloud MQTT mode needs a Bambu `Access Token` and the printer `serial`
+(the account `uid` is resolved automatically via cloud API, or pass `--cloud-uid`):
+
+```bash
+python3 -m pip install -r tools/bambu_relay/requirements.txt
+python3 tools/bambu_relay/relay.py \
+  --cloud-token '<BAMBU_ACCESS_TOKEN>' \
+  --printer-serial '<PRINTER_SERIAL>' \
+  --listen-host 0.0.0.0 \
+  --listen-port 8787
+```
+
+A different regional broker can be set with `--mqtt-host us.mqtt.bambulab.com`.
+
+LAN MQTT mode (printer in `LAN only`, needs the access code):
+
+```bash
+python3 tools/bambu_relay/relay.py \
+  --printer-host 192.168.1.50 \
+  --printer-serial '<PRINTER_SERIAL>' \
+  --printer-access-code '<LAN_ACCESS_CODE>' \
+  --listen-host 0.0.0.0 \
+  --listen-port 8787
+```
 
 ## OpenWrt Deploy
 

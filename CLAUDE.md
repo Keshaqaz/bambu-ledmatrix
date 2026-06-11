@@ -1,10 +1,14 @@
-# ESP32 Matrix Controller: Working Context
+# LED Matrix: Working Context
 
 Last updated: 2026-06-11
 
+This file is the operational context for the whole repo (firmware + relay).
+User-facing docs: `README.md` (repo map), `esp32_matrix_controller22/README.md`
+(firmware), `esp32_matrix_controller22/tools/bambu_relay/README.md` (relay).
+
 ## Project
 
-- Path: `/Users/kesha/Desktop/vibecoding/ledmatrix/esp32_matrix_controller22`
+- Firmware project: `esp32_matrix_controller22/`
 - Target board: `ESP32C3 Dev Module` / FQBN `esp32:esp32:esp32c3:PartitionScheme=huge_app`
 - Main firmware: `src/app.cpp`; web UI source: `src/index_html.h`; browser preview export: `web/index.html` (re-export via `tools/export_web_ui.sh`, verify via `tools/check_web_ui_export.sh`)
 - Relay: `tools/bambu_relay/relay.py` (deployed on the OpenWrt router)

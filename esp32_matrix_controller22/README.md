@@ -88,76 +88,15 @@ arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=huge_app .
 
 ## Bambu Relay
 
-Для live-статуса принтера используется внешний relay:
+Для live-статуса принтера используется внешний relay (`tools/bambu_relay/`).
+Прошивка ESP не выполняет прямой вход в Bambu Cloud: она только опрашивает
+`Relay URL`, а relay получает статус принтера по MQTT.
 
-- `tools/bambu_relay/relay.py`
-- `tools/bambu_relay/requirements.txt`
-- деплой на OpenWrt-роутер описан в `tools/bambu_relay/README.md`
+Запуск, деплой на OpenWrt-роутер, HTTP API и конфигурация relay описаны в
+[`tools/bambu_relay/README.md`](tools/bambu_relay/README.md).
 
-Прошивка ESP больше не выполняет прямой вход в Bambu Cloud. Она только опрашивает
-`Relay URL`, а relay уже получает статус принтера по MQTT. Для мониторинга у relay
-есть `GET /healthz` — отвечает `{"ok": true}` без авторизации и без данных печати.
-
-Relay умеет два режима:
-
-- `cloud MQTT`: рекомендуемый путь, сохраняет облачный режим принтера
-- `LAN MQTT`: опциональный fallback для `LAN only`
-
-### Cloud MQTT relay
-
-Нужны:
-
-- `Access Token` Bambu
-- `serial` принтера
-- компьютер в одной сети с матрицей
-
-Минимальный запуск:
-
-```bash
-cd /Users/kesha/Desktop/vibecoding/ledmatrix/esp32_matrix_controller22
-python3 -m pip install -r tools/bambu_relay/requirements.txt
-python3 tools/bambu_relay/relay.py \
-  --cloud-token '<BAMBU_ACCESS_TOKEN>' \
-  --printer-serial '<PRINTER_SERIAL>' \
-  --listen-host 0.0.0.0 \
-  --listen-port 8787
-```
-
-`uid` аккаунта relay попытается получить сам через cloud API. Если это не удалось, его можно передать явно:
-
-```bash
-python3 tools/bambu_relay/relay.py \
-  --cloud-token '<BAMBU_ACCESS_TOKEN>' \
-  --cloud-uid '<BAMBU_UID>' \
-  --printer-serial '<PRINTER_SERIAL>'
-```
-
-Если нужен другой региональный брокер, его можно переопределить:
-
-```bash
---mqtt-host us.mqtt.bambulab.com
-```
-
-### LAN MQTT relay
-
-Этот режим нужен только если принтер переведён в `LAN only` и у вас есть `access code`.
-
-```bash
-python3 tools/bambu_relay/relay.py \
-  --printer-host 192.168.1.50 \
-  --printer-serial '<PRINTER_SERIAL>' \
-  --printer-access-code '<LAN_ACCESS_CODE>' \
-  --listen-host 0.0.0.0 \
-  --listen-port 8787
-```
-
-### Подключение матрицы
-
-После запуска relay в веб-интерфейсе матрицы включите:
+Со стороны матрицы в веб-интерфейсе нужно включить:
 
 - `Bambu -> Показывать статус принтера в режиме Часы + темп`
-- `Relay URL = http://<IP_компьютера_с_relay>:8787/status`
-
-Опционально можно задать `Relay Key` и передавать его relay-сервису через `--auth-key`
-(или `BAMBU_RELAY_KEY` в конфиге). Ключ проверяется timing-safe сравнением;
-запросы без заголовка `X-Relay-Key` получают `401`.
+- `Relay URL = http://<хост_relay>:8787/status`
+- опционально `Relay Key`, если relay запущен с ключом
