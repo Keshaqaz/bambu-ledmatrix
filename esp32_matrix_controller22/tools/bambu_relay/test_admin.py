@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+import json
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+
+HERE = Path(__file__).resolve().parent
+ADMIN = HERE / "admin.py"
+
+
+class RotationHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/preference":
+            if self.server.auth_status != 200:
+                self.send_response(self.server.auth_status)
+                self.end_headers()
+                return
+            if self.headers.get("Authorization") != "Bearer fresh-token":
+                self.send_response(401)
+                self.end_headers()
+                return
+            payload = {"uid": "123456"}
+        elif self.path == "/status":
+            payload = {
+                "ok": True,
+                "source": "cloud_mqtt",
+                "connected": self.server.status_connected,
+            }
+        else:
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, _format, *_args):
+        return
+
+
+class AdminCliTest(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tempdir.name)
+        self.config = self.root / "bambu_relay.conf"
+        self.config.write_text(
+            "BAMBU_CLOUD_TOKEN='old-token'\n"
+            "BAMBU_PRINTER_SERIAL='SERIAL'\n"
+            "BAMBU_RELAY_KEY='relay-key'\n"
+        )
+        self.config.chmod(0o600)
+
+        self.service_log = self.root / "service.log"
+        self.service = self.root / "bambu-relay"
+        self.service.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s\\n' \"$1\" >> '{self.service_log}'\n"
+        )
+        self.service.chmod(0o700)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), RotationHandler)
+        self.server.auth_status = 200
+        self.server.status_connected = True
+        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server_thread.start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.tempdir.cleanup()
+
+    def run_admin(self, stdin, command="install-cloud-token"):
+        env = os.environ.copy()
+        env.update({
+            "BAMBU_RELAY_CONFIG": str(self.config),
+            "BAMBU_RELAY_SERVICE": str(self.service),
+            "BAMBU_AUTH_CHECK_URL": f"{self.base_url}/preference",
+            "BAMBU_RELAY_STATUS_URL": f"{self.base_url}/status",
+            "BAMBU_RELAY_VERIFY_TIMEOUT": "1",
+        })
+        return subprocess.run(
+            [sys.executable, str(ADMIN), command],
+            input=stdin,
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+
+    def test_valid_token_is_installed_atomically_and_verified(self):
+        result = self.run_admin("fresh-token\n")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("BAMBU_CLOUD_TOKEN='fresh-token'", self.config.read_text())
+        self.assertEqual(stat.S_IMODE(self.config.stat().st_mode), 0o600)
+        self.assertEqual(self.service_log.read_text().splitlines(), ["restart"])
+        self.assertNotIn("fresh-token", result.stdout + result.stderr)
+
+    def test_failed_relay_verification_restores_previous_token(self):
+        self.server.status_connected = False
+
+        result = self.run_admin("fresh-token\n")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("BAMBU_CLOUD_TOKEN='old-token'", self.config.read_text())
+        self.assertEqual(self.service_log.read_text().splitlines(), ["restart", "restart"])
+        self.assertNotIn("fresh-token", result.stdout + result.stderr)
+
+    def test_check_cloud_token_reports_expired_without_restarting(self):
+        result = self.run_admin("", command="check-cloud-token")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(self.service_log.exists())
+        self.assertNotIn("old-token", result.stdout + result.stderr)
+        self.assertIn("HTTP 401", result.stderr)
+
+    def test_check_distinguishes_transient_api_failure_from_rotation(self):
+        self.config.write_text("BAMBU_CLOUD_TOKEN='fresh-token'\n")
+        self.server.auth_status = 503
+
+        result = self.run_admin("", command="check-cloud-token")
+
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("HTTP 503", result.stderr)
+        self.assertNotIn("fresh-token", result.stdout + result.stderr)
+
+    def test_login_json_records_server_supplied_expiration(self):
+        before = int(time.time())
+        login_response = json.dumps({"accessToken": "fresh-token", "expiresIn": 3600})
+
+        result = self.run_admin(login_response)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        assignments = {}
+        for line in self.config.read_text().splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                assignments[key] = value.strip("'")
+        expires_at = int(assignments["BAMBU_CLOUD_TOKEN_EXPIRES_AT"])
+        self.assertGreaterEqual(expires_at, before + 3600)
+        self.assertLessEqual(expires_at, int(time.time()) + 3600)
+        self.assertNotIn("fresh-token", result.stdout + result.stderr)
+
+    def test_check_warns_before_recorded_expiration(self):
+        self.config.write_text(
+            "BAMBU_CLOUD_TOKEN='fresh-token'\n"
+            f"BAMBU_CLOUD_TOKEN_EXPIRES_AT='{int(time.time()) + 3600}'\n"
+            "BAMBU_PRINTER_SERIAL='SERIAL'\n"
+        )
+
+        result = self.run_admin("", command="check-cloud-token")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("expires within", result.stderr)
+        self.assertNotIn("fresh-token", result.stdout + result.stderr)
+        self.assertFalse(self.service_log.exists())
+
+    def test_bambu_studio_login_payload_is_accepted(self):
+        login_payload = json.dumps({
+            "data": {"token": "fresh-token", "expires_in": "3600"}
+        })
+
+        result = self.run_admin(login_payload)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("BAMBU_CLOUD_TOKEN='fresh-token'", self.config.read_text())
+        self.assertIn("BAMBU_CLOUD_TOKEN_EXPIRES_AT=", self.config.read_text())
+
+    def test_raw_token_removes_stale_expiration_metadata(self):
+        self.config.write_text(
+            "BAMBU_CLOUD_TOKEN='old-token'\n"
+            "BAMBU_CLOUD_TOKEN_EXPIRES_AT='1'\n"
+            "BAMBU_PRINTER_SERIAL='SERIAL'\n"
+        )
+
+        result = self.run_admin("fresh-token\n")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("BAMBU_CLOUD_TOKEN_EXPIRES_AT", self.config.read_text())
+
+    def test_installation_repairs_insecure_config_permissions(self):
+        self.config.chmod(0o640)
+
+        result = self.run_admin("fresh-token\n")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stat.S_IMODE(self.config.stat().st_mode), 0o600)
+
+
+if __name__ == "__main__":
+    unittest.main()

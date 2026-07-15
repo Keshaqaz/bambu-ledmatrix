@@ -1,0 +1,29 @@
+#!/bin/sh
+
+ADMIN="${BAMBU_RELAY_ADMIN:-/root/bambu_relay_admin.py}"
+STATE_FILE="${BAMBU_RELAY_TOKEN_STATE:-/tmp/bambu-relay-token.state}"
+TAG="bambu-relay-token"
+
+output="$($ADMIN check-cloud-token 2>&1)"
+status=$?
+
+if [ "$status" -eq 0 ]; then
+  previous="$(cat "$STATE_FILE" 2>/dev/null)"
+  printf '%s\n' ok > "$STATE_FILE"
+  if [ -n "$previous" ] && [ "$previous" != "ok" ]; then
+    logger -t "$TAG" -p daemon.notice "cloud token check recovered"
+  fi
+  exit 0
+fi
+
+previous="$(cat "$STATE_FILE" 2>/dev/null)"
+current="failed:$status"
+printf '%s\n' "$current" > "$STATE_FILE"
+if [ "$previous" != "$current" ]; then
+  if [ "$status" -eq 2 ]; then
+    logger -t "$TAG" -p daemon.err "cloud token needs rotation: $output"
+  else
+    logger -t "$TAG" -p daemon.warning "cloud token check failed (rotation not confirmed): $output"
+  fi
+fi
+exit "$status"
