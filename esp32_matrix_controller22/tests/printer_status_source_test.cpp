@@ -8,7 +8,11 @@ int main() {
   source.configure(true, true, "relay ready");
 
   PrinterStatePatch printing = {};
-  printing.present = PRINTER_PATCH_LIFECYCLE | PRINTER_PATCH_PROGRESS;
+  printing.present = PRINTER_PATCH_TRANSPORT_CONNECTED |
+                     PRINTER_PATCH_PRINTER_ONLINE |
+                     PRINTER_PATCH_LIFECYCLE | PRINTER_PATCH_PROGRESS;
+  printing.transportConnected = true;
+  printing.printerOnline = true;
   printing.lifecycle = PRINTER_PRINTING;
   printing.progress = 1;
   source.replay(printing);
@@ -37,6 +41,8 @@ int main() {
   strcpy(partial.stage, "infill");
   source.replay(partial);
   snapshot = source.snapshot();
+  assert(snapshot.transportConnected);
+  assert(snapshot.printerOnline);
   assert(snapshot.progress == 42);
   assert(snapshot.currentLayer == 12);
   assert(snapshot.totalLayers == 80);
@@ -85,7 +91,19 @@ int main() {
   assert(snapshot.visibleLifecycle == PRINTER_FINISHED);
   assert(snapshot.progress == 100);
 
+  source.advanceBy(PrinterStatusReducer::kFinishedGraceMs - 1);
+  snapshot = source.snapshot();
+  assert(snapshot.lifecycle == PRINTER_FINISHED);
+  assert(snapshot.visibleLifecycle == PRINTER_FINISHED);
+  source.advanceBy(1);
+  snapshot = source.snapshot();
+  assert(snapshot.lifecycle == PRINTER_IDLE);
+  assert(snapshot.visibleLifecycle == PRINTER_UNKNOWN);
+
+  source.replay(finished);
+
   source.replayMalformed("temporary failure during finished grace");
+  source.advanceBy(PrinterStatusReducer::kFinishedGraceMs);
   snapshot = source.snapshot();
   assert(snapshot.lifecycle == PRINTER_UNKNOWN);
   assert(snapshot.visibleLifecycle == PRINTER_FINISHED);

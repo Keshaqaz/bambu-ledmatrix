@@ -10,7 +10,12 @@ class ScriptedPrinterStatusSource : public PrinterStatusSource {
     reducer_.configure(enabled, configured, detail);
   }
 
-  void replay(const PrinterStatePatch& patch) { reducer_.apply(patch); }
+  void replay(const PrinterStatePatch& patch) { reducer_.apply(patch, nowMs_); }
+
+  void advanceBy(uint32_t elapsedMs) {
+    nowMs_ += elapsedMs;
+    reducer_.advance(nowMs_);
+  }
 
   void replayMalformed(const char* detail) {
     reducer_.markUnavailable(false, PRINTER_UNKNOWN, detail);
@@ -22,4 +27,5 @@ class ScriptedPrinterStatusSource : public PrinterStatusSource {
 
  private:
   PrinterStatusReducer reducer_;
+  uint32_t nowMs_ = 0;
 };

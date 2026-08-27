@@ -97,6 +97,8 @@ inline PrinterLifecycle printerVisibleLifecycleForUpdate(
 
 class PrinterStatusReducer {
  public:
+  static const uint32_t kFinishedGraceMs = 30000UL;
+
   PrinterStateSnapshot snapshot() const { return state_; }
 
   void configure(bool enabled, bool configured, const char* detail) {
@@ -110,39 +112,68 @@ class PrinterStatusReducer {
     }
   }
 
-  void apply(const PrinterStatePatch& patch) {
+  void apply(const PrinterStatePatch& patch, uint32_t nowMs = 0) {
     if (patch.present & PRINTER_PATCH_TRANSPORT_CONNECTED)
       state_.transportConnected = patch.transportConnected;
     if (patch.present & PRINTER_PATCH_PRINTER_ONLINE)
       state_.printerOnline = patch.printerOnline;
 
     const PrinterLifecycle previousVisible = state_.visibleLifecycle;
-    if (patch.present & PRINTER_PATCH_LIFECYCLE) {
+    bool deferFinishedIdle = false;
+    if ((patch.present & PRINTER_PATCH_LIFECYCLE) &&
+        patch.lifecycle == PRINTER_IDLE && finishedGraceActive_ &&
+        static_cast<uint32_t>(nowMs - finishedSinceMs_) < kFinishedGraceMs) {
+      deferFinishedIdle = true;
+    }
+    if ((patch.present & PRINTER_PATCH_LIFECYCLE) && !deferFinishedIdle) {
       state_.lifecycle = patch.lifecycle;
       state_.visibleLifecycle = printerVisibleLifecycleForUpdate(
           state_.visibleLifecycle, patch.lifecycle);
+      if (patch.lifecycle == PRINTER_FINISHED) {
+        if (!finishedGraceActive_) {
+          finishedGraceActive_ = true;
+          finishedSinceMs_ = nowMs;
+        }
+      } else if (patch.lifecycle != PRINTER_UNKNOWN &&
+                 patch.lifecycle != PRINTER_OFFLINE) {
+        finishedGraceActive_ = false;
+      }
     }
 
     const bool retainingOverlay =
         (state_.lifecycle == PRINTER_UNKNOWN ||
          state_.lifecycle == PRINTER_OFFLINE) &&
         printerHasVisibleOverlay(previousVisible);
-    if ((patch.present & PRINTER_PATCH_PROGRESS) && !retainingOverlay)
+    if ((patch.present & PRINTER_PATCH_PROGRESS) && !retainingOverlay &&
+        !deferFinishedIdle)
       state_.progress = patch.progress > 100 ? 100 : patch.progress;
     if (state_.lifecycle == PRINTER_FINISHED) state_.progress = 100;
     if (state_.lifecycle == PRINTER_IDLE) state_.progress = 0;
-    if (patch.present & PRINTER_PATCH_CURRENT_LAYER)
+    if (!deferFinishedIdle && (patch.present & PRINTER_PATCH_CURRENT_LAYER))
       state_.currentLayer = patch.currentLayer;
-    if (patch.present & PRINTER_PATCH_TOTAL_LAYERS)
+    if (!deferFinishedIdle && (patch.present & PRINTER_PATCH_TOTAL_LAYERS))
       state_.totalLayers = patch.totalLayers;
-    if (patch.present & PRINTER_PATCH_REMAINING_SECONDS)
+    if (!deferFinishedIdle && (patch.present & PRINTER_PATCH_REMAINING_SECONDS))
       state_.remainingSeconds = patch.remainingSeconds;
-    if (patch.present & PRINTER_PATCH_JOB_NAME)
+    if (!deferFinishedIdle && (patch.present & PRINTER_PATCH_JOB_NAME))
       copyText(state_.jobName, patch.jobName);
-    if (patch.present & PRINTER_PATCH_STAGE)
+    if (!deferFinishedIdle && (patch.present & PRINTER_PATCH_STAGE))
       copyText(state_.stage, patch.stage);
-    if (patch.present & PRINTER_PATCH_DETAIL)
+    if (!deferFinishedIdle && (patch.present & PRINTER_PATCH_DETAIL))
       copyText(state_.detail, patch.detail);
+  }
+
+  void advance(uint32_t nowMs) {
+    if (!finishedGraceActive_ || state_.lifecycle != PRINTER_FINISHED ||
+        static_cast<uint32_t>(nowMs - finishedSinceMs_) < kFinishedGraceMs) {
+      return;
+    }
+    state_.lifecycle = PRINTER_IDLE;
+    state_.visibleLifecycle = PRINTER_UNKNOWN;
+    state_.progress = 0;
+    copyText(state_.stage, "idle");
+    copyText(state_.detail, "idle");
+    finishedGraceActive_ = false;
   }
 
   void markUnavailable(bool transportConnected, PrinterLifecycle lifecycle,
@@ -178,7 +209,11 @@ class PrinterStatusReducer {
     state_.remainingSeconds = 0;
     state_.jobName[0] = '\0';
     state_.stage[0] = '\0';
+    finishedGraceActive_ = false;
+    finishedSinceMs_ = 0;
   }
 
   PrinterStateSnapshot state_;
+  bool finishedGraceActive_ = false;
+  uint32_t finishedSinceMs_ = 0;
 };

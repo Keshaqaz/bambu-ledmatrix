@@ -918,6 +918,7 @@ class RelayHttpSource : public PrinterStatusSource {
  public:
   PrinterStateSnapshot snapshot() const override {
     taskENTER_CRITICAL(&printerStatusMux);
+    reducer_.advance(millis());
     PrinterStateSnapshot copy = reducer_.snapshot();
     taskEXIT_CRITICAL(&printerStatusMux);
     return copy;
@@ -943,11 +944,11 @@ class RelayHttpSource : public PrinterStatusSource {
 
   void apply(const PrinterStatePatch& patch) {
     taskENTER_CRITICAL(&printerStatusMux);
-    reducer_.apply(patch);
+    reducer_.apply(patch, millis());
     taskEXIT_CRITICAL(&printerStatusMux);
   }
 
-  PrinterStatusReducer reducer_;
+  mutable PrinterStatusReducer reducer_;
 };
 
 static RelayHttpSource relayHttpSource;
@@ -1062,10 +1063,15 @@ bool RelayHttpSource::fetch(const char* relayUrl, const char* relayKey) {
     return false;
   }
 
-  const bool connected = doc["connected"] | false;
-  const bool printerOnline = doc["printerOnline"].isNull()
-      ? connected
-      : doc["printerOnline"].as<bool>();
+  const PrinterStateSnapshot previous = snapshot();
+  const bool hasConnected = !doc["connected"].isNull();
+  const bool hasPrinterOnline = !doc["printerOnline"].isNull();
+  const bool connected = hasConnected
+      ? doc["connected"].as<bool>()
+      : previous.transportConnected;
+  const bool printerOnline = hasPrinterOnline
+      ? doc["printerOnline"].as<bool>()
+      : previous.printerOnline;
   const bool hasProgress = !doc["progress"].isNull();
   float progress = hasProgress ? doc["progress"].as<float>() : 0.0f;
   // Relay progress is percent-valued. Preserve the long-standing fractional
@@ -1081,16 +1087,22 @@ bool RelayHttpSource::fetch(const char* relayUrl, const char* relayKey) {
   PrinterLifecycle lifecycle = relayLifecycleFromString(lifecycleText);
   if (lifecycle == PRINTER_UNKNOWN && hasLifecycleInput)
     lifecycle = relayResolveLifecycle(rawStatus, rawStage, progress);
-  if (!printerOnline) lifecycle = PRINTER_OFFLINE;
+  if (hasPrinterOnline && !printerOnline) lifecycle = PRINTER_OFFLINE;
 
   PrinterStatePatch patch;
-  patch.present = PRINTER_PATCH_TRANSPORT_CONNECTED |
-                  PRINTER_PATCH_PRINTER_ONLINE;
-  patch.transportConnected = connected;
-  patch.printerOnline = printerOnline;
-  if (!printerOnline || hasLifecycleInput) {
+  if (hasConnected) {
+    patch.present |= PRINTER_PATCH_TRANSPORT_CONNECTED;
+    patch.transportConnected = connected;
+  }
+  if (hasPrinterOnline) {
+    patch.present |= PRINTER_PATCH_PRINTER_ONLINE;
+    patch.printerOnline = printerOnline;
+  }
+  if ((hasPrinterOnline && !printerOnline) || hasLifecycleInput) {
     patch.present |= PRINTER_PATCH_LIFECYCLE;
-    patch.lifecycle = lifecycle;
+    patch.lifecycle = (hasPrinterOnline && !printerOnline)
+        ? PRINTER_OFFLINE
+        : lifecycle;
   }
   if (hasProgress) {
     patch.present |= PRINTER_PATCH_PROGRESS;
@@ -1099,7 +1111,7 @@ bool RelayHttpSource::fetch(const char* relayUrl, const char* relayKey) {
   // A stale/offline relay snapshot is a source-quality update, not a new
   // printer-state snapshot. Keep the last confirmed job metadata with the
   // visible overlay until an online update (especially explicit idle) arrives.
-  if (printerOnline) {
+  if (!hasPrinterOnline || printerOnline) {
     if (!doc["jobName"].isNull()) {
       patch.present |= PRINTER_PATCH_JOB_NAME;
       strlcpy(patch.jobName, doc["jobName"] | "", sizeof(patch.jobName));
@@ -1129,7 +1141,6 @@ bool RelayHttpSource::fetch(const char* relayUrl, const char* relayKey) {
     strlcpy(patch.detail, "Relay недоступен", sizeof(patch.detail));
   } else {
     char msg[96];
-    const PrinterStateSnapshot previous = snapshot();
     const uint8_t shownProgress = hasProgress ? patch.progress : previous.progress;
     const PrinterLifecycle shownLifecycle =
         (patch.present & PRINTER_PATCH_LIFECYCLE) ? lifecycle : previous.lifecycle;
@@ -2368,6 +2379,22 @@ void handleRoot() {
                 reinterpret_cast<PGM_P>(INDEX_HTML_GZ), INDEX_HTML_GZ_LEN);
 }
 
+static void appendPrinterStatus(JsonDocument& doc,
+                                const PrinterStateSnapshot& snapshot) {
+  doc["bambuConfigured"] = snapshot.configured;
+  doc["bambuConnected"] = snapshot.transportConnected;
+  doc["bambuPrinterOnline"] = snapshot.printerOnline;
+  doc["bambuLifecycle"] = snapshot.lifecycle;
+  doc["bambuVisibleLifecycle"] = snapshot.visibleLifecycle;
+  doc["bambuProgress"] = snapshot.progress;
+  doc["bambuCurrentLayer"] = snapshot.currentLayer;
+  doc["bambuTotalLayers"] = snapshot.totalLayers;
+  doc["bambuRemainingSeconds"] = snapshot.remainingSeconds;
+  doc["bambuJobName"] = snapshot.jobName;
+  doc["bambuStage"] = snapshot.stage;
+  doc["bambuDetail"] = snapshot.detail;
+}
+
 void handleGetSettings() {
   if (!checkAuth()) { server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
   JsonDocument doc;
@@ -2408,19 +2435,7 @@ void handleGetSettings() {
   doc["bambuRelayUrl"]     = bambuCfg.relayUrl;
   doc["bambuRelayKeySet"]  = bambuCfg.relayKey[0] != '\0';
   xSemaphoreGive(bambuCfgMtx);
-  { PrinterStateSnapshot st = printerStatusSource.snapshot();
-    doc["bambuConfigured"] = st.configured;
-    doc["bambuConnected"]  = st.transportConnected;
-    doc["bambuPrinterOnline"] = st.printerOnline;
-    doc["bambuLifecycle"]  = st.lifecycle;
-    doc["bambuVisibleLifecycle"] = st.visibleLifecycle;
-    doc["bambuProgress"]   = st.progress;
-    doc["bambuCurrentLayer"] = st.currentLayer;
-    doc["bambuTotalLayers"] = st.totalLayers;
-    doc["bambuRemainingSeconds"] = st.remainingSeconds;
-    doc["bambuJobName"] = st.jobName;
-    doc["bambuStage"] = st.stage;
-    doc["bambuDetail"]     = st.detail; }
+  appendPrinterStatus(doc, printerStatusSource.snapshot());
   // Данные восхода/заката хранятся в RAM (не в cfg) — читаем вне мьютекса
   doc["sunTimeValid"]  = sunTimeValid.load();
   { uint32_t st = sunTimes.load();
@@ -2612,20 +2627,9 @@ void handleStatus() {
   }
   doc["savePending"] = savePending.load();
   doc["saveError"]   = saveError.load();
-  { PrinterStateSnapshot st = printerStatusSource.snapshot();
-    doc["bambuEnabled"]    = st.enabled;
-    doc["bambuConfigured"] = st.configured;
-    doc["bambuConnected"]  = st.transportConnected;
-    doc["bambuPrinterOnline"] = st.printerOnline;
-    doc["bambuLifecycle"]  = st.lifecycle;
-    doc["bambuVisibleLifecycle"] = st.visibleLifecycle;
-    doc["bambuProgress"]   = st.progress;
-    doc["bambuCurrentLayer"] = st.currentLayer;
-    doc["bambuTotalLayers"] = st.totalLayers;
-    doc["bambuRemainingSeconds"] = st.remainingSeconds;
-    doc["bambuJobName"] = st.jobName;
-    doc["bambuStage"] = st.stage;
-    doc["bambuDetail"]     = st.detail; }
+  { PrinterStateSnapshot printer = printerStatusSource.snapshot();
+    doc["bambuEnabled"] = printer.enabled;
+    appendPrinterStatus(doc, printer); }
   // Данные восхода/заката — нужны для авто-обновления sunStatusTxt каждые 3 сек
   doc["sunTimeValid"] = sunTimeValid.load();
   { uint32_t snt = sunTimes.load();
