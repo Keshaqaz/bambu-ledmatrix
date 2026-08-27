@@ -6,6 +6,7 @@
 # PlatformIO / firmware build artifacts
 .pio/
 esp32_matrix_controller22/build/
+esp32_matrix_controller22/.secrets/
 *.bin
 *.elf
 *.map

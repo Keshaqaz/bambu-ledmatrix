@@ -5,7 +5,8 @@ ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 SRC_FILE="$ROOT_DIR/src/index_html.h"
 OUT_FILE="$ROOT_DIR/web/index.html"
 TMP_FILE=$(mktemp "${TMPDIR:-/tmp}/ledmatrix-web.XXXXXX")
-trap 'rm -f "$TMP_FILE"' EXIT HUP INT TERM
+TMP_GZIP_HEADER=$(mktemp "${TMPDIR:-/tmp}/ledmatrix-web-gzip.XXXXXX")
+trap 'rm -f "$TMP_FILE" "$TMP_GZIP_HEADER"' EXIT HUP INT TERM
 
 awk '
 BEGIN { started = 0 }
@@ -25,13 +26,18 @@ BEGIN { started = 0 }
 }
 ' "$SRC_FILE" > "$TMP_FILE"
 
-if cmp -s "$TMP_FILE" "$OUT_FILE"; then
-  printf "web/index.html is up to date\n"
-  exit 0
+if ! cmp -s "$TMP_FILE" "$OUT_FILE"; then
+  printf "web/index.html is out of date; run: sh tools/export_web_ui.sh\n" >&2
+  if command -v diff >/dev/null 2>&1; then
+    diff -u "$OUT_FILE" "$TMP_FILE" | sed -n '1,120p' >&2 || true
+  fi
+  exit 1
 fi
 
-printf "web/index.html is out of date; run: sh tools/export_web_ui.sh\n" >&2
-if command -v diff >/dev/null 2>&1; then
-  diff -u "$OUT_FILE" "$TMP_FILE" | sed -n '1,120p' >&2 || true
+sh "$ROOT_DIR/tools/generate_web_ui_gzip.sh" "$TMP_GZIP_HEADER" >/dev/null
+if ! cmp -s "$TMP_GZIP_HEADER" "$ROOT_DIR/src/index_html_gz.h"; then
+  printf "src/index_html_gz.h is out of date; run: sh tools/generate_web_ui_gzip.sh\n" >&2
+  exit 1
 fi
-exit 1
+
+printf "web/index.html and deterministic gzip asset are up to date\n"

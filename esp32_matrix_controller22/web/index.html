@@ -158,9 +158,22 @@ details .dbody{padding:2px 13px 13px}
   border:1px solid var(--accent);color:var(--text);padding:10px 18px;border-radius:11px;font-size:.79rem;
   opacity:0;transition:.3s;pointer-events:none;z-index:99;box-shadow:0 8px 24px rgba(0,0,0,.5)}
 .toast.show{opacity:1;transform:translateX(-50%)}
+.auth{position:fixed;inset:0;z-index:200;background:rgba(8,9,12,.96);display:flex;align-items:center;justify-content:center;padding:20px}
+.authbox{width:min(420px,100%);background:var(--card);border:1px solid var(--border2);border-radius:16px;padding:20px}
+.authbox h1{font-size:1rem;letter-spacing:.06em;margin-bottom:8px}.authbox .note{margin-bottom:14px}
 .dis{opacity:.4;pointer-events:none;transition:.2s}
 .hide{display:none!important}
 </style></head><body>
+
+<div class="auth hide" id="authGate">
+  <div class="authbox">
+    <h1 id="authTitle">Вход в LED Matrix</h1>
+    <div class="note" id="authHint">Введите пароль администратора.</div>
+    <div class="field"><label>Пароль администратора</label><input type="password" id="adminPass" autocomplete="current-password"></div>
+    <div class="note err hide" id="authError" style="margin-bottom:10px"></div>
+    <button class="btn" id="authBtn" onclick="submitAuth()">Войти</button>
+  </div>
+</div>
 
 <div class="shell">
 
@@ -361,6 +374,19 @@ details .dbody{padding:2px 13px 13px}
       <div class="si"><div class="sl2">Память</div><div class="sv" id="sHeap">—</div></div>
       <div class="si"><div class="sl2">CPU</div><div class="sv" id="sCpu">—</div></div>
     </div>
+    <details>
+      <summary>Ресурсные метрики T01</summary>
+      <div class="dbody">
+        <div class="sg">
+          <div class="si"><div class="sl2">Heap minimum</div><div class="sv" id="sHeapMin">—</div></div>
+          <div class="si"><div class="sl2">Largest block</div><div class="sv" id="sHeapLargest">—</div></div>
+          <div class="si"><div class="sl2">Loop stack free</div><div class="sv" id="sStackLoop">—</div></div>
+          <div class="si"><div class="sl2">Weather stack free</div><div class="sv" id="sStackWeather">—</div></div>
+          <div class="si"><div class="sl2">Printer stack free</div><div class="sv" id="sStackPrinter">—</div></div>
+          <div class="si"><div class="sl2">WiFi task stack</div><div class="sv">0 · loop SM</div></div>
+        </div>
+      </div>
+    </details>
   </div>
 
   <div class="card">
@@ -378,7 +404,13 @@ details .dbody{padding:2px 13px 13px}
       <input type="file" accept=".bin" id="fwFile" onchange="fwPick(this)">
       <span class="dico">⬆</span>
       <span class="dt" id="dropT">Выберите или перетащите .bin</span>
-      <span class="dh">esp32_matrix_controller22.ino.bin · сборка min_spiffs, не merged.bin</span>
+      <span class="dh">esp32_matrix_controller22.ino.bin · min_spiffs · только подписанный образ</span>
+    </label>
+    <label class="drop" style="margin-top:8px">
+      <input type="file" accept=".sig" id="fwSig" onchange="fwPick(this)">
+      <span class="dico">✍</span>
+      <span class="dt" id="sigT">Выберите подпись .sig</span>
+      <span class="dh">Создаётся tools/sign_ota.sh тем же ключом, который встроен в прошивку</span>
     </label>
     <div class="hide" id="fwProg" style="margin-top:10px">
       <div class="pbar"><i id="fwBar" style="width:0%;background:linear-gradient(90deg,#b06a18,var(--accent))"></i></div>
@@ -391,6 +423,7 @@ details .dbody{padding:2px 13px 13px}
   <div class="card">
     <div class="ch"><h2>Управление</h2></div>
     <button class="btn2 btn-danger" onclick="rebootDevice()">Перезагрузить устройство</button>
+    <button class="btn2" style="margin-top:8px" onclick="logoutSession()">Выйти из WebUI</button>
   </div>
 </div>
 
@@ -417,11 +450,12 @@ const PREVIEW_MODE=window.location.protocol==='file:';
 let st={rot:0,provider:0,locCoords:false,sunBySun:false};
 let connBusy=false,scanBusy=false,prevConnResult=0,toastTimer=0;
 let hydrating=false,autosaveReady=false,autosaveTimer=0,autosavePending=false,autosaveRunning=false,autosaveQueued=false,autosaveNoticeTimer=0,saveAwaitPersist=false;
+let csrfToken='',authProvisioned=true,appStarted=false;
 
 /* ── preview mode: моки для file:// ── */
 let mockConnResult=0,mockSettings={brightness:80,autoColor:true,use24h:true,ntpServer:'pool.ntp.org',tzOffset:3,tzFromWeather:true,updateMin:10,weatherProvider:0,apiKeySet:true,city:'Moscow',owmLat:55.7558,owmLon:37.6173,owmUseCoords:false,rotation:0,flipH:false,flipV:false,autoBrightness:false,brightnessDay:80,brightnessNight:20,dayStartHour:7,nightStartHour:22,autoBrSunMode:false,ct6ClockX:0,ct6ClockY:2,ct6TempX:-1,ct6TempY:9,ct6ClockR:255,ct6ClockG:128,ct6ClockB:0,ct6TempR:0,ct6TempG:200,ct6TempB:255,bambuEnabled:true,bambuRelayUrl:'http://192.168.1.1:8787/status',bambuRelayKeySet:true,bambuConnected:true,bambuPrinterOnline:true,bambuLifecycle:3,bambuProgress:42,bambuDetail:'Preview: печать 42%',sunTimeValid:true,sunriseH:6,sunriseM:12,sunsetH:20,sunsetM:4};
 function mockJson(payload,status=200){return new Response(JSON.stringify(payload),{status,headers:{'Content-Type':'application/json'}});}
-function mockStatus(){return {wifi:true,ap:false,ssid:'Home WiFi',ip:'192.168.1.65',temp:23.4,cpuTemp:41.2,uptime:'3ч 14м',heap:'214 KB',fwVersion:'preview',fwPartition:'app0',rssi:'-58 dBm',weatherSource:'owm',weatherError:'',weatherAgeSec:240,connResult:mockConnResult,connIp:mockConnResult===2?'192.168.1.88':'',connStatus:0,connStatusText:'',savePending:false,saveError:false,bambuEnabled:mockSettings.bambuEnabled,bambuConfigured:true,bambuConnected:true,bambuPrinterOnline:true,bambuLifecycle:3,bambuProgress:42,bambuDetail:mockSettings.bambuDetail,sunTimeValid:true,sunriseH:6,sunriseM:12,sunsetH:20,sunsetM:4};}
+function mockStatus(){return {wifi:true,ap:false,ssid:'Home WiFi',ip:'192.168.1.65',temp:23.4,cpuTemp:41.2,uptime:'3ч 14м',heap:'214 KB',heapInternalMinimum:128000,heapInternalLargest:92000,taskStackFree:{loop:6200,weather:4100,printer:3600,wifi:0},fwVersion:'preview',fwPartition:'app0',rssi:'-58 dBm',weatherSource:'owm',weatherError:'',weatherAgeSec:240,connResult:mockConnResult,connIp:mockConnResult===2?'192.168.1.88':'',connStatus:0,connStatusText:'',savePending:false,saveError:false,bambuEnabled:mockSettings.bambuEnabled,bambuConfigured:true,bambuConnected:true,bambuPrinterOnline:true,bambuLifecycle:3,bambuProgress:42,bambuDetail:mockSettings.bambuDetail,sunTimeValid:true,sunriseH:6,sunriseM:12,sunsetH:20,sunsetM:4};}
 async function apiFetch(url,opts={}){const headers=new Headers(opts.headers||{});if(opts.body!==undefined&&!headers.has('Content-Type'))headers.set('Content-Type','application/json');const method=(opts.method||'GET').toUpperCase();
   if(PREVIEW_MODE){
     if(url==='/api/settings'&&method==='GET')return mockJson(mockSettings);
@@ -432,9 +466,25 @@ async function apiFetch(url,opts={}){const headers=new Headers(opts.headers||{})
     if(url==='/api/disconnect'&&method==='POST'){mockConnResult=0;return mockJson({ok:true});}
     if((url==='/api/reboot'||url==='/api/weather/refresh')&&method==='POST')return mockJson({ok:true});
   }
+  if(!['GET','HEAD','OPTIONS'].includes(method)&&csrfToken)headers.set('X-CSRF-Token',csrfToken);
   const res=await fetch(url,Object.assign({},opts,{headers}));
-  if(res.status===401)throw new Error('unauthorized');
+  if(res.status===401||res.status===403){showAuth(true);throw new Error('unauthorized');}
   return res;}
+
+function showAuth(provisioned){authProvisioned=provisioned;g('authGate').classList.remove('hide');g('authError').classList.add('hide');
+  g('authTitle').textContent=provisioned?'Вход в LED Matrix':'Первичная настройка защиты';
+  g('authHint').textContent=provisioned?'Введите пароль администратора.':'Создайте пароль администратора (минимум 10 символов). Он не сохраняется в браузере.';
+  g('authBtn').textContent=provisioned?'Войти':'Защитить устройство';g('adminPass').autocomplete=provisioned?'current-password':'new-password';}
+async function submitAuth(){const password=g('adminPass').value,err=g('authError');err.classList.add('hide');
+  if(password.length<10){err.textContent='Минимум 10 символов';err.classList.remove('hide');return;}
+  g('authBtn').disabled=true;
+  try{const url=authProvisioned?'/api/session/login':'/api/session/bootstrap';const res=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password})});
+    const data=await res.json();if(!res.ok)throw new Error(data.error||'auth_failed');csrfToken=data.csrf||'';g('adminPass').value='';g('authGate').classList.add('hide');startApp();}
+  catch(e){err.textContent=e.message==='invalid_credentials'?'Неверный пароль':'Не удалось настроить вход';err.classList.remove('hide');}
+  finally{g('authBtn').disabled=false;}}
+async function initAuth(){if(PREVIEW_MODE){csrfToken='preview';startApp();return;}
+  try{const data=await(await fetch('/api/session')).json();if(data.authenticated){csrfToken=data.csrf||'';startApp();}else showAuth(!!data.provisioned);}
+  catch(e){showAuth(true);g('authError').textContent='Устройство не ответило';g('authError').classList.remove('hide');}}
 
 /* ── базовые утилиты ── */
 function go(p){document.querySelectorAll('.page').forEach(e=>e.classList.toggle('on',e.id==='pg-'+p));
@@ -631,6 +681,7 @@ function buildSavePayload(){
 /* ── статус (поллинг 3 с) ── */
 function describeWifiMode(d){if(d.wifi&&d.ap)return 'WiFi + AP';if(d.wifi)return 'WiFi клиент';if(d.ap)return 'Точка доступа';return 'Оффлайн';}
 function rssiLevel(r){return r>-50?4:r>-65?3:r>-75?2:1;}
+function fmtBytes(v){return Number.isFinite(+v)?Math.round(+v/1024)+' KB':'—';}
 const WSRC={'owm':'OpenWeatherMap','open-meteo':'Open-Meteo'};
 async function fetchStatus(){
   try{
@@ -643,9 +694,9 @@ async function fetchStatus(){
     /* сеть */
     const banner=g('netBanner');
     if(d.wifi){banner.className='banner ok';g('netBannerTxt').innerHTML='Подключено к <b>'+escapeHtml(d.ssid||'')+'</b> · IP <b>'+escapeHtml(d.ip||'—')+'</b>';}
-    else if(d.ap){banner.className='banner warn';g('netBannerTxt').innerHTML='Точка доступа <b>ESP32-Matrix</b> — выберите сеть ниже';}
+    else if(d.ap){banner.className='banner warn';g('netBannerTxt').innerHTML='Точка доступа <b>'+escapeHtml(d.apSsid||'ESP32-Matrix')+'</b> — выберите сеть ниже';}
     else{banner.className='banner warn';g('netBannerTxt').textContent='Не подключено к WiFi';}
-    g('nSsid').textContent=d.wifi?(d.ssid||'—'):(d.ap?'ESP32-Matrix':'—');
+    g('nSsid').textContent=d.wifi?(d.ssid||'—'):(d.ap?(d.apSsid||'ESP32-Matrix'):'—');
     g('nIp').textContent=d.ip||'—';
     const rv=parseInt(d.rssi);
     g('nBars').dataset.l=d.wifi&&!isNaN(rv)?rssiLevel(rv):0;
@@ -666,6 +717,11 @@ async function fetchStatus(){
     if(d.fwVersion)g('sFw').textContent=d.fwVersion+' · '+(d.fwPartition||'?');
     g('sUp').textContent=d.uptime||'—';
     g('sHeap').textContent=d.heap||'—';
+    g('sHeapMin').textContent=fmtBytes(d.heapInternalMinimum);
+    g('sHeapLargest').textContent=fmtBytes(d.heapInternalLargest);
+    g('sStackLoop').textContent=fmtBytes(d.taskStackFree?.loop);
+    g('sStackWeather').textContent=fmtBytes(d.taskStackFree?.weather);
+    g('sStackPrinter').textContent=fmtBytes(d.taskStackFree?.printer);
     g('sCpu').textContent=d.cpuTemp>-999?d.cpuTemp.toFixed(1)+'°C':'—';
     /* отложенная запись NVS */
     if(d.saveError){saveAwaitPersist=false;setSaveState('error','ошибка записи');}
@@ -720,17 +776,21 @@ async function disconnWifi(){if(!confirm('Отключиться и забыть
 async function rebootDevice(){if(!confirm('Перезагрузить устройство?'))return;
   try{const res=await apiFetch('/api/reboot',{method:'POST',body:'{}'});if(!res.ok)throw new Error('reboot_failed');toast('Перезагрузка…');}
   catch(e){toast('Не удалось перезагрузить устройство');}}
+async function logoutSession(){try{await apiFetch('/api/session/logout',{method:'POST',body:'{}'});}catch(e){}
+  csrfToken='';appStarted=false;clearInterval(statusInterval);statusInterval=0;showAuth(true);}
 
 /* ── OTA ── */
 let fwBusy=false;
 function fwMsg(t,color){const el=g('fwResult');el.textContent=t;el.style.color=color||'';}
 function fwPick(inp){const f=inp.files[0];if(!f)return;
-  g('dropT').textContent=f.name+' · '+Math.round(f.size/1024)+' КБ';
-  g('fwBtn').disabled=false;}
-function uploadFirmware(){
+  if(inp.id==='fwFile')g('dropT').textContent=f.name+' · '+Math.round(f.size/1024)+' КБ';else g('sigT').textContent=f.name+' · '+f.size+' байт';
+  g('fwBtn').disabled=!(g('fwFile').files[0]&&g('fwSig').files[0]);}
+async function uploadFirmware(){
   if(fwBusy)return;
   const f=g('fwFile').files[0];
+  const sigFile=g('fwSig').files[0];
   if(!f){toast('Выберите .bin файл');return;}
+  if(!sigFile){toast('Выберите подпись .sig');return;}
   if(!/\.bin$/i.test(f.name)){toast('Нужен файл .bin');return;}
   if(/merged/i.test(f.name)){fwMsg('Это merged.bin — загружайте esp32_matrix_controller22.ino.bin','var(--red)');return;}
   if(!confirm('Прошить устройство файлом «'+f.name+'» ('+Math.round(f.size/1024)+' КБ)? Во время загрузки не отключайте питание.'))return;
@@ -747,13 +807,18 @@ function uploadFirmware(){
   const fd=new FormData();fd.append('firmware',f,f.name);
   const xhr=new XMLHttpRequest();
   xhr.open('POST','/api/update?size='+f.size);
+  xhr.setRequestHeader('X-CSRF-Token',csrfToken);
+  const sigBytes=new Uint8Array(await sigFile.arrayBuffer());
+  xhr.setRequestHeader('X-OTA-Signature',btoa(String.fromCharCode(...sigBytes)));
   xhr.timeout=300000;
   xhr.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded*100/e.total);bar.style.width=p+'%';txt.textContent=p+'%'+(p===100?' — проверка и запись…':'');}};
   xhr.onload=()=>{
     if(xhr.status===200){
       fwMsg('Прошивка загружена, устройство перезагружается…','var(--green)');toast('Перезагрузка…');
       // После OTA слот всегда меняется (app0↔app1) — ждём смены fwVersion/fwPartition
-      const poll=setInterval(async()=>{try{const d=await(await fetch('/api/status')).json();
+      const poll=setInterval(async()=>{try{const response=await fetch('/api/status');
+        if(response.status===401){clearInterval(poll);csrfToken='';appStarted=false;statusInterval=-1;showAuth(true);fwMsg('✅ Устройство перезагрузилось — войдите снова и проверьте версию','var(--green)');finish(true);return;}
+        const d=await response.json();
         const cur=d.fwVersion+' · '+(d.fwPartition||'?');
         if(d.fwVersion&&cur!==prevFw){clearInterval(poll);fwMsg('✅ Обновлено: '+cur,'var(--green)');finish(true);}}catch(e){}},2000);
       setTimeout(()=>{clearInterval(poll);if(fwBusy){fwMsg('Устройство не ответило после перезагрузки — обновите страницу и проверьте версию','var(--red)');finish(false);}},120000);
@@ -768,8 +833,9 @@ const drop=g('drop');
   if(ev==='drop'&&e.dataTransfer.files[0]){g('fwFile').files=e.dataTransfer.files;fwPick(g('fwFile'));}}));
 
 /* ── init ── */
-loadSettings();fetchStatus();
-let statusInterval=setInterval(fetchStatus,3000);
+let statusInterval=0;
+function startApp(){if(appStarted){fetchStatus();return;}appStarted=true;loadSettings();fetchStatus();statusInterval=setInterval(fetchStatus,3000);}
+initAuth();
 document.addEventListener('visibilitychange',()=>{if(fwBusy)return;clearInterval(statusInterval);statusInterval=0;
   if(!document.hidden){fetchStatus();statusInterval=setInterval(fetchStatus,3000);}});
 window.addEventListener('beforeunload',e=>{if(autosaveRunning||autosavePending||autosaveQueued){e.preventDefault();e.returnValue='Изменения ещё сохраняются';}});

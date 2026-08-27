@@ -31,12 +31,19 @@
 #include <stddef.h>
 #include <esp_arduino_version.h>
 #include <esp_wifi.h>
+#include <esp_heap_caps.h>
 #include <Update.h>
-#include <ArduinoOTA.h>
 #include <esp_ota_ops.h>
 #include <esp_app_format.h>
+#include <mbedtls/base64.h>
+#include <mbedtls/pk.h>
+#include <mbedtls/sha256.h>
 #include <atomic>
 #include "app.hpp"
+#include "bambu_legacy_migration.hpp"
+#include "ota_public_key.hpp"
+#include "security_policy.hpp"
+#include "wifi_reconnect_policy.hpp"
 
 // PlatformIO compiles sources as plain C++ and does not apply Arduino's .ino
 // preprocessing. Keep explicit prototypes here so the same code builds in
@@ -68,12 +75,15 @@ void handleConnectWifi();
 void handleDisconnectWifi();
 void handleReboot();
 void handleWeatherRefresh();
+void handleSessionStatus();
+void handleSessionBootstrap();
+void handleSessionLogin();
+void handleSessionLogout();
 void handleUpdateUpload();
 void handleUpdateFinal();
 void showBoot();
 void showConnecting();
 static void startAP();
-void wifiConnTask(void* param);
 void weatherTask(void* param);
 void setup();
 void loop();
@@ -89,12 +99,16 @@ void loop();
 static constexpr uint16_t CONFIG_VERSION = 332;
 // Версия прошивки: поднимать при каждой OTA-итерации — по смене значения в
 // /api/status видно, что обновление реально применилось.
-static constexpr const char* FW_VERSION = "4.0.0-2026.06.11";
+static constexpr const char* FW_VERSION = "4.1.0-2026.08.27";
 static constexpr uint32_t STORED_STATE_MAGIC = 0x4D415458UL; // MATX
-static constexpr uint16_t STORED_STATE_VERSION = 1;
+static constexpr uint16_t STORED_STATE_VERSION = 2;
 static constexpr size_t BAMBU_TOKEN_CAPACITY = 384;
-static constexpr const char* LEGACY_DEFAULT_AP_PASS = "12345678";
 static constexpr uint8_t MIN_UI_BRIGHTNESS = 1;
+static constexpr size_t MAX_SETTINGS_BODY_BYTES = 4096;
+static constexpr size_t MAX_CONNECT_BODY_BYTES = 256;
+static constexpr size_t MAX_SESSION_BODY_BYTES = 192;
+static constexpr size_t MAX_RELAY_JSON_BYTES = 4096;
+static constexpr size_t MAX_WEATHER_JSON_BYTES = 12288;
 
 CRGB leds[NUM_LEDS];
 
@@ -149,8 +163,8 @@ struct Config {
   uint8_t  rotation        = 0;   // 0=нормальный 1=90°CW 2=180° 3=270°CW
   bool     flipH           = false; // зеркало по горизонтали
   bool     flipV           = false; // зеркало по вертикали
-  char     webPass[32]     = "";        // пароль веб-интерфейса не используется
-  char     apPass[64]      = "12345678"; // фиксированный пароль точки доступа ESP32-Matrix
+  char     webPass[32]     = ""; // legacy NVS bytes; runtime auth lives in SecurityState
+  char     apPass[64]      = ""; // legacy NVS bytes; runtime AP password lives in SecurityState
 
   // Режим 6 «Часы + Темп»: позиция строк и независимые цвета.
   // Автоцвет влияет только на температуру; часы всегда берут ct6ClockRGB.
@@ -272,16 +286,7 @@ static_assert(sizeof(LegacyConfigV326) == 432, "LegacyConfigV326 size changed");
 static_assert(sizeof(LegacyConfigV331Compat) > sizeof(Config),
               "LegacyConfigV331Compat must remain larger than current Config");
 
-struct BambuConfig {
-  bool enabled = false;
-  // Legacy ESP-side Bambu Cloud fields kept only so old NVS blobs keep their layout.
-  // Runtime is relay-only; these fields are cleared on load/save and ignored.
-  char email[96] = "";
-  char password[96] = "";
-  bool relayEnabled = true;
-  char relayUrl[160] = "";
-  char relayKey[64] = "";
-};
+using BambuConfig = BambuRelayConfig;
 
 struct StoredStateBlob {
   uint32_t magic = STORED_STATE_MAGIC;
@@ -289,16 +294,36 @@ struct StoredStateBlob {
   uint16_t size = sizeof(StoredStateBlob);
   Config cfg;
   BambuConfig bambuCfg;
-  char bambuToken[BAMBU_TOKEN_CAPACITY] = "";
+  uint32_t checksum = 0;
+};
+
+// Explicit v1 layout: it contained obsolete ESP-side Bambu account buffers.
+// It is read only during migration, copied into the relay-only runtime layout,
+// securely wiped from RAM and immediately rewritten as StoredStateBlob v2.
+struct LegacyStoredStateBlobV1 {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t size;
+  Config cfg;
+  LegacyBambuConfigV2 bambuCfg;
+  char bambuToken[BAMBU_TOKEN_CAPACITY];
+  uint32_t checksum;
+};
+
+struct SecurityState {
+  uint32_t magic = 0x53454331UL; // SEC1
+  uint16_t version = 1;
+  uint16_t size = sizeof(SecurityState);
+  char apPassword[13] = "";      // 12 random decimal digits + NUL
+  uint8_t adminSalt[16] = {};
+  uint8_t adminHash[32] = {};
+  bool adminProvisioned = false;
   uint32_t checksum = 0;
 };
 
 Config     cfg;
 BambuConfig bambuCfg;
 Preferences prefs;
-// Legacy direct-cloud token/serial placeholders kept only to migrate/clear old NVS keys.
-static char bambuManualToken[BAMBU_TOKEN_CAPACITY] = "";
-static char bambuPrinterSerial[32] = "";
 
 // ════════════════════════════════════════════════════════════
 //  РАНТАЙМ
@@ -306,14 +331,21 @@ static char bambuPrinterSerial[32] = "";
 WebServer server(80);
 DNSServer dnsServer;
 
-static const char* AP_NAME = "ESP32-Matrix"; // SSID точки доступа (не меняется)
+static char AP_NAME[32] = "ESP32-Matrix";
+static SecurityState securityState;
+static uint32_t apCredentialDisplayStartedMs = 0;
+static uint8_t sessionToken[32] = {};
+static uint8_t csrfToken[32] = {};
+static bool sessionActive = false;
+static uint32_t sessionLastSeenMs = 0;
+static constexpr uint32_t SESSION_IDLE_TIMEOUT_MS = 30UL * 60UL * 1000UL;
 
 float    currentTemp    = -999.0f;
 std::atomic<bool> wifiConnected{false};
 std::atomic<bool>     apMode{true};   // стартуем всегда в AP
 std::atomic<bool> weatherRequested{false}; // флаг запроса погоды для weatherTask
 // configTime() модифицирует глобальное состояние lwIP — вызываем только из loop task.
-// wifiConnTask выставляет этот флаг, loop task вызывает configTime.
+// Wi-Fi state machine выставляет этот флаг, loop task вызывает configTime.
 std::atomic<bool> ntpPending{false};
 // Атомарный флаг "SSID сохранён" — избегает чтения cfg.ssid (char[]) из matrixShow без мьютекса
 std::atomic<bool> hasSsid{false};
@@ -343,7 +375,7 @@ uint32_t lastWeatherMs  = 0;
 uint32_t lastWeatherAttemptMs = 0;
 int      lastWeatherHttpCode = 0;
 uint8_t  lastWeatherKeyLen = 0;
-char     lastWeatherError[96] = "";
+char     lastWeatherError[160] = "";
 char     lastWeatherSource[16] = "";
 uint32_t lastDrawMs     = 0;
 static std::atomic<uint32_t> displayInvalidationSeq{0};
@@ -363,10 +395,20 @@ static portMUX_TYPE weatherMux = portMUX_INITIALIZER_UNLOCKED;
 // Мьютексы FreeRTOS для операций, которые могут занимать много времени:
 // taskENTER_CRITICAL нельзя использовать вокруг NVS и длинных блоков —
 // он надолго отключает прерывания и может вызвать Interrupt WDT reset.
-static SemaphoreHandle_t cfgMtx;   // защищает cfg: пишет handlePostSettings/wifiConnTask, читает fetchWeather
+static SemaphoreHandle_t cfgMtx;   // защищает cfg: пишет WebUI/Wi-Fi state machine, читает fetchWeather
 static SemaphoreHandle_t prefsMtx; // защищает NVS/Preferences: saveConfig/loadConfig
 static SemaphoreHandle_t bambuCfgMtx; // защищает bambuCfg: пишет веб-интерфейс, читает bambuTask
 static TaskHandle_t bambuTaskHandle = nullptr;
+static TaskHandle_t weatherTaskHandle = nullptr;
+static TaskHandle_t loopTaskHandle = nullptr;
+static std::atomic<uint32_t> minimumLargestInternalBlock{UINT32_MAX};
+
+static void sampleMemoryMetrics() {
+  uint32_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  uint32_t previous = minimumLargestInternalBlock.load();
+  while (largest < previous &&
+         !minimumLargestInternalBlock.compare_exchange_weak(previous, largest)) {}
+}
 
 // Безопасное чтение температуры — читает loop task, пишет weatherTask
 inline float safeGetTemp() {
@@ -443,6 +485,26 @@ static uint8_t bambuOverlayLifecycle(uint8_t nextLifecycle) {
   }
 }
 
+static bool bambuHasVisibleOverlay(uint8_t lifecycle) {
+  return lifecycle == BAMBU_PREPARING ||
+         lifecycle == BAMBU_PRINTING ||
+         lifecycle == BAMBU_PAUSED ||
+         lifecycle == BAMBU_FINISHED ||
+         lifecycle == BAMBU_ERROR;
+}
+
+static uint8_t bambuDisplayLifecycleForUpdate(uint8_t currentDisplayLifecycle,
+                                              uint8_t nextLifecycle) {
+  if (bambuHasVisibleOverlay(nextLifecycle)) return bambuOverlayLifecycle(nextLifecycle);
+  if (nextLifecycle == BAMBU_IDLE) return BAMBU_UNKNOWN;
+
+  // UNKNOWN/OFFLINE are transport-quality states, not proof that a print ended.
+  // Keep the last visible overlay until relay reports an explicit idle state.
+  return bambuHasVisibleOverlay(currentDisplayLifecycle)
+    ? currentDisplayLifecycle
+    : BAMBU_UNKNOWN;
+}
+
 static void setBambuDetail(BambuState& st, const char* detail) {
   strlcpy(st.detail, detail ? detail : "", sizeof(st.detail));
 }
@@ -456,11 +518,6 @@ static bool bambuHasRelayConfig(bool* enabledOut = nullptr,
   enabled = bambuCfg.enabled;
   // Relay-only runtime: keep the old flag forced on for migrated configs.
   bambuCfg.relayEnabled = true;
-  // Drop obsolete ESP-side Cloud credentials from RAM so they are not re-saved.
-  bambuCfg.email[0] = '\0';
-  bambuCfg.password[0] = '\0';
-  bambuManualToken[0] = '\0';
-  bambuPrinterSerial[0] = '\0';
   strlcpy(localRelayUrl, bambuCfg.relayUrl, sizeof(localRelayUrl));
   if (relayUrl && relayUrlSz) strlcpy(relayUrl, bambuCfg.relayUrl, relayUrlSz);
   if (relayKey && relayKeySz) strlcpy(relayKey, bambuCfg.relayKey, relayKeySz);
@@ -480,7 +537,7 @@ static void bambuSleepOrWake(uint32_t delayMs) {
 
 // ── Асинхронное подключение к WiFi ──────────────────────────────────────────
 // handleConnectWifi() только сохраняет параметры и возвращает ответ браузеру.
-// wifiConnTask выполняет фактическое подключение в отдельной FreeRTOS task.
+// loop() выполняет фактическое подключение неблокирующей state machine.
 // Результат читается браузером через /api/status polling.
 static char              wifiPendSsid[40]  = "";
 static char              wifiPendPass[64]  = "";
@@ -488,24 +545,21 @@ static std::atomic<bool> wifiConnPending{false};
 static std::atomic<int>  wifiConnResult{0}; // 0=idle 1=connecting 2=ok 3=fail
 static std::atomic<int>  wifiConnFailStatus{0};
 static portMUX_TYPE      wifiConnMux = portMUX_INITIALIZER_UNLOCKED;
-// Флаг: wifiConnTask просит loop task перезапустить AP (AP-функции не потокобезопасны)
-static std::atomic<bool> wifiNeedApRestart{false};
-// Loop-task: WiFi API не потокобезопасен — все вызовы mode/begin делаем из loop task
-// wifiConnTask выставляет wifiDoConnect, loop task вызывает WiFi.begin
-// и выставляет wifiConnInProgress, после чего wifiConnTask начинает опрос статуса.
-static std::atomic<bool>    wifiDoConnect{false};
 static std::atomic<bool>    wifiConnInProgress{false};
-// Результат мониторинга подключения записывает loop task, читает wifiConnTask.
-// Исключает прямые вызовы WiFi.status() из wifiConnTask (WiFi API не потокобезопасен).
-static std::atomic<bool>    wifiConnDone{false};    // опрос завершён
-static std::atomic<bool>    wifiConnOk{false};      // true = WL_CONNECTED
-static std::atomic<uint8_t> wifiConnFinalSt{0};     // итоговый статус (wl_status_t)
-// NVS-запись только из loop task: wifiConnTask устанавливает флаг, loop() вызывает saveConfig().
+enum class WifiConnectPhase : uint8_t { Idle, RadioOffWait, StaStartWait, Connecting };
+static WifiConnectPhase wifiConnectPhase = WifiConnectPhase::Idle;
+static uint32_t wifiConnectDeadlineMs = 0;
+static uint32_t wifiConnectStartedMs = 0;
+static char wifiActiveSsid[40] = "";
+static char wifiActivePass[64] = "";
+// Планировщик читается/изменяется только из Arduino setup()/loop() task.
+static WifiReconnectPolicy  wifiReconnectPolicy;
+// NVS-запись выполняется только из loop task.
 static std::atomic<bool>    savePending{false};
 static std::atomic<uint32_t> saveDueMs{0};
 static std::atomic<bool>    saveError{false};
 
-// Таймер выключения AP — вынесен в глобал, чтобы wifiConnTask мог сбросить его
+// Таймер выключения AP после успешного STA подключения.
 static std::atomic<uint32_t> apOffMs{0};
 
 // Кэш восхода/заката — обновляется weatherTask раз в сутки, хранится в local time.
@@ -524,7 +578,7 @@ static std::atomic<bool>     appliedUiBrightnessValid{false};
 
 // Снапшот полей cfg, нужных для рендера — обновляется в начале loop() под cfgMtx.
 // px() и show*() читают отсюда, а не из cfg напрямую,
-// чтобы избежать гонок с wifiConnTask, который может писать cfg.ssid/wifiPass.
+// чтобы избежать гонок с Wi-Fi state machine, которая пишет cfg.ssid/wifiPass.
 struct RenderSnap {
   uint8_t  rotation; bool flipH, flipV;
   bool     autoColor;
@@ -615,7 +669,7 @@ static void sanitizeLoadedConfig(Config& loaded) {
   loaded.blinkColon = false;
   loaded.ct6ShowWeatherIcon = false;
   loaded.webPass[0] = '\0';
-  strlcpy(loaded.apPass, LEGACY_DEFAULT_AP_PASS, sizeof(loaded.apPass));
+  loaded.apPass[0] = '\0';
 }
 
 static bool configEquals(const Config& a, const Config& b) {
@@ -674,8 +728,6 @@ static bool configEquals(const Config& a, const Config& b) {
 static bool bambuConfigEquals(const BambuConfig& a, const BambuConfig& b) {
   return
     a.enabled == b.enabled &&
-    strncmp(a.email, b.email, sizeof(a.email)) == 0 &&
-    strncmp(a.password, b.password, sizeof(a.password)) == 0 &&
     a.relayEnabled == b.relayEnabled &&
     strncmp(a.relayUrl, b.relayUrl, sizeof(a.relayUrl)) == 0 &&
     strncmp(a.relayKey, b.relayKey, sizeof(a.relayKey)) == 0;
@@ -694,27 +746,73 @@ static uint32_t storedStateChecksum(const StoredStateBlob& blob) {
   return fnv1a32(reinterpret_cast<const uint8_t*>(&blob), offsetof(StoredStateBlob, checksum));
 }
 
-static void ensureBootstrapSecrets() {
-  bool changed = false;
+static uint32_t securityStateChecksum(const SecurityState& state) {
+  return fnv1a32(reinterpret_cast<const uint8_t*>(&state), offsetof(SecurityState, checksum));
+}
 
-  xSemaphoreTake(cfgMtx, portMAX_DELAY);
-  if (strncmp(cfg.apPass, LEGACY_DEFAULT_AP_PASS, sizeof(cfg.apPass)) != 0) {
-    strlcpy(cfg.apPass, LEGACY_DEFAULT_AP_PASS, sizeof(cfg.apPass));
-    changed = true;
-  }
-  if (cfg.webPass[0] != '\0') {
-    cfg.webPass[0] = '\0';
-    changed = true;
-  }
-  xSemaphoreGive(cfgMtx);
+static void secureZero(void* ptr, size_t length) {
+  volatile uint8_t* bytes = static_cast<volatile uint8_t*>(ptr);
+  while (length--) *bytes++ = 0;
+}
 
-  if (changed) {
-    if (saveConfig()) Serial.println("[Security] Restored default AP password and disabled web auth");
-    else Serial.println("[Security] Failed to persist default AP password / web auth policy");
+static void fillRandom(uint8_t* output, size_t length) {
+  for (size_t i = 0; i < length; i += sizeof(uint32_t)) {
+    uint32_t value = esp_random();
+    size_t copy = min(sizeof(value), length - i);
+    memcpy(output + i, &value, copy);
+  }
+}
+
+static void hashAdminPassword(const char* password, const uint8_t salt[16], uint8_t output[32]) {
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts(&ctx, 0);
+  mbedtls_sha256_update(&ctx, salt, 16);
+  mbedtls_sha256_update(&ctx, reinterpret_cast<const uint8_t*>(password), strlen(password));
+  mbedtls_sha256_finish(&ctx, output);
+  mbedtls_sha256_free(&ctx);
+}
+
+static bool persistSecurityState() {
+  securityState.checksum = securityStateChecksum(securityState);
+  Preferences securityPrefs;
+  if (!securityPrefs.begin("security", false)) return false;
+  bool ok = securityPrefs.putBytes("state", &securityState, sizeof(securityState)) == sizeof(securityState);
+  securityPrefs.end();
+  return ok;
+}
+
+static void initializeSecurityState() {
+  Preferences securityPrefs;
+  bool loaded = false;
+  if (securityPrefs.begin("security", true)) {
+    if (securityPrefs.getBytesLength("state") == sizeof(securityState)) {
+      SecurityState candidate;
+      size_t got = securityPrefs.getBytes("state", &candidate, sizeof(candidate));
+      loaded = got == sizeof(candidate) && candidate.magic == securityState.magic &&
+               candidate.version == securityState.version && candidate.size == sizeof(candidate) &&
+               candidate.checksum == securityStateChecksum(candidate) &&
+               strnlen(candidate.apPassword, sizeof(candidate.apPassword)) == 12;
+      if (loaded) securityState = candidate;
+      secureZero(&candidate, sizeof(candidate));
+    }
+    securityPrefs.end();
+  }
+  if (!loaded) {
+    SecurityState fresh;
+    for (size_t i = 0; i < 12; ++i) fresh.apPassword[i] = '0' + (esp_random() % 10);
+    fresh.apPassword[12] = '\0';
+    securityState = fresh;
+    if (!persistSecurityState()) fatalHalt("Failed to persist security bootstrap state");
+    secureZero(&fresh, sizeof(fresh));
+    Serial.println("[Security] Created unique onboarding credentials");
   }
 
-  Serial.printf("[Security] AP password: %s\n", LEGACY_DEFAULT_AP_PASS);
-  Serial.println("[Security] Web auth disabled");
+  uint64_t mac = ESP.getEfuseMac();
+  snprintf(AP_NAME, sizeof(AP_NAME), "ESP32-Matrix-%06llX",
+           static_cast<unsigned long long>(mac & 0xFFFFFFULL));
+  Serial.printf("[Security] Web auth: %s; AP credentials are shown only on the matrix\n",
+                securityState.adminProvisioned ? "provisioned" : "onboarding required");
 }
 
 static bool loadStoredStateBlob(StoredStateBlob& blob) {
@@ -740,6 +838,20 @@ static bool loadStoredStateBlob(StoredStateBlob& blob) {
   if (blob.checksum != expected) {
     Serial.printf("[NVS] state checksum mismatch: %08lx != %08lx\n",
                   (unsigned long)blob.checksum, (unsigned long)expected);
+    return false;
+  }
+  return true;
+}
+
+static bool loadLegacyStoredStateBlob(LegacyStoredStateBlobV1& blob) {
+  if (!prefs.isKey("state") || prefs.getBytesLength("state") != sizeof(blob)) return false;
+  size_t got = prefs.getBytes("state", &blob, sizeof(blob));
+  if (got != sizeof(blob) || blob.magic != STORED_STATE_MAGIC || blob.version != 1 ||
+      blob.size != sizeof(blob)) return false;
+  uint32_t expected = fnv1a32(reinterpret_cast<const uint8_t*>(&blob),
+                              offsetof(LegacyStoredStateBlobV1, checksum));
+  if (blob.checksum != expected) {
+    Serial.println("[NVS] legacy state checksum mismatch");
     return false;
   }
   return true;
@@ -879,30 +991,108 @@ static uint8_t bambuLifecycleFromString(const String& raw) {
   return BAMBU_UNKNOWN;
 }
 
+class BoundedInputStream : public Stream {
+ public:
+  BoundedInputStream(Stream& source, size_t limit) : source_(source), limit_(limit) {}
+  int available() override {
+    int sourceAvailable = source_.available();
+    size_t remaining = consumed_ < limit_ ? limit_ - consumed_ : 0;
+    return sourceAvailable < static_cast<int>(remaining) ? sourceAvailable : static_cast<int>(remaining);
+  }
+  int read() override {
+    if (consumed_ >= limit_) {
+      overflow_ = source_.available() > 0;
+      return -1;
+    }
+    int value = source_.read();
+    if (value >= 0) ++consumed_;
+    return value;
+  }
+  int peek() override {
+    if (consumed_ >= limit_) {
+      overflow_ = source_.available() > 0;
+      return -1;
+    }
+    return source_.peek();
+  }
+  size_t write(uint8_t) override { return 0; }
+  bool overflowed() const { return overflow_; }
+  bool drainUnknownLengthBody(HTTPClient& http, uint32_t idleTimeoutMs = 1000) {
+    uint32_t lastProgressMs = millis();
+    while (true) {
+      if (source_.available() > 0) {
+        if (read() < 0) return false;
+        lastProgressMs = millis();
+        continue;
+      }
+      if (!http.connected()) return !overflow_;
+      if (millis() - lastProgressMs >= idleTimeoutMs) return false;
+      delay(1);
+    }
+  }
+
+ private:
+  Stream& source_;
+  size_t limit_;
+  size_t consumed_ = 0;
+  bool overflow_ = false;
+};
+
+static bool boundedHttpBodyAccepted(HTTPClient& http, BoundedInputStream& input,
+                                    int contentLength, size_t limit) {
+  if (input.overflowed() || contentLength > static_cast<int>(limit)) return false;
+  // A known Content-Length was checked before parsing. For close-delimited
+  // HTTP/1.0 responses, consume the remainder so a valid JSON prefix cannot
+  // hide an oversized trailing body after ArduinoJson stops at the root value.
+  return contentLength >= 0 || input.drainUnknownLengthBody(http);
+}
+
 static bool bambuFetchRelayStatus(const char* relayUrl, const char* relayKey) {
   if (!relayUrl || !relayUrl[0]) return false;
 
   HTTPClient http;
   http.setConnectTimeout(5000);
   http.setTimeout(5000);
+  http.setReuse(false);
+  http.useHTTP10(true);
   if (!http.begin(relayUrl)) {
     Serial.println("[BambuRelay] begin failed");
     return false;
   }
   if (relayKey && relayKey[0]) http.addHeader("X-Relay-Key", relayKey);
   int code = http.GET();
-  String body = code > 0 ? http.getString() : String();
-  http.end();
 
   if (code != 200) {
     Serial.printf("[BambuRelay] HTTP %d\n", code);
-    if (body.length()) Serial.printf("[BambuRelay] body=%s\n", body.c_str());
+    http.end();
     return false;
   }
 
+  int contentLength = http.getSize();
+  if (contentLength > static_cast<int>(MAX_RELAY_JSON_BYTES)) {
+    Serial.println("[BambuRelay] oversized response rejected");
+    http.end();
+    return false;
+  }
+
+  JsonDocument filter;
+  filter["connected"] = true;
+  filter["printerOnline"] = true;
+  filter["progress"] = true;
+  filter["status"] = true;
+  filter["stage"] = true;
+  filter["detail"] = true;
+  filter["lifecycle"] = true;
   JsonDocument doc;
-  if (deserializeJson(doc, body)) {
-    Serial.printf("[BambuRelay] bad json: %s\n", body.c_str());
+  BoundedInputStream input(http.getStream(), MAX_RELAY_JSON_BYTES);
+  DeserializationError jsonError = deserializeJson(
+    doc, input, DeserializationOption::Filter(filter), DeserializationOption::NestingLimit(4));
+  bool bodyAccepted = boundedHttpBodyAccepted(
+    http, input, contentLength, MAX_RELAY_JSON_BYTES);
+  http.end();
+  if (jsonError || !bodyAccepted) {
+    Serial.printf("[BambuRelay] rejected JSON: %s\n",
+                  !bodyAccepted ? "oversized or unterminated" : jsonError.c_str());
     return false;
   }
 
@@ -925,10 +1115,13 @@ static bool bambuFetchRelayStatus(const char* relayUrl, const char* relayKey) {
   st.connected = connected;
   st.printerOnline = printerOnline;
   st.lifecycle = lifecycle;
-  st.displayLifecycle = (lifecycle == BAMBU_IDLE || lifecycle == BAMBU_OFFLINE || lifecycle == BAMBU_UNKNOWN)
-    ? BAMBU_UNKNOWN
-    : bambuOverlayLifecycle(lifecycle);
-  st.progress = (uint8_t)constrain((int)lroundf(progress), 0, 100);
+  uint8_t nextDisplayLifecycle = bambuDisplayLifecycleForUpdate(st.displayLifecycle, lifecycle);
+  bool retainingOverlay = (lifecycle == BAMBU_OFFLINE || lifecycle == BAMBU_UNKNOWN) &&
+                          bambuHasVisibleOverlay(st.displayLifecycle);
+  st.displayLifecycle = nextDisplayLifecycle;
+  if (!retainingOverlay) {
+    st.progress = (uint8_t)constrain((int)lroundf(progress), 0, 100);
+  }
   strlcpy(st.rawStatus, rawStatus.c_str(), sizeof(st.rawStatus));
   strlcpy(st.rawStage, rawStage.c_str(), sizeof(st.rawStage));
   if (detail.length()) {
@@ -1382,6 +1575,10 @@ static void applyWeatherTz(long offsetSec) {
 
 void fetchWeather() {
   if (!wifiConnected) return;
+  struct WeatherWifiPsGuard {
+    WeatherWifiPsGuard() { esp_wifi_set_ps(WIFI_PS_NONE); }
+    ~WeatherWifiPsGuard() { esp_wifi_set_ps(WIFI_PS_MIN_MODEM); }
+  } wifiPsGuard;
   taskENTER_CRITICAL(&weatherMux);
   lastWeatherAttemptMs = millis();
   taskEXIT_CRITICAL(&weatherMux);
@@ -1434,17 +1631,6 @@ void fetchWeather() {
 
   // ── OpenWeatherMap: основной источник (провайдеры «авто» и «только OWM») ──
   if (tryOwm) {
-    WiFiClientSecure sc;
-    sc.setInsecure(); // HTTPS защищает API key от пассивного перехвата в LAN; CA не проверяем ради RAM.
-    // Ядро ESP32 Arduino 3.x: setTimeout() — миллисекунды, setHandshakeTimeout() — секунды.
-    sc.setTimeout(8000);
-    sc.setHandshakeTimeout(8);
-    HTTPClient http;
-    http.setConnectTimeout(8000);
-    http.setTimeout(8000);
-    http.setReuse(false);
-    http.useHTTP10(true);
-
     String path;
     if (owmUseCoords) {
       path = String("/data/2.5/weather?lat=") + String(owmLat, 4) +
@@ -1458,13 +1644,27 @@ void fetchWeather() {
       Serial.printf("[Weather] OWM city='%s' keyLen=%u\n", city, keyLen);
     }
 
-    auto applyWeatherPayload = [&](Stream& body) -> bool {
+    auto applyWeatherPayload = [&](HTTPClient& http) -> bool {
+      int contentLength = http.getSize();
+      if (contentLength > static_cast<int>(MAX_WEATHER_JSON_BYTES)) {
+        setWeatherDiag(200, "json: oversized", keyLen, "owm");
+        return false;
+      }
+      JsonDocument filter;
+      filter["main"]["temp"] = true;
+      filter["timezone"] = true;
+      filter["coord"]["lat"] = true;
+      filter["coord"]["lon"] = true;
       JsonDocument doc;
-      // getStream() парсит прямо из потока — без промежуточного String в heap
-      DeserializationError err = deserializeJson(doc, body);
-      if (err) {
+      BoundedInputStream input(http.getStream(), MAX_WEATHER_JSON_BYTES);
+      DeserializationError err = deserializeJson(
+        doc, input, DeserializationOption::Filter(filter), DeserializationOption::NestingLimit(4));
+      bool bodyAccepted = boundedHttpBodyAccepted(
+        http, input, contentLength, MAX_WEATHER_JSON_BYTES);
+      if (err || !bodyAccepted) {
         char msg[64];
-        snprintf(msg, sizeof(msg), "json: %s", err.c_str());
+        snprintf(msg, sizeof(msg), "json: %s",
+                 !bodyAccepted ? "oversized or unterminated" : err.c_str());
         setWeatherDiag(200, msg, keyLen, "owm");
         Serial.printf("[Weather] JSON error: %s\n", err.c_str());
         return false;
@@ -1504,29 +1704,78 @@ void fetchWeather() {
       return true;
     };
 
-    // Сначала HTTPS, чтобы не передавать API key открытым текстом.
-    String url = "https://api.openweathermap.org" + path;
-    if (http.begin(sc, url)) {
+    auto runOwmRequest = [&](WiFiClient& client, bool useHttps, WiFiClientSecure* secureClient) -> bool {
+      HTTPClient http;
+      http.setConnectTimeout(8000);
+      http.setTimeout(8000);
+      http.setReuse(false);
+      http.useHTTP10(true);
+
+      const char* protocol = useHttps ? "https" : "http";
+      const char* host = "api.openweathermap.org";
+      IPAddress resolved;
+      bool dnsOk = WiFi.hostByName(host, resolved);
+      String resolvedIp = dnsOk ? resolved.toString() : String("dns-fail");
+      String gatewayIp = WiFi.gatewayIP().toString();
+      if (dnsOk) {
+        Serial.printf("[Weather] OWM %s DNS %s -> %s gw=%s\n",
+                      protocol, host, resolvedIp.c_str(), gatewayIp.c_str());
+      } else {
+        Serial.printf("[Weather] OWM %s DNS failed for %s gw=%s\n",
+                      protocol, host, gatewayIp.c_str());
+      }
+      String url = String(protocol) + "://api.openweathermap.org" + path;
+      Serial.printf("[Weather] OWM %s request\n", protocol);
+      if (!http.begin(client, url)) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "owm %s ip=%s gw=%s begin failed",
+                 protocol, resolvedIp.c_str(), gatewayIp.c_str());
+        setWeatherDiag(0, msg, keyLen, "owm");
+        Serial.printf("[Weather] %s\n", msg);
+        return false;
+      }
+
       int code = http.GET();
+      bool ok = false;
       if (code == 200) {
-        owmOk = applyWeatherPayload(http.getStream());
+        ok = applyWeatherPayload(http);
       } else {
         String err = http.errorToString(code);
-        char tlsErr[64] = "";
-        int tlsCode = sc.lastError(tlsErr, sizeof(tlsErr));
         char msg[96];
-        if (tlsCode != 0) {
-          snprintf(msg, sizeof(msg), "HTTP %d: %s; TLS %d: %s", code, err.c_str(), tlsCode, tlsErr);
+        if (useHttps) {
+          char tlsErr[64] = "";
+          int tlsCode = secureClient ? secureClient->lastError(tlsErr, sizeof(tlsErr)) : 0;
+          if (tlsCode != 0) {
+            snprintf(msg, sizeof(msg), "owm https ip=%s gw=%s HTTP %d: %s; TLS %d: %s",
+                     resolvedIp.c_str(), gatewayIp.c_str(), code, err.c_str(), tlsCode, tlsErr);
+          } else {
+            snprintf(msg, sizeof(msg), "owm https ip=%s gw=%s HTTP %d: %s",
+                     resolvedIp.c_str(), gatewayIp.c_str(), code, err.c_str());
+          }
         } else {
-          snprintf(msg, sizeof(msg), "HTTP %d: %s", code, err.c_str());
+          snprintf(msg, sizeof(msg), "owm http ip=%s gw=%s HTTP %d: %s",
+                   resolvedIp.c_str(), gatewayIp.c_str(), code, err.c_str());
         }
         setWeatherDiag(code, msg, keyLen, "owm");
         Serial.printf("[Weather] %s\n", msg);
       }
       http.end();
-    } else {
-      setWeatherDiag(0, "http begin failed", keyLen, "owm");
-      Serial.println("[Weather] HTTP begin failed");
+      return ok;
+    };
+
+    // Сначала HTTP: быстрее после холодного старта и без TLS-handshake; HTTPS остаётся фоллбэком.
+    {
+      WiFiClient client;
+      client.setTimeout(8000);
+      owmOk = runOwmRequest(client, false, nullptr);
+    }
+    if (!owmOk) {
+      WiFiClientSecure client;
+      client.setInsecure(); // CA не проверяем ради RAM.
+      // Ядро ESP32 Arduino 3.x: setTimeout() — миллисекунды, setHandshakeTimeout() — секунды.
+      client.setTimeout(8000);
+      client.setHandshakeTimeout(8);
+      owmOk = runOwmRequest(client, true, &client);
     }
   }
 
@@ -1541,43 +1790,44 @@ void fetchWeather() {
     return;
   }
 
-  WiFiClientSecure meteoClient;
-  meteoClient.setInsecure();
   // Как фоллбэк — таймауты короче основного, чтобы при недоступности обоих API
   // weatherTask не блокировался дольше необходимого; как основной — полные 8 с.
   uint16_t meteoTimeout = (provider == 2) ? 8000 : 5000;
-  meteoClient.setTimeout(meteoTimeout);
-  meteoClient.setHandshakeTimeout(meteoTimeout / 1000);
-  HTTPClient meteoHttp;
-  meteoHttp.setConnectTimeout(meteoTimeout);
-  meteoHttp.setTimeout(meteoTimeout);
-  meteoHttp.setReuse(false);
-  meteoHttp.useHTTP10(true);
   // timezone=auto: в ответ добавляется utc_offset_seconds локации
-  String meteoUrl = String("https://api.open-meteo.com/v1/forecast?latitude=") +
-                    String(owmLat, 4) + "&longitude=" + String(owmLon, 4) +
-                    "&current=temperature_2m&timezone=auto";
-  if (!meteoHttp.begin(meteoClient, meteoUrl)) {
-    setWeatherDiag(0, "open-meteo begin failed", keyLen, "open-meteo");
-    Serial.println("[Weather] Open-Meteo begin failed");
-    return;
-  }
+  String meteoPath = String("/v1/forecast?latitude=") + String(owmLat, 4) +
+                     "&longitude=" + String(owmLon, 4) +
+                     "&current=temperature_2m&timezone=auto";
 
-  int meteoCode = meteoHttp.GET();
-  if (meteoCode == 200) {
+  auto applyMeteoPayload = [&](int meteoCode, HTTPClient& http) -> bool {
+    int contentLength = http.getSize();
+    if (contentLength > static_cast<int>(MAX_WEATHER_JSON_BYTES)) {
+      setWeatherDiag(meteoCode, "open-meteo json: oversized", keyLen, "open-meteo");
+      return false;
+    }
+    JsonDocument filter;
+    filter["current"]["temperature_2m"] = true;
+    filter["current_weather"]["temperature"] = true;
+    filter["utc_offset_seconds"] = true;
     JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, meteoHttp.getStream());
-    if (err) {
+    BoundedInputStream input(http.getStream(), MAX_WEATHER_JSON_BYTES);
+    DeserializationError err = deserializeJson(
+      doc, input, DeserializationOption::Filter(filter), DeserializationOption::NestingLimit(4));
+    bool bodyAccepted = boundedHttpBodyAccepted(
+      http, input, contentLength, MAX_WEATHER_JSON_BYTES);
+    if (err || !bodyAccepted) {
       char msg[64];
-      snprintf(msg, sizeof(msg), "open-meteo json: %s", err.c_str());
+      snprintf(msg, sizeof(msg), "open-meteo json: %s",
+               !bodyAccepted ? "oversized or unterminated" : err.c_str());
       setWeatherDiag(meteoCode, msg, keyLen, "open-meteo");
       Serial.printf("[Weather] %s\n", msg);
+      return false;
     } else {
       float t = doc["current"]["temperature_2m"] | NAN;
       if (isnan(t)) t = doc["current_weather"]["temperature"] | NAN;
       if (isnan(t)) {
         setWeatherDiag(meteoCode, "open-meteo missing temperature", keyLen, "open-meteo");
         Serial.println("[Weather] Open-Meteo missing temperature");
+        return false;
       } else {
         taskENTER_CRITICAL(&weatherMux);
         currentTemp = t;
@@ -1590,16 +1840,83 @@ void fetchWeather() {
         Serial.printf("[Weather] Open-Meteo OK %.1f C\n", t);
         if (doc["utc_offset_seconds"].is<long>())
           applyWeatherTz(doc["utc_offset_seconds"].as<long>());
+        return true;
       }
     }
-  } else {
-    String meteoErr = meteoHttp.errorToString(meteoCode);
-    char msg[96];
-    snprintf(msg, sizeof(msg), "open-meteo HTTP %d: %s", meteoCode, meteoErr.c_str());
-    setWeatherDiag(meteoCode, msg, keyLen, "open-meteo");
-    Serial.printf("[Weather] %s\n", msg);
+  };
+
+  auto runMeteoRequest = [&](WiFiClient& client, bool useHttps, WiFiClientSecure* secureClient) -> bool {
+    HTTPClient meteoHttp;
+    meteoHttp.setConnectTimeout(meteoTimeout);
+    meteoHttp.setTimeout(meteoTimeout);
+    meteoHttp.setReuse(false);
+    meteoHttp.useHTTP10(true);
+
+    const char* protocol = useHttps ? "https" : "http";
+    const char* host = "api.open-meteo.com";
+    IPAddress resolved;
+    bool dnsOk = WiFi.hostByName(host, resolved);
+    String resolvedIp = dnsOk ? resolved.toString() : String("dns-fail");
+    String gatewayIp = WiFi.gatewayIP().toString();
+    if (dnsOk) {
+      Serial.printf("[Weather] Open-Meteo %s DNS %s -> %s gw=%s\n",
+                    protocol, host, resolvedIp.c_str(), gatewayIp.c_str());
+    } else {
+      Serial.printf("[Weather] Open-Meteo %s DNS failed for %s gw=%s\n",
+                    protocol, host, gatewayIp.c_str());
+    }
+    String meteoUrl = String(protocol) + "://api.open-meteo.com" + meteoPath;
+    Serial.printf("[Weather] Open-Meteo %s request\n", protocol);
+    if (!meteoHttp.begin(client, meteoUrl)) {
+      char msg[104];
+      snprintf(msg, sizeof(msg), "open-meteo %s ip=%s gw=%s begin failed",
+               protocol, resolvedIp.c_str(), gatewayIp.c_str());
+      setWeatherDiag(0, msg, keyLen, "open-meteo");
+      Serial.printf("[Weather] %s\n", msg);
+      return false;
+    }
+
+    int meteoCode = meteoHttp.GET();
+    bool ok = false;
+    if (meteoCode == 200) {
+      ok = applyMeteoPayload(meteoCode, meteoHttp);
+    } else {
+      String meteoErr = meteoHttp.errorToString(meteoCode);
+      char msg[96];
+      if (useHttps) {
+        char tlsErr[64] = "";
+        int tlsCode = secureClient ? secureClient->lastError(tlsErr, sizeof(tlsErr)) : 0;
+        if (tlsCode != 0) {
+          snprintf(msg, sizeof(msg), "open-meteo https ip=%s gw=%s HTTP %d: %s; TLS %d: %s",
+                   resolvedIp.c_str(), gatewayIp.c_str(), meteoCode, meteoErr.c_str(), tlsCode, tlsErr);
+        } else {
+          snprintf(msg, sizeof(msg), "open-meteo https ip=%s gw=%s HTTP %d: %s",
+                   resolvedIp.c_str(), gatewayIp.c_str(), meteoCode, meteoErr.c_str());
+        }
+      } else {
+        snprintf(msg, sizeof(msg), "open-meteo http ip=%s gw=%s HTTP %d: %s",
+                 resolvedIp.c_str(), gatewayIp.c_str(), meteoCode, meteoErr.c_str());
+      }
+      setWeatherDiag(meteoCode, msg, keyLen, "open-meteo");
+      Serial.printf("[Weather] %s\n", msg);
+    }
+    meteoHttp.end();
+    return ok;
+  };
+
+  bool meteoOk = false;
+  {
+    WiFiClient client;
+    client.setTimeout(meteoTimeout);
+    meteoOk = runMeteoRequest(client, false, nullptr);
   }
-  meteoHttp.end();
+  if (!meteoOk) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(meteoTimeout);
+    client.setHandshakeTimeout(meteoTimeout / 1000);
+    runMeteoRequest(client, true, &client);
+  }
 }
 
 // Запрашивает актуальные времена восхода и заката с api.sunrise-sunset.org.
@@ -1639,12 +1956,28 @@ void fetchSunriseSunset() {
   int code = http.GET();
   Serial.printf("[Sun] HTTP код: %d\n", code);
   if (code == 200) {
+    int contentLength = http.getSize();
+    if (contentLength > static_cast<int>(MAX_WEATHER_JSON_BYTES)) {
+      Serial.println("[Sun] JSON ошибка: oversized");
+      http.end();
+      return;
+    }
+    JsonDocument filter;
+    filter["results"]["sunrise"] = true;
+    filter["results"]["sunset"] = true;
     JsonDocument doc;
+    // This endpoint has historically been unreliable when parsed directly from
+    // HTTPClient::getStream(); retain the bounded small body copy here.
     String body = http.getString();
-    DeserializationError err = deserializeJson(doc, body);
+    if (body.length() > MAX_WEATHER_JSON_BYTES) {
+      Serial.println("[Sun] JSON ошибка: oversized");
+      http.end();
+      return;
+    }
+    DeserializationError err = deserializeJson(
+      doc, body, DeserializationOption::Filter(filter), DeserializationOption::NestingLimit(4));
     if (err) {
       Serial.printf("[Sun] JSON ошибка: %s\n", err.c_str());
-      Serial.printf("[Sun] Тело: %s\n", body.c_str());
     } else {
       const char* rStr = doc["results"]["sunrise"] | "";
       const char* sStr = doc["results"]["sunset"]  | "";
@@ -1683,7 +2016,6 @@ void fetchSunriseSunset() {
     }
   } else {
     Serial.printf("[Sun] Ошибка HTTP %d\n", code);
-    if (code > 0) Serial.printf("[Sun] Тело: %s\n", http.getString().c_str());
   }
   http.end();
 }
@@ -1692,23 +2024,15 @@ void fetchSunriseSunset() {
 //  КОНФИГ: сохранение / загрузка
 // ════════════════════════════════════════════════════════════
 bool saveConfig() {
-  // Снимок под cfgMtx — wifiConnTask может менять cfg во время NVS-записи
+  // Снимок под cfgMtx — Wi-Fi state machine может менять cfg во время NVS-записи
   StoredStateBlob blob;
   xSemaphoreTake(cfgMtx, portMAX_DELAY);
   blob.cfg = cfg;
   xSemaphoreGive(cfgMtx);
   xSemaphoreTake(bambuCfgMtx, portMAX_DELAY);
   blob.bambuCfg = bambuCfg;
-  // Relay-only runtime: do not persist obsolete ESP-side Cloud credentials.
-  blob.bambuCfg.email[0] = '\0';
-  blob.bambuCfg.password[0] = '\0';
   blob.bambuCfg.relayEnabled = true;
-  blob.bambuToken[0] = '\0';
-  bambuCfg.email[0] = '\0';
-  bambuCfg.password[0] = '\0';
   bambuCfg.relayEnabled = true;
-  bambuManualToken[0] = '\0';
-  bambuPrinterSerial[0] = '\0';
   xSemaphoreGive(bambuCfgMtx);
   blob.checksum = storedStateChecksum(blob);
   // NVS-запись под prefsMtx (занимает сотни мкс — мьютекс, не spinlock)
@@ -1716,9 +2040,14 @@ bool saveConfig() {
   bool ok = prefs.begin("matrix", false);
   if (ok) {
     ok = prefs.putBytes("state", &blob, sizeof(blob)) == sizeof(blob);
-    // Remove legacy split keys from older builds; failures here are non-fatal.
+    // Remove legacy split keys, including obsolete account credential buffers.
+    prefs.remove("bcfg");
+    prefs.remove("bver");
+    prefs.remove("bcsz");
     prefs.remove("bserial");
     prefs.remove("btok");
+    prefs.remove("btver");
+    prefs.remove("btsz");
     prefs.end();
   } else {
     Serial.println("[NVS] prefs.begin(write) failed");
@@ -1734,54 +2063,40 @@ void loadConfig() {
   xSemaphoreTake(cfgMtx,   portMAX_DELAY);
   xSemaphoreTake(bambuCfgMtx, portMAX_DELAY);
   xSemaphoreTake(prefsMtx, portMAX_DELAY);
+  bool migratedLegacyState = false;
   if (prefs.begin("matrix", true)) {
     StoredStateBlob blob;
     if (loadStoredStateBlob(blob)) {
       cfg = blob.cfg;
       sanitizeLoadedConfig(cfg);
       bambuCfg = blob.bambuCfg;
-      strlcpy(bambuManualToken, blob.bambuToken, sizeof(bambuManualToken));
-      if (prefs.isKey("bserial")) {
-        size_t got = prefs.getBytes("bserial", &bambuPrinterSerial, sizeof(bambuPrinterSerial));
-        if (got != sizeof(bambuPrinterSerial)) bambuPrinterSerial[0] = '\0';
-      } else {
-        bambuPrinterSerial[0] = '\0';
-      }
     } else {
-      uint16_t ver = prefs.getUShort("ver", 0);
-      uint16_t csz = prefs.getUShort("csz", 0);
-      if (loadConfigFromNvs(ver, csz, cfg)) {
+      LegacyStoredStateBlobV1 legacyBlob = {};
+      if (loadLegacyStoredStateBlob(legacyBlob)) {
+        cfg = legacyBlob.cfg;
         sanitizeLoadedConfig(cfg);
-      }
-      uint16_t bver = prefs.getUShort("bver", 0);
-      uint16_t bsz = prefs.getUShort("bcsz", 0);
-      if (bver == 2 && bsz == (uint16_t)sizeof(bambuCfg) && prefs.isKey("bcfg")) {
-        size_t got = prefs.getBytes("bcfg", &bambuCfg, sizeof(bambuCfg));
-        if (got != sizeof(bambuCfg)) {
-          Serial.printf("[NVS] getBytes(bcfg) size mismatch: %u\n", (unsigned)got);
+        bambuCfg = migrateLegacyBambuConfig(legacyBlob.bambuCfg);
+        migratedLegacyState = true;
+        Serial.println("[NVS] Migrated state v1; obsolete Bambu credentials removed");
+      } else {
+        uint16_t ver = prefs.getUShort("ver", 0);
+        uint16_t csz = prefs.getUShort("csz", 0);
+        if (loadConfigFromNvs(ver, csz, cfg)) sanitizeLoadedConfig(cfg);
+        uint16_t bver = prefs.getUShort("bver", 0);
+        uint16_t bsz = prefs.getUShort("bcsz", 0);
+        if (bver == 2 && bsz == (uint16_t)sizeof(LegacyBambuConfigV2) && prefs.isKey("bcfg")) {
+          LegacyBambuConfigV2 legacyBambu;
+          size_t got = prefs.getBytes("bcfg", &legacyBambu, sizeof(legacyBambu));
+          if (got == sizeof(legacyBambu)) {
+            bambuCfg = migrateLegacyBambuConfig(legacyBambu);
+            migratedLegacyState = true;
+          } else {
+            Serial.printf("[NVS] getBytes(bcfg legacy) size mismatch: %u\n", (unsigned)got);
+          }
+          secureZero(&legacyBambu, sizeof(legacyBambu));
         }
       }
-      uint16_t btver = prefs.getUShort("btver", 0);
-      uint16_t btsz = prefs.getUShort("btsz", 0);
-      if (btver == 1 && btsz == (uint16_t)sizeof(bambuManualToken) && prefs.isKey("btok")) {
-        size_t got = prefs.getBytes("btok", &bambuManualToken, sizeof(bambuManualToken));
-        if (got != sizeof(bambuManualToken)) {
-          Serial.printf("[NVS] getBytes(btok) size mismatch: %u\n", (unsigned)got);
-          bambuManualToken[0] = '\0';
-        }
-      } else {
-        bambuManualToken[0] = '\0';
-      }
-      if (prefs.isKey("bserial")) {
-        size_t got = prefs.getBytes("bserial", &bambuPrinterSerial, sizeof(bambuPrinterSerial));
-        if (got != sizeof(bambuPrinterSerial)) bambuPrinterSerial[0] = '\0';
-      } else {
-        bambuPrinterSerial[0] = '\0';
-      }
-    }
-    if (!prefs.isKey("state") && !prefs.isKey("cfg")) {
-      bambuManualToken[0] = '\0';
-      bambuPrinterSerial[0] = '\0';
+      secureZero(&legacyBlob, sizeof(legacyBlob));
     }
     if (prefs.isKey(PREF_LAST_AUTO_BRIGHTNESS)) {
       uint8_t remembered = prefs.getUChar(PREF_LAST_AUTO_BRIGHTNESS, cfg.brightness);
@@ -1792,25 +2107,20 @@ void loadConfig() {
     } else {
       lastAutoBrightnessValid.store(false);
     }
-    // Relay-only runtime: migrate away from obsolete ESP-side Cloud fields.
     bambuCfg.relayEnabled = true;
-    bambuCfg.email[0] = '\0';
-    bambuCfg.password[0] = '\0';
-    bambuManualToken[0] = '\0';
-    bambuPrinterSerial[0] = '\0';
     prefs.end();
   } else {
     Serial.println("[NVS] prefs.begin(read) failed, using defaults");
     lastAutoBrightnessValid.store(false);
     bambuCfg.relayEnabled = true;
-    bambuCfg.email[0] = '\0';
-    bambuCfg.password[0] = '\0';
-    bambuManualToken[0] = '\0';
-    bambuPrinterSerial[0] = '\0';
   }
   xSemaphoreGive(prefsMtx);
   xSemaphoreGive(bambuCfgMtx);
   xSemaphoreGive(cfgMtx);
+
+  if (migratedLegacyState) {
+    if (!saveConfig()) Serial.println("[NVS] Failed to rewrite migrated state v2");
+  }
 
   BambuState st;
   st.enabled = bambuCfg.enabled;
@@ -1827,19 +2137,217 @@ void loadConfig() {
 // ════════════════════════════════════════════════════════════
 //  ВСТРОЕННЫЙ ВЕБ-ИНТЕРФЕЙС
 // ════════════════════════════════════════════════════════════
-#include "index_html.h"
+#include "index_html_gz.h"
 
 // ════════════════════════════════════════════════════════════
 //  ВЕБ-СЕРВЕР: обработчики
 // ════════════════════════════════════════════════════════════
-// Веб-аутентификация отключена по требованию пользователя.
-bool checkAuth() {
+static void bytesToHex(const uint8_t* bytes, size_t length, char* output, size_t outputSize) {
+  static const char HEX_DIGITS[] = "0123456789abcdef";
+  if (outputSize < length * 2 + 1) {
+    if (outputSize) output[0] = '\0';
+    return;
+  }
+  for (size_t i = 0; i < length; ++i) {
+    output[i * 2] = HEX_DIGITS[bytes[i] >> 4];
+    output[i * 2 + 1] = HEX_DIGITS[bytes[i] & 0x0F];
+  }
+  output[length * 2] = '\0';
+}
+
+static bool hexToBytes(const char* input, uint8_t* output, size_t outputLength) {
+  if (!input || strlen(input) != outputLength * 2) return false;
+  for (size_t i = 0; i < outputLength; ++i) {
+    char hi = input[i * 2], lo = input[i * 2 + 1];
+    auto nibble = [](char value) -> int {
+      if (value >= '0' && value <= '9') return value - '0';
+      if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+      if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+      return -1;
+    };
+    int a = nibble(hi), b = nibble(lo);
+    if (a < 0 || b < 0) return false;
+    output[i] = static_cast<uint8_t>((a << 4) | b);
+  }
   return true;
 }
 
+static void clearSession() {
+  secureZero(sessionToken, sizeof(sessionToken));
+  secureZero(csrfToken, sizeof(csrfToken));
+  sessionActive = false;
+  sessionLastSeenMs = 0;
+}
+
+static void createSession() {
+  fillRandom(sessionToken, sizeof(sessionToken));
+  fillRandom(csrfToken, sizeof(csrfToken));
+  sessionActive = true;
+  sessionLastSeenMs = millis();
+}
+
+bool checkAuth() {
+  if (!securityState.adminProvisioned || !sessionActive) return false;
+  if (millis() - sessionLastSeenMs > SESSION_IDLE_TIMEOUT_MS) {
+    clearSession();
+    return false;
+  }
+  char encoded[65] = {};
+  if (!extractCookieValue(server.header("Cookie").c_str(), "matrix_session",
+                          encoded, sizeof(encoded))) return false;
+  uint8_t candidate[sizeof(sessionToken)] = {};
+  bool decoded = hexToBytes(encoded, candidate, sizeof(candidate));
+  bool valid = decoded && secureBytesEqual(candidate, sessionToken, sizeof(sessionToken));
+  secureZero(candidate, sizeof(candidate));
+  secureZero(encoded, sizeof(encoded));
+  if (valid) sessionLastSeenMs = millis();
+  return valid;
+}
+
+static bool checkMutationAuth() {
+  if (!checkAuth()) return false;
+  uint8_t candidate[sizeof(csrfToken)] = {};
+  bool decoded = hexToBytes(server.header("X-CSRF-Token").c_str(), candidate, sizeof(candidate));
+  bool valid = decoded && secureBytesEqual(candidate, csrfToken, sizeof(csrfToken));
+  secureZero(candidate, sizeof(candidate));
+  return valid;
+}
+
+static void sendJsonDocument(int code, JsonDocument& doc) {
+  if (doc.overflowed()) {
+    server.send(500, "application/json", "{\"error\":\"json_no_memory\"}");
+    return;
+  }
+  server.sendHeader("Cache-Control", "no-store");
+  server.setContentLength(measureJson(doc));
+  server.send(code, "application/json", "");
+  serializeJson(doc, server.client());
+}
+
+static bool parseBoundedBody(JsonDocument& doc, size_t maximumBytes) {
+  if (!server.hasArg("plain")) {
+    server.send(400, "application/json", "{\"error\":\"missing_body\"}");
+    return false;
+  }
+  const String& body = server.arg("plain");
+  if (body.length() == 0 || body.length() > maximumBytes) {
+    server.send(413, "application/json", "{\"error\":\"body_too_large\"}");
+    return false;
+  }
+  DeserializationError error = deserializeJson(doc, body, DeserializationOption::NestingLimit(4));
+  if (error) {
+    const char* code = error == DeserializationError::NoMemory ? "json_no_memory" : "bad_json";
+    server.send(400, "application/json", String("{\"error\":\"") + code + "\"}");
+    return false;
+  }
+  return true;
+}
+
+static void sendSessionResponse(bool sessionJustCreated = false) {
+  JsonDocument doc;
+  char csrf[65] = {};
+  doc["provisioned"] = securityState.adminProvisioned;
+  bool authenticated = sessionJustCreated || checkAuth();
+  doc["authenticated"] = authenticated;
+  if (authenticated) {
+    bytesToHex(csrfToken, sizeof(csrfToken), csrf, sizeof(csrf));
+    doc["csrf"] = csrf;
+  }
+  sendJsonDocument(200, doc);
+  secureZero(csrf, sizeof(csrf));
+}
+
+static void completeSuccessfulAuthentication() {
+  createSession();
+  char encoded[65];
+  bytesToHex(sessionToken, sizeof(sessionToken), encoded, sizeof(encoded));
+  server.sendHeader("Set-Cookie", String("matrix_session=") + encoded +
+                    "; Path=/; HttpOnly; SameSite=Strict");
+  secureZero(encoded, sizeof(encoded));
+  sendSessionResponse(true);
+}
+
+void handleSessionStatus() {
+  sendSessionResponse();
+}
+
+static bool requestArrivedViaOnboardingAp() {
+  wifi_mode_t mode = WiFi.getMode();
+  if (mode != WIFI_MODE_AP && mode != WIFI_MODE_APSTA) return false;
+  IPAddress apAddress = WiFi.softAPIP();
+  IPAddress localAddress = server.client().localIP();
+  return apAddress != IPAddress(0, 0, 0, 0) && localAddress == apAddress;
+}
+
+void handleSessionBootstrap() {
+  if (securityState.adminProvisioned) {
+    server.send(409, "application/json", "{\"error\":\"already_provisioned\"}");
+    return;
+  }
+  if (!requestArrivedViaOnboardingAp()) {
+    server.send(403, "application/json", "{\"error\":\"onboarding_ap_required\"}");
+    return;
+  }
+  JsonDocument doc;
+  if (!parseBoundedBody(doc, MAX_SESSION_BODY_BYTES)) return;
+  const char* password = doc["password"] | "";
+  if (!isValidAdminPassword(password)) {
+    server.send(400, "application/json", "{\"error\":\"weak_password\"}");
+    return;
+  }
+  SecurityState previous = securityState;
+  fillRandom(securityState.adminSalt, sizeof(securityState.adminSalt));
+  hashAdminPassword(password, securityState.adminSalt, securityState.adminHash);
+  securityState.adminProvisioned = true;
+  if (!persistSecurityState()) {
+    securityState = previous;
+    secureZero(&previous, sizeof(previous));
+    server.send(500, "application/json", "{\"error\":\"save_failed\"}");
+    return;
+  }
+  secureZero(&previous, sizeof(previous));
+  completeSuccessfulAuthentication();
+}
+
+void handleSessionLogin() {
+  if (!securityState.adminProvisioned) {
+    server.send(409, "application/json", "{\"error\":\"onboarding_required\"}");
+    return;
+  }
+  JsonDocument doc;
+  if (!parseBoundedBody(doc, MAX_SESSION_BODY_BYTES)) return;
+  const char* password = doc["password"] | "";
+  uint8_t candidate[32];
+  hashAdminPassword(password, securityState.adminSalt, candidate);
+  bool valid = secureBytesEqual(candidate, securityState.adminHash, sizeof(candidate));
+  secureZero(candidate, sizeof(candidate));
+  if (!valid) {
+    server.send(401, "application/json", "{\"error\":\"invalid_credentials\"}");
+    return;
+  }
+  completeSuccessfulAuthentication();
+}
+
+void handleSessionLogout() {
+  if (!checkMutationAuth()) {
+    server.send(403, "application/json", "{\"error\":\"forbidden\"}");
+    return;
+  }
+  clearSession();
+  server.sendHeader("Set-Cookie", "matrix_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict");
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
 void handleRoot() {
-  server.sendHeader("Cache-Control", "no-cache");
-  server.send_P(200, "text/html", INDEX_HTML);
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("X-Content-Type-Options", "nosniff");
+  server.sendHeader("Referrer-Policy", "no-referrer");
+  server.sendHeader("Content-Security-Policy",
+                    "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+                    "connect-src 'self'; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'");
+  server.sendHeader("Content-Encoding", "gzip");
+  server.send_P(200, "text/html; charset=utf-8",
+                reinterpret_cast<PGM_P>(INDEX_HTML_GZ), INDEX_HTML_GZ_LEN);
 }
 
 void handleGetSettings() {
@@ -1855,7 +2363,7 @@ void handleGetSettings() {
   doc["updateMin"]    = cfg.updateMin;
   doc["weatherProvider"] = cfg.weatherProvider;
   doc["apiKeySet"]    = cfg.apiKey[0] != '\0';
-  doc["apiKey"]       = cfg.apiKey[0] ? "***" : "";  // не отдаём ключ открытым текстом
+  doc["apiKey"]       = redactSecretForApi(cfg.apiKey);
   doc["city"]         = cfg.city;
   doc["owmLat"]       = cfg.owmLat;
   doc["owmLon"]       = cfg.owmLon;
@@ -1896,18 +2404,13 @@ void handleGetSettings() {
     doc["sunriseM"] = (int)((st >> 16) & 0xFF);
     doc["sunsetH"]  = (int)((st >>  8) & 0xFF);
     doc["sunsetM"]  = (int)( st        & 0xFF); }
-  String out; serializeJson(doc, out);
-  server.send(200, "application/json", out);
+  sendJsonDocument(200, doc);
 }
 
 void handlePostSettings() {
-  if (!checkAuth()) { server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
-  if (!server.hasArg("plain")) { server.send(400); return; }
+  if (!checkMutationAuth()) { server.send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
   JsonDocument doc;
-  if (deserializeJson(doc, server.arg("plain"))) {
-    server.send(400, "application/json", "{\"error\":\"bad json\"}");
-    return;
-  }
+  if (!parseBoundedBody(doc, MAX_SETTINGS_BODY_BYTES)) return;
 
   auto setStr = [&](const char* key, char* dst, size_t sz) {
     if (doc[key].is<const char*>()) strlcpy(dst, doc[key].as<const char*>(), sz);
@@ -1917,10 +2420,10 @@ void handlePostSettings() {
   auto setKey = [&](const char* key, char* dst, size_t sz) {
     if (doc[key].is<const char*>()) {
       const char* v = doc[key].as<const char*>();
-      if (strcmp(v, "***") != 0) strlcpy(dst, v, sz);
+      if (!isRedactedSecretValue(v)) strlcpy(dst, v, sz);
     }
   };
-  // cfgMtx: cfg читается из background tasks (fetchWeather, wifiConnTask) — защищаем все записи.
+  // cfgMtx: cfg читается из background tasks и Wi-Fi state machine — защищаем все записи.
   // Используем мьютекс, а не spinlock: блок длинный — spinlock вызвал бы Interrupt WDT reset.
   Config prevCfg;
   xSemaphoreTake(cfgMtx, portMAX_DELAY);
@@ -1966,7 +2469,7 @@ void handlePostSettings() {
   cfg.showColon = false;  // разделитель часов удалён
   cfg.colonBright = 90;   // переиспользуется как яркость подложки оверлея
   cfg.webPass[0] = '\0';
-  strlcpy(cfg.apPass, LEGACY_DEFAULT_AP_PASS, sizeof(cfg.apPass));
+  cfg.apPass[0] = '\0';
   // Снимаем значения для использования вне мьютекса — cfg нельзя читать после Give
   uint8_t snapBr      = cfg.brightness;
   bool    snapAutoB   = cfg.autoBrightness;
@@ -1983,12 +2486,8 @@ void handlePostSettings() {
   prevBambuCfg = bambuCfg;
   if (!doc["bambuEnabled"].isNull()) bambuCfg.enabled = doc["bambuEnabled"];
   bambuCfg.relayEnabled = true;
-  bambuCfg.email[0] = '\0';
-  bambuCfg.password[0] = '\0';
   setStr("bambuRelayUrl", bambuCfg.relayUrl, sizeof(bambuCfg.relayUrl));
   setKey("bambuRelayKey", bambuCfg.relayKey, sizeof(bambuCfg.relayKey));
-  bambuManualToken[0] = '\0';
-  bambuPrinterSerial[0] = '\0';
   bool bambuChanged = !bambuConfigEquals(prevBambuCfg, bambuCfg);
   xSemaphoreGive(bambuCfgMtx);
 
@@ -2012,9 +2511,7 @@ void handlePostSettings() {
   JsonDocument resp;
   resp["ok"] = true;
   resp["persistPending"] = persistPending;
-  String out;
-  serializeJson(resp, out);
-  server.send(200, "application/json", out);
+  sendJsonDocument(200, resp);
 }
 
 void handleStatus() {
@@ -2022,7 +2519,7 @@ void handleStatus() {
   JsonDocument doc;
   doc["wifi"]   = wifiConnected.load();
   doc["ap"]     = apMode.load();
-  // cfg.ssid пишется wifiConnTask под cfgMtx — читаем тоже под ним
+  // cfg.ssid пишется Wi-Fi state machine под cfgMtx — читаем тоже под ним
   { char ssid[sizeof(cfg.ssid)];
     xSemaphoreTake(cfgMtx, portMAX_DELAY);
     strlcpy(ssid, cfg.ssid, sizeof(ssid));
@@ -2030,6 +2527,11 @@ void handleStatus() {
     doc["ssid"] = ssid; }
   doc["ip"]     = wifiConnected.load() ? WiFi.localIP().toString() : "192.168.4.1";
   doc["apIP"]   = "192.168.4.1";
+  doc["apSsid"] = AP_NAME;
+  doc["gateway"] = wifiConnected.load() ? WiFi.gatewayIP().toString() : "";
+  doc["subnet"]  = wifiConnected.load() ? WiFi.subnetMask().toString() : "";
+  doc["dns0"]    = wifiConnected.load() ? WiFi.dnsIP(0).toString() : "";
+  doc["dns1"]    = wifiConnected.load() ? WiFi.dnsIP(1).toString() : "";
   doc["cpuTemp"]    = temperatureRead(); // встроенный датчик температуры ESP32 (°C)
   doc["temp"]       = safeGetTemp();
   {
@@ -2059,7 +2561,20 @@ void handleStatus() {
                       String((millis() / 1000 % 3600) / 60, DEC) + "м";
   doc["fwVersion"]  = FW_VERSION;
   doc["fwPartition"] = esp_ota_get_running_partition()->label; // app0/app1 — виден фактический слот
-  doc["heap"]       = String(ESP.getFreeHeap() / 1024) + " KB";
+  uint32_t currentInternalHeap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  uint32_t minimumInternalHeap = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  uint32_t largestInternalBlock = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  doc["heap"]       = String(currentInternalHeap / 1024) + " KB";
+  doc["heapInternalCurrent"] = currentInternalHeap;
+  doc["heapInternalMinimum"] = minimumInternalHeap;
+  doc["heapInternalLargest"] = largestInternalBlock;
+  uint32_t minLargest = minimumLargestInternalBlock.load();
+  doc["heapInternalMinimumLargest"] = minLargest == UINT32_MAX ? largestInternalBlock : minLargest;
+  JsonObject stacks = doc["taskStackFree"].to<JsonObject>();
+  stacks["loop"] = loopTaskHandle ? uxTaskGetStackHighWaterMark(loopTaskHandle) : 0;
+  stacks["weather"] = weatherTaskHandle ? uxTaskGetStackHighWaterMark(weatherTaskHandle) : 0;
+  stacks["printer"] = bambuTaskHandle ? uxTaskGetStackHighWaterMark(bambuTaskHandle) : 0;
+  stacks["wifi"] = 0; // Wi-Fi connect is part of loop; no reserved task stack.
   doc["rssi"]       = wifiConnected.load() ? String(WiFi.RSSI()) + " dBm" : "—";
   doc["connResult"] = wifiConnResult.load();
   doc["connIp"]     = (wifiConnResult.load() == 2) ? WiFi.localIP().toString() : String("");
@@ -2089,8 +2604,7 @@ void handleStatus() {
     doc["sunsetH"]  = (int)((snt >>  8) & 0xFF);
     doc["sunsetM"]  = (int)( snt        & 0xFF); }
 
-  String out; serializeJson(doc, out);
-  server.send(200, "application/json", out);
+  sendJsonDocument(200, doc);
 }
 
 // Сканирование WiFi: двухфазный async без блокировки loop().
@@ -2130,25 +2644,20 @@ void handleScanWifi() {
     }
   }
   WiFi.scanDelete();
-  String out; serializeJson(doc, out);
-  server.send(200, "application/json", out);
+  sendJsonDocument(200, doc);
 }
 
 // Подключение к сети — немедленно возвращает ответ браузеру.
-// Фактическое подключение выполняет wifiConnTask.
+// Фактическое подключение выполняет неблокирующая loop state machine.
 // Браузер получает результат через /api/status polling.
 void handleConnectWifi() {
-  if (!checkAuth()) { server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
-  if (!server.hasArg("plain")) { server.send(400); return; }
+  if (!checkMutationAuth()) { server.send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
   if (wifiConnPending.load() || wifiConnInProgress.load()) {
     server.send(409, "application/json", "{\"error\":\"connection in progress\"}");
     return;
   }
   JsonDocument doc;
-  if (deserializeJson(doc, server.arg("plain"))) {
-    server.send(400, "application/json", "{\"error\":\"bad json\"}");
-    return;
-  }
+  if (!parseBoundedBody(doc, MAX_CONNECT_BODY_BYTES)) return;
   const char* ssid = doc["ssid"] | "";
   const char* pass = doc["password"] | "";
   if (strlen(ssid) == 0) {
@@ -2161,13 +2670,13 @@ void handleConnectWifi() {
   taskEXIT_CRITICAL(&wifiConnMux);
   wifiConnFailStatus.store(0);
   wifiConnResult.store(1);      // сразу показываем "connecting" в браузере
-  wifiConnPending.store(true);  // будит wifiConnTask
+  wifiConnPending.store(true);  // заберёт loop state machine
   server.send(200, "application/json", "{\"ok\":true,\"pending\":true}");
 }
 
 
 void handleDisconnectWifi() {
-  if (!checkAuth()) { server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
+  if (!checkMutationAuth()) { server.send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
   char prevSsid[sizeof(cfg.ssid)];
   char prevPass[sizeof(cfg.wifiPass)];
   bool prevConnected = wifiConnected.load();
@@ -2198,7 +2707,7 @@ void handleDisconnectWifi() {
 
 
 void handleReboot() {
-  if (!checkAuth()) { server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
+  if (!checkMutationAuth()) { server.send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
   if (!flushDeferredSave(true)) {
     server.send(500, "application/json", "{\"error\":\"save_failed\"}");
     return;
@@ -2208,17 +2717,64 @@ void handleReboot() {
 }
 
 void handleWeatherRefresh() {
-  if (!checkAuth()) { server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
+  if (!checkMutationAuth()) { server.send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
   weatherRequested = true;
   wakeBambuTask();
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
 // ════════════════════════════════════════════════════════════
-//  OTA: веб-загрузка /api/update + ArduinoOTA (espota)
+//  OTA: подписанная аутентифицированная веб-загрузка /api/update
 //  Образ пишется в неактивный слот; otadata переключается атомарно
 //  в Update.end() — до этого момента обрыв безвреден.
 // ════════════════════════════════════════════════════════════
+static mbedtls_sha256_context otaSha256;
+static bool otaSha256Initialized = false;
+static bool otaUploadAuthorized = false;
+static uint8_t otaSignature[96] = {};
+static size_t otaSignatureLength = 0;
+static char otaUploadError[64] = "";
+
+static void otaResetVerification() {
+  if (otaSha256Initialized) mbedtls_sha256_free(&otaSha256);
+  otaSha256Initialized = false;
+  otaUploadAuthorized = false;
+  secureZero(otaSignature, sizeof(otaSignature));
+  otaSignatureLength = 0;
+}
+
+static bool otaReadSignatureHeader() {
+  String encoded = server.header("X-OTA-Signature");
+  if (encoded.length() < 80 || encoded.length() > 160) return false;
+  size_t decodedLength = 0;
+  int result = mbedtls_base64_decode(
+    otaSignature, sizeof(otaSignature), &decodedLength,
+    reinterpret_cast<const uint8_t*>(encoded.c_str()), encoded.length());
+  otaSignatureLength = decodedLength;
+  return result == 0 && decodedLength >= 64 && decodedLength <= sizeof(otaSignature);
+}
+
+static bool otaVerifySignature() {
+  if (!otaSha256Initialized || otaSignatureLength == 0) return false;
+  uint8_t digest[32];
+  mbedtls_sha256_finish(&otaSha256, digest);
+  mbedtls_sha256_free(&otaSha256);
+  otaSha256Initialized = false;
+
+  mbedtls_pk_context publicKey;
+  mbedtls_pk_init(&publicKey);
+  int result = mbedtls_pk_parse_public_key(
+    &publicKey, reinterpret_cast<const uint8_t*>(OTA_SIGNING_PUBLIC_KEY),
+    sizeof(OTA_SIGNING_PUBLIC_KEY));
+  if (result == 0) {
+    result = mbedtls_pk_verify(&publicKey, MBEDTLS_MD_SHA256, digest, sizeof(digest),
+                               otaSignature, otaSignatureLength);
+  }
+  mbedtls_pk_free(&publicKey);
+  secureZero(digest, sizeof(digest));
+  return result == 0;
+}
+
 // Прогресс OTA на матрице: янтарный столб растёт снизу вверх (в тон boot-
 // анимации), дробная часть строки показывается яркостью. pct > 100 = размер
 // неизвестен — дышит нижняя строка. Перерисовка только при смене процента и
@@ -2286,6 +2842,17 @@ void handleUpdateUpload() {
   HTTPUpload& up = server.upload();
   switch (up.status) {
     case UPLOAD_FILE_START: {
+      otaResetVerification();
+      otaUploadError[0] = '\0';
+      if (!checkMutationAuth()) {
+        strlcpy(otaUploadError, "forbidden", sizeof(otaUploadError));
+        break;
+      }
+      if (!otaReadSignatureHeader()) {
+        strlcpy(otaUploadError, "missing_or_invalid_signature", sizeof(otaUploadError));
+        break;
+      }
+      otaUploadAuthorized = true;
       otaEnterUpdateMode();
       flushDeferredSave(true);          // дописать отложенный конфиг до перешивки
       // Точный размер приходит query-параметром (?size=N от веб-UI): Update.begin
@@ -2297,11 +2864,18 @@ void handleUpdateUpload() {
       }
       Serial.printf("[OTA] Web upload: %s (%u bytes)\n",
                     up.filename.c_str(), (unsigned)(expected == UPDATE_SIZE_UNKNOWN ? 0 : expected));
-      if (!Update.begin(expected)) Update.printError(Serial);
+      if (!Update.begin(expected)) {
+        strlcpy(otaUploadError, "update_begin_failed", sizeof(otaUploadError));
+        Update.printError(Serial);
+      } else {
+        mbedtls_sha256_init(&otaSha256);
+        mbedtls_sha256_starts(&otaSha256, 0);
+        otaSha256Initialized = true;
+      }
       break;
     }
     case UPLOAD_FILE_WRITE: {
-      if (!Update.isRunning()) break;
+      if (!otaUploadAuthorized || !Update.isRunning()) break;
       if (up.totalSize == 0 && up.currentSize >= 0x24) {
         // Первый чанк: отличаем app-образ от bootloader/merged.bin — оба
         // начинаются с 0xE9, но esp_app_desc_t (magic 0xABCD5432 по смещению
@@ -2311,28 +2885,42 @@ void handleUpdateUpload() {
         memcpy(&descMagic, up.buf + 0x20, sizeof(descMagic));
         if (up.buf[0] != 0xE9 || descMagic != ESP_APP_DESC_MAGIC_WORD) {
           Serial.println("[OTA] Отклонено: не app-образ (загружайте .ino.bin, не merged.bin)");
+          strlcpy(otaUploadError, "not_application_image", sizeof(otaUploadError));
           Update.abort();
           break;
         }
       }
-      if (Update.write(up.buf, up.currentSize) != up.currentSize)
+      if (otaSha256Initialized) mbedtls_sha256_update(&otaSha256, up.buf, up.currentSize);
+      if (Update.write(up.buf, up.currentSize) != up.currentSize) {
+        strlcpy(otaUploadError, "flash_write_failed", sizeof(otaUploadError));
         Update.printError(Serial);      // ошибка запомнена в Update, отдадим в final
-      else {
+      } else {
         size_t total = Update.size();
         showOtaProgress((total && total != UPDATE_SIZE_UNKNOWN)
           ? (uint8_t)((uint64_t)Update.progress() * 100 / total) : (uint8_t)255);
       }
       break;
     }
-    case UPLOAD_FILE_END:
-      if (Update.isRunning() && Update.end(true)) { // true: завершить и при UNKNOWN size
+    case UPLOAD_FILE_END: {
+      bool signatureValid = Update.isRunning() && otaVerifySignature();
+      if (!signatureValid) {
+        if (!otaUploadError[0])
+          strlcpy(otaUploadError, "signature_verification_failed", sizeof(otaUploadError));
+        Update.abort();
+        Serial.println("[OTA] Signature verification failed; boot slot unchanged");
+      } else if (Update.end(true)) { // commit boot partition only after signature passes
         Serial.printf("[OTA] Образ принят: %u байт\n", up.totalSize);
         showOtaDone();                  // зелёная заливка висит до перезагрузки
-      } else
+      } else {
+        strlcpy(otaUploadError, "image_validation_failed", sizeof(otaUploadError));
         Update.printError(Serial);
+      }
       break;
+    }
     case UPLOAD_FILE_ABORTED:
       Update.abort();
+      strlcpy(otaUploadError, "upload_aborted", sizeof(otaUploadError));
+      otaResetVerification();
       otaAbortUpdateMode();
       Serial.println("[OTA] Upload прерван клиентом");
       break;
@@ -2341,15 +2929,19 @@ void handleUpdateUpload() {
 }
 
 void handleUpdateFinal() {
-  if (!checkAuth()) { server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
-  if (Update.hasError() || !Update.isFinished()) {
+  if (!checkMutationAuth() || !otaUploadAuthorized) {
+    otaResetVerification();
+    server.send(403, "application/json", "{\"error\":\"forbidden\"}");
+    return;
+  }
+  if (Update.hasError() || !Update.isFinished() || otaUploadError[0]) {
     JsonDocument doc;
     doc["ok"] = false;
-    doc["error"] = Update.errorString();
-    String out; serializeJson(doc, out);
+    doc["error"] = otaUploadError[0] ? otaUploadError : Update.errorString();
     Update.abort();
+    otaResetVerification();
     otaAbortUpdateMode();
-    server.send(500, "application/json", out);
+    sendJsonDocument(400, doc);
     return;
   }
   // Новая прошивка не должна унаследовать счётчик, если OTA прошло в первые 60 с
@@ -2357,6 +2949,7 @@ void handleUpdateFinal() {
   bootGuardReset();
   xSemaphoreGive(prefsMtx);
   server.send(200, "application/json", "{\"ok\":true}");
+  otaResetVerification();
   rebootMs.store(millis()); rebootPending.store(true); // ответ успевает уйти клиенту
 }
 
@@ -2420,95 +3013,124 @@ static void configureStaNetworkPolicy() {
 #endif
 }
 
-// Старт AP — вызывать ТОЛЬКО когда WiFi уже в WIFI_OFF или WIFI_AP
-static void startAP() {
-  WiFi.mode(WIFI_AP);
-  delay(200);
+static void configureAccessPoint(bool keepStaConnected) {
+  WiFi.mode(keepStaConnected ? WIFI_AP_STA : WIFI_AP);
   IPAddress apIP(192, 168, 4, 1);
   WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
-  WiFi.softAP(AP_NAME, LEGACY_DEFAULT_AP_PASS, 6, 0, 4);
-  delay(300);
+  WiFi.softAP(AP_NAME, securityState.apPassword, 6, 0, 4);
   // В AP fallback не нужен постоянно бодрствующий радиомодуль: это только греет кристалл.
   esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
   apMode.store(true);
-  Serial.printf("[AP] Запущена: %s → %s  (ch6, ps=min)\n",
-    AP_NAME, WiFi.softAPIP().toString().c_str());
+  BambuState printer = getBambuStateSnapshot();
+  if (!bambuHasVisibleOverlay(printer.displayLifecycle))
+    apCredentialDisplayStartedMs = millis() | 1u;
+  Serial.printf("[AP] Запущена: %s → %s  (unique password, ch6, %s, ps=min)\n",
+    AP_NAME, WiFi.softAPIP().toString().c_str(), keepStaConnected ? "AP+STA" : "AP");
+}
+
+// Старт fallback AP — вызывать только когда WiFi уже в WIFI_OFF или WIFI_AP.
+static void startAP() {
+  configureAccessPoint(false);
+}
+
+static bool showApCredentialFrame() {
+  if (!apCredentialDisplayStartedMs) return false;
+  uint32_t elapsed = millis() - apCredentialDisplayStartedMs;
+  if (elapsed >= 11200UL) {
+    apCredentialDisplayStartedMs = 0;
+    return false;
+  }
+  uint8_t group = static_cast<uint8_t>((elapsed / 1400UL) % 4UL);
+  char digits[4] = {
+    securityState.apPassword[group * 3], securityState.apPassword[group * 3 + 1],
+    securityState.apPassword[group * 3 + 2], '\0'
+  };
+  clearMatrix();
+  for (uint8_t i = 0; i <= group; ++i) px(6 + i, 1, CRGB(255, 120, 0));
+  drawStr3((MW - strW3(digits)) / 2, 6, digits, CRGB(255, 150, 20));
+  matrixShow();
+  return true;
 }
 
 // ════════════════════════════════════════════════════════════
-//  АСИНХРОННОЕ ПОДКЛЮЧЕНИЕ К WiFi (FreeRTOS task)
-//  handleConnectWifi() выставляет wifiConnPending и сразу отвечает браузеру.
-//  Этот task выполняет фактический connect и пишет результат в wifiConnResult.
-//  Восстановление AP при ошибке — через флаг wifiNeedApRestart → loop task.
+//  НЕБЛОКИРУЮЩЕЕ ПОДКЛЮЧЕНИЕ К WiFi В LOOP TASK
 // ════════════════════════════════════════════════════════════
-void wifiConnTask(void* param) {
-  for (;;) {
-    if (wifiConnPending.load()) {
-      wifiConnPending.store(false);
-
-      char ssid[40], pass[64];
-      taskENTER_CRITICAL(&wifiConnMux);
-      strlcpy(ssid, wifiPendSsid, sizeof(ssid));
-      strlcpy(pass, wifiPendPass, sizeof(pass));
-      taskEXIT_CRITICAL(&wifiConnMux);
-
-      Serial.printf("[WiFi] Подключаемся к '%s' (async)...\n", ssid);
-
-      // WiFi API не потокобезопасен — просим loop task вызвать WiFi.mode/begin
-      wifiDoConnect.store(true);
-      // Ждём, пока loop() вызовет WiFi.begin и выставит wifiConnInProgress (таймаут 5 сек)
-      {
-        uint32_t t0 = millis();
-        bool timedOut = false;
-        while (!wifiConnInProgress.load()) {
-          if (millis() - t0 > 5000) { timedOut = true; break; }
-          vTaskDelay(10 / portTICK_PERIOD_MS);
-        }
-        if (timedOut) {
-          wifiDoConnect.store(false);
-          wifiConnResult.store(3); // fail
-          wifiNeedApRestart.store(true);
-          Serial.println("[WiFi] Таймаут ожидания loop() → сброс");
-          vTaskDelay(100 / portTICK_PERIOD_MS);
-          continue;
-        }
-      }
-
-      // Ждём результата от loop task — прямой вызов WiFi.status() из wifiConnTask небезопасен.
-      { uint32_t t0 = millis();
-        while (!wifiConnDone.load() && millis() - t0 < 20000)
-          vTaskDelay(50 / portTICK_PERIOD_MS);
-      }
-
-      if (wifiConnOk.load()) {
-        bool snapSunMode;
-        xSemaphoreTake(cfgMtx, portMAX_DELAY);
-        strlcpy(cfg.ssid,     ssid, sizeof(cfg.ssid));
-        strlcpy(cfg.wifiPass, pass, sizeof(cfg.wifiPass));
-        snapSunMode = cfg.autoBrSunMode; // снимаем под мьютексом — см. ниже
-        xSemaphoreGive(cfgMtx);
-        hasSsid.store(true);
-        scheduleDeferredSave(); // NVS-запись делегируем loop task
-        wifiConnected.store(true);
-        apMode.store(true);
-        apOffMs.store(0); // loop() начнёт 60-сек отсчёт заново
-        ntpPending.store(true); // loop task вызовет configTime
-        weatherRequested.store(true);
-        wakeBambuTask();
-        if (snapSunMode) sunFetchRequested.store(true);
-        wifiConnInProgress.store(false); // сбрасываем для корректной повторной попытки
-        wifiConnFailStatus.store(0);
-        wifiConnResult.store(2); // ok
-        Serial.println("[WiFi] Подключено!"); // WiFi.localIP() читаем в loop/status path
-      } else {
-        wifiConnFailStatus.store(wifiConnFinalSt.load());
-        wifiConnResult.store(3); // fail
-        wifiNeedApRestart.store(true); // loop task переключит WiFi в AP
-        Serial.printf("[WiFi] Ошибка подключения, статус=%d\n", wifiConnFailStatus.load());
-      }
-    }
-    vTaskDelay(100 / portTICK_PERIOD_MS);
+static void serviceWifiConnectStateMachine() {
+  uint32_t now = millis();
+  if (wifiConnectPhase == WifiConnectPhase::Idle && wifiConnPending.exchange(false)) {
+    taskENTER_CRITICAL(&wifiConnMux);
+    strlcpy(wifiActiveSsid, wifiPendSsid, sizeof(wifiActiveSsid));
+    strlcpy(wifiActivePass, wifiPendPass, sizeof(wifiActivePass));
+    secureZero(wifiPendPass, sizeof(wifiPendPass));
+    taskEXIT_CRITICAL(&wifiConnMux);
+    Serial.printf("[WiFi] Подключаемся к '%s' (loop state machine)...\n", wifiActiveSsid);
+    wifiConnInProgress.store(true);
+    wifiConnected.store(false);
+    WiFi.mode(WIFI_OFF);
+    wifiConnectDeadlineMs = now + 300;
+    wifiConnectPhase = WifiConnectPhase::RadioOffWait;
+    return;
   }
+
+  if (wifiConnectPhase == WifiConnectPhase::RadioOffWait &&
+      static_cast<int32_t>(now - wifiConnectDeadlineMs) >= 0) {
+    WiFi.mode(WIFI_AP_STA);
+    wifiConnectDeadlineMs = now + 300;
+    wifiConnectPhase = WifiConnectPhase::StaStartWait;
+    return;
+  }
+
+  if (wifiConnectPhase == WifiConnectPhase::StaStartWait &&
+      static_cast<int32_t>(now - wifiConnectDeadlineMs) >= 0) {
+    IPAddress apIP(192, 168, 4, 1);
+    WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+    WiFi.softAP(AP_NAME, securityState.apPassword, 6, 0, 4);
+    apMode.store(true);
+    dnsServer.start(53, "*", apIP);
+    configureStaNetworkPolicy();
+    WiFi.begin(wifiActiveSsid, wifiActivePass);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    wifiConnectStartedMs = now;
+    wifiConnectPhase = WifiConnectPhase::Connecting;
+    return;
+  }
+
+  if (wifiConnectPhase != WifiConnectPhase::Connecting) return;
+  int status = WiFi.status();
+  if (status != WL_CONNECTED && now - wifiConnectStartedMs < 15000UL) return;
+
+  if (status == WL_CONNECTED) {
+    bool sunMode;
+    xSemaphoreTake(cfgMtx, portMAX_DELAY);
+    strlcpy(cfg.ssid, wifiActiveSsid, sizeof(cfg.ssid));
+    strlcpy(cfg.wifiPass, wifiActivePass, sizeof(cfg.wifiPass));
+    sunMode = cfg.autoBrSunMode;
+    xSemaphoreGive(cfgMtx);
+    hasSsid.store(true);
+    scheduleDeferredSave();
+    wifiConnected.store(true);
+    apOffMs.store(0);
+    ntpPending.store(true);
+    weatherRequested.store(true);
+    wakeBambuTask();
+    if (sunMode) sunFetchRequested.store(true);
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    wifiReconnectPolicy.reset();
+    wifiConnFailStatus.store(0);
+    wifiConnResult.store(2);
+    Serial.println("[WiFi] Подключено!");
+  } else {
+    wifiConnected.store(false);
+    wifiConnFailStatus.store(status);
+    wifiConnResult.store(3);
+    startAP();
+    dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
+    if (hasSsid.load()) wifiReconnectPolicy.scheduleAfterFailure(now);
+    Serial.printf("[WiFi] Ошибка подключения, статус=%d\n", status);
+  }
+  secureZero(wifiActivePass, sizeof(wifiActivePass));
+  wifiConnInProgress.store(false);
+  wifiConnectPhase = WifiConnectPhase::Idle;
 }
 
 // ════════════════════════════════════════════════════════════
@@ -2552,7 +3174,7 @@ void bambuTask(void* param) {
     if (!enabled) {
       st.connected = false;
       st.printerOnline = false;
-          st.lifecycle = BAMBU_UNKNOWN;
+      st.lifecycle = BAMBU_UNKNOWN;
       st.displayLifecycle = BAMBU_UNKNOWN;
       st.progress = 0;
       setBambuDetail(st, "Bambu выключен");
@@ -2577,8 +3199,6 @@ void bambuTask(void* param) {
       st.connected = false;
       st.printerOnline = false;
       st.lifecycle = BAMBU_UNKNOWN;
-      st.displayLifecycle = BAMBU_UNKNOWN;
-      st.progress = 0;
       setBambuDetail(st, "Bambu Relay ждёт WiFi");
       setBambuStateSnapshot(st);
       bambuSleepOrWake(2000);
@@ -2600,9 +3220,7 @@ void bambuTask(void* param) {
     st = getBambuStateSnapshot();
     st.connected = false;
     st.printerOnline = false;
-      st.lifecycle = BAMBU_UNKNOWN;
-    st.displayLifecycle = BAMBU_UNKNOWN;
-    st.progress = 0;
+    st.lifecycle = BAMBU_UNKNOWN;
     strlcpy(st.rawStatus, "", sizeof(st.rawStatus));
     strlcpy(st.rawStage, "", sizeof(st.rawStage));
     setBambuDetail(st, "Relay недоступен");
@@ -2616,6 +3234,7 @@ void bambuTask(void* param) {
 // ════════════════════════════════════════════════════════════
 void setup() {
   Serial.begin(115200);
+  loopTaskHandle = xTaskGetCurrentTaskHandle();
   Serial.println("\n╔════════════════════════╗");
   Serial.println("║  ESP32 LED Matrix v3.0 ║");
   Serial.println("╚════════════════════════╝");
@@ -2664,7 +3283,7 @@ void setup() {
   if (!cfgMtx || !prefsMtx || !bambuCfgMtx) fatalHalt("Failed to create mutexes");
 
   loadConfig();
-  ensureBootstrapSecrets();
+  initializeSecurityState();
   hasSsid.store(cfg.ssid[0] != '\0'); // синхронизируем с загруженным конфигом
   // Яркость при старте: если авто-режим уже успел сохранить последнее вычисленное
   // значение, применяем его сразу. Как только NTP даст актуальное время, loop()
@@ -2730,6 +3349,9 @@ void setup() {
         weatherRequested = true;  // погода через task, не блокируя
         { bool sunMode; xSemaphoreTake(cfgMtx, portMAX_DELAY); sunMode = cfg.autoBrSunMode; xSemaphoreGive(cfgMtx);
           if (sunMode) sunFetchRequested.store(true); }
+        // Existing installations already know the STA network, but still need
+        // an AP-gated path to establish the first admin password after T01.
+        if (!securityState.adminProvisioned) configureAccessPoint(true);
       } else {
         Serial.printf("[WiFi] ✗ Попытка %d: статус=%d\n", attempt, st);
         WiFi.disconnect(false);
@@ -2746,10 +3368,12 @@ void setup() {
     if (!connected) {
       Serial.printf("[WiFi] Все попытки исчерпаны → AP\n");
       startAP();
+      wifiReconnectPolicy.scheduleInitial(millis());
     }
   } else {
     Serial.println("[WiFi] Сеть не задана → AP");
     startAP();
+    wifiReconnectPolicy.reset();
   }
 
   // DNS captive portal — только если AP запущен
@@ -2767,6 +3391,10 @@ void setup() {
   server.on("/redirect",                  HTTP_GET, [](){ server.sendHeader("Location","/"); server.send(302); });
 
   server.on("/",              HTTP_GET,  handleRoot);
+  server.on("/api/session",              HTTP_GET,  handleSessionStatus);
+  server.on("/api/session/bootstrap",    HTTP_POST, handleSessionBootstrap);
+  server.on("/api/session/login",        HTTP_POST, handleSessionLogin);
+  server.on("/api/session/logout",       HTTP_POST, handleSessionLogout);
   server.on("/api/settings",  HTTP_GET,  handleGetSettings);
   server.on("/api/settings",  HTTP_POST, handlePostSettings);
   server.on("/api/status",    HTTP_GET,  handleStatus);
@@ -2778,35 +3406,12 @@ void setup() {
   server.on("/api/weather/refresh", HTTP_POST, handleWeatherRefresh);
   server.on("/api/update",    HTTP_POST, handleUpdateFinal, handleUpdateUpload);
   server.onNotFound([](){ server.sendHeader("Location","/"); server.send(302); });
+  const char* collectedHeaders[] = {"Cookie", "X-CSRF-Token", "X-OTA-Signature"};
+  server.collectHeaders(collectedHeaders, 3);
   server.begin();
   Serial.println("Server started");
 
-  // ── ArduinoOTA (espota, порт 3232): arduino-cli upload --protocol network ──
-  ArduinoOTA.setHostname("esp32-matrix");
-  ArduinoOTA.setMdnsEnabled(false);     // IP статичный, espota работает по IP — mDNS не нужен (и ~5-10 KB heap целее)
-  ArduinoOTA.onStart([]() {
-    otaEnterUpdateMode();
-    flushDeferredSave(true);
-    Serial.println("[OTA] ArduinoOTA start");
-  });
-  ArduinoOTA.onProgress([](unsigned int done, unsigned int total) {
-    showOtaProgress(total ? (uint8_t)((uint64_t)done * 100 / total) : (uint8_t)255);
-  });
-  ArduinoOTA.onEnd([]() {
-    // espota перезагружает устройство сам, final-обработчика нет — счётчик
-    // boot-guard сбрасываем здесь, чтобы он не уехал в новую прошивку.
-    xSemaphoreTake(prefsMtx, portMAX_DELAY);
-    bootGuardReset();
-    xSemaphoreGive(prefsMtx);
-    showOtaDone();
-    Serial.println("[OTA] ArduinoOTA done");
-  });
-  ArduinoOTA.onError([](ota_error_t err) {
-    otaAbortUpdateMode();
-    Serial.printf("[OTA] ArduinoOTA error %u\n", (unsigned)err);
-  });
-  ArduinoOTA.begin();
-  Serial.println("ArduinoOTA listening on :3232");
+  Serial.println("[OTA] ArduinoOTA disabled; signed authenticated web OTA only");
 
   // ESP32-C3 одноядерный: фоновые задачи time-slice на том же ядре, WebServer остаётся в loop task.
   BaseType_t weatherTaskOk = xTaskCreatePinnedToCore(
@@ -2815,16 +3420,7 @@ void setup() {
     20480,         // стек: HTTPClient + ArduinoJson + WiFiClientSecure/mbedTLS (~12 KB TLS handshake)
     NULL,
     1,             // низкий приоритет
-    NULL,
-    0              // единственное ядро ESP32-C3
-  );
-  BaseType_t wifiConnTaskOk = xTaskCreatePinnedToCore(
-    wifiConnTask,  // асинхронное подключение к WiFi — не блокирует loop/сервер
-    "wifiConn",
-    8192,
-    NULL,
-    1,
-    NULL,
+    &weatherTaskHandle,
     0              // единственное ядро ESP32-C3
   );
   BaseType_t bambuTaskOk = xTaskCreatePinnedToCore(
@@ -2837,9 +3433,8 @@ void setup() {
     0              // единственное ядро ESP32-C3
   );
   if (weatherTaskOk != pdPASS) fatalHalt("Failed to create weather task");
-  if (wifiConnTaskOk != pdPASS) fatalHalt("Failed to create WiFi connect task");
   if (bambuTaskOk != pdPASS) fatalHalt("Failed to create Bambu task");
-  Serial.println("Background tasks started; WebServer stays in loop task");
+  Serial.println("Background tasks started; WebServer and WiFi state machine stay in loop task");
 }
 
 // ════════════════════════════════════════════════════════════
@@ -2852,7 +3447,13 @@ void loop() {
   // Веб-сервер в loop task (WebServer не потокобезопасен)
   dnsServer.processNextRequest();
   server.handleClient();
-  ArduinoOTA.handle();
+  serviceWifiConnectStateMachine();
+  { static uint32_t lastMemorySampleMs = 0;
+    if (millis() - lastMemorySampleMs >= 1000UL) {
+      lastMemorySampleMs = millis();
+      sampleMemoryMetrics();
+    }
+  }
 
   // Boot-guard: 60 с аптайма без краша = загрузка успешна. Критерий — только
   // millis(): прошивка в AP-режиме без Wi-Fi тоже валидна, привязка к Wi-Fi
@@ -2865,58 +3466,19 @@ void loop() {
     Serial.println("[BootGuard] Загрузка стабильна, счётчик сброшен");
   }
 
-  // Loop-task: WiFi.mode/begin вызываем из loop task (единая точка доступа к WiFi API).
-  // wifiConnTask выставляет wifiDoConnect с уже сохранёнными ssid/pass.
-  if (wifiDoConnect.load()) {
-    wifiDoConnect.store(false);
-    char ssid[40], pass[64];
-    taskENTER_CRITICAL(&wifiConnMux);
-    strlcpy(ssid, wifiPendSsid, sizeof(ssid));
-    strlcpy(pass, wifiPendPass, sizeof(pass));
-    taskEXIT_CRITICAL(&wifiConnMux);
-    WiFi.mode(WIFI_OFF);
-    delay(300);
-    WiFi.mode(WIFI_AP_STA);
-    delay(300);
-    { IPAddress apIP(192, 168, 4, 1);
-      WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
-      WiFi.softAP(AP_NAME, LEGACY_DEFAULT_AP_PASS, 6, 0, 4); }
-    delay(500);
-    configureStaNetworkPolicy();
-    wifiConnDone.store(false); // сброс перед началом — loop() начнёт мониторинг
-    wifiConnOk.store(false);
-    WiFi.begin(ssid, pass);
-    esp_wifi_set_ps(WIFI_PS_NONE); // power save off для стабильного подключения
-    wifiConnInProgress.store(true); // сигнал wifiConnTask: мониторинг начался
+  // Успех сбрасывает backoff, следующая реальная потеря связи снова начнётся с 5 с.
+  if (wifiConnected.load() && wifiReconnectPolicy.isScheduled()) {
+    wifiReconnectPolicy.reset();
   }
 
-  // Мониторинг подключения WiFi — WiFi.status() вызывается только из loop task.
-  // wifiConnTask ждёт wifiConnDone вместо прямого вызова WiFi.status().
-  { static uint32_t monT0 = 0;
-    if (wifiConnInProgress.load() && !wifiConnDone.load()) {
-      if (monT0 == 0) monT0 = millis() | 1u; // |1 чтобы не спутать с "не запущено"
-      int ws = WiFi.status();
-      if (ws == WL_CONNECTED || millis() - monT0 >= 15000) {
-        if (ws == WL_CONNECTED) {
-          esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-        }
-        wifiConnFinalSt.store((uint8_t)ws);
-        wifiConnOk.store(ws == WL_CONNECTED);
-        wifiConnDone.store(true);
-        monT0 = 0;
-      }
-    } else if (!wifiConnInProgress.load()) {
-      monT0 = 0;
-    }
-  }
-
-  // Автопереподключение к сохранённой сети — раз в 10 мин если при старте не удалось
-  // (или после потери связи, пока не подключились). Реиспользует wifiConnPending-путь.
-  { static uint32_t autoReconMs = 0;
+  // Автопереподключение к сохранённой сети: bounded exponential backoff
+  // 5 → 10 → 20 → 40 → 60 с, затем раз в минуту. Таймер считается от потери
+  // связи/окончания неудачной попытки, а не от старта устройства.
+  {
+    uint32_t now = millis();
     if (!wifiConnected.load() && hasSsid.load() &&
         !wifiConnPending.load() && !wifiConnInProgress.load() &&
-        millis() - autoReconMs >= 600000UL) {
-      autoReconMs = millis();
+        wifiReconnectPolicy.takeDue(now)) {
       char ssid[sizeof(cfg.ssid)], pass[sizeof(cfg.wifiPass)];
       xSemaphoreTake(cfgMtx, portMAX_DELAY);
       strlcpy(ssid, cfg.ssid,     sizeof(ssid));
@@ -2930,22 +3492,16 @@ void loop() {
         taskEXIT_CRITICAL(&wifiConnMux);
         wifiConnFailStatus.store(0);
         wifiConnResult.store(1); // "connecting" в браузере
-        wifiConnPending.store(true); // передаём управление wifiConnTask
+        wifiConnPending.store(true); // заберёт loop state machine
+      } else {
+        wifiReconnectPolicy.reset();
       }
     }
   }
 
-  // Восстановление AP после неудачного WiFi-подключения (запрошено wifiConnTask)
-  if (wifiNeedApRestart.load()) {
-    wifiNeedApRestart.store(false);
-    wifiConnInProgress.store(false); // сброс флага мониторинга
-    wifiConnDone.store(true);        // разблокируем wifiConnTask: больше не нужно ждать 20с
-    startAP();
-    dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
-  }
-
-  // Выключить AP через 60 сек после успешного подключения к WiFi
-  if (wifiConnected && apMode.load()) {
+  // До первичного provisioning onboarding AP остаётся доступным даже при
+  // рабочем STA. После создания admin-пароля действует обычный 60-с таймаут.
+  if (wifiConnected && apMode.load() && securityState.adminProvisioned) {
     uint32_t apOff = apOffMs.load();
     if (apOff == 0) { apOff = millis(); apOffMs.store(apOff); }
     if (millis() - apOff > 60000) {
@@ -2959,11 +3515,12 @@ void loop() {
   // Проверяем что STA соединение не упало — неблокирующий переход в AP:
   // WiFi.mode(WIFI_OFF) требует ~200мс на завершение, используем таймер вместо delay()
   { static uint32_t wifiDropOffMs = 0;
-    if (wifiConnected.load() && !apMode.load() && WiFi.status() != WL_CONNECTED) {
-      Serial.println("[WiFi] Соединение потеряно — перейдём в AP, авто-реконнект через 10 мин");
+    if (wifiConnected.load() && WiFi.status() != WL_CONNECTED) {
+      Serial.println("[WiFi] Соединение потеряно — перейдём в AP, первая попытка через 5 сек");
       wifiConnected.store(false);
       wifiConnFailStatus.store(WL_CONNECTION_LOST);
       wifiConnResult.store(3);
+      wifiReconnectPolicy.scheduleInitial(millis());
       WiFi.mode(WIFI_OFF);
       wifiDropOffMs = millis() | 1u; // |1 чтобы 0 означало «не в процессе»
     }
@@ -3008,7 +3565,7 @@ void loop() {
     }
   }
 
-  // NVS-запись — только из loop task (wifiConnTask выставляет флаг вместо прямого вызова saveConfig)
+  // NVS-запись — только из loop task.
   if (savePending.load() && !flushDeferredSave(false) && !savePending.load()) {
     Serial.println("[NVS] Deferred save failed");
   }
@@ -3051,13 +3608,24 @@ void loop() {
     if (needUpdate) weatherRequested = true;
   }
 
-  // Единственный режим отображения — «Часы + темп», кадр раз в 250 мс
-  if (millis() - lastDrawMs < 250) {
-    // Без yield loop() крутится почти на 100% между кадрами и заметно греет ESP32-C3.
-    // 4мс сохраняют отзывчивость WebServer и заметно уменьшают idle-polling.
-    delay(4);
-    return;
+  // 4 FPS нужны только мигающим/пульсирующим состояниям Bambu. Статичный экран
+  // проверяем раз в секунду; showClockTemp() дополнительно пропускает FastLED.show(),
+  // если минута, температура, настройки и состояние принтера не изменились.
+  BambuState printer = getBambuStateSnapshot();
+  bool animatedOverlay = printer.displayLifecycle == BAMBU_PREPARING ||
+                         printer.displayLifecycle == BAMBU_PAUSED ||
+                         printer.displayLifecycle == BAMBU_FINISHED ||
+                         printer.displayLifecycle == BAMBU_ERROR;
+  uint32_t drawIntervalMs = animatedOverlay ? 250UL : 1000UL;
+  if (apCredentialDisplayStartedMs && millis() - lastDrawMs >= 200UL) {
+    lastDrawMs = millis();
+    showApCredentialFrame();
+  } else if (!apCredentialDisplayStartedMs && millis() - lastDrawMs >= drawIntervalMs) {
+    lastDrawMs = millis();
+    showClockTemp();
   }
-  lastDrawMs = millis();
-  showClockTemp();
+
+  // 20 Гц достаточно для WebServer/Wi-Fi state machine и снижает число пустых проходов
+  // loop() в 2.5 раза относительно предыдущих 50 Гц.
+  delay(50);
 }

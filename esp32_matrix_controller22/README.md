@@ -12,6 +12,13 @@
 
 `src/app.cpp`
 
+Установленная версия: `4.0.11-2026.08.20` (`app0`). Текущий исходник T01:
+`4.1.0-2026.08.27`; production-сборка занимает 1 276 941 байт flash (64%)
+и 42 044 байта глобальной памяти (12%). Baseline до T01 был 1 352 287 байт
+flash и 46 596 байт глобальной памяти: дельта −75 346 и −4 552 байта
+соответственно. На устройство T01 ещё не загружен, поэтому on-device heap,
+largest block и task high-water marks после изменения пока не сняты.
+
 Что выбрать в Arduino IDE:
 
 - Board package: `esp32 by Espressif Systems`
@@ -35,29 +42,25 @@ OTA в этом проекте когда-то провалилась.
 arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs --export-binaries .
 # сборка + прошивка по USB:
 arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs -u -p /dev/cu.usbmodem101 .
-# прошивка по сети (OTA, устройство уже на min_spiffs; mDNS на устройстве
-# выключен, поэтому arduino-cli «-l network» порт не найдёт — зовём espota напрямую):
-python3 ~/Library/Arduino15/packages/esp32/hardware/esp32/3.3.8/tools/espota.py \
-  -i 192.168.1.65 -p 3232 -f build/esp32.esp32.esp32c3/esp32_matrix_controller22.ino.bin
+# подписать production image для WebUI OTA:
+sh tools/sign_ota.sh build/esp32.esp32.esp32c3/esp32_matrix_controller22.ino.bin
 ```
 
 ## OTA-обновления
 
-Два способа:
+Сетевой путь один: аутентифицированный WebUI. ArduinoOTA/espota на порту 3232
+отключён. В `Система → Обновление прошивки` выбрать оба файла:
 
-1. **Веб-интерфейс**: `Система → Обновление прошивки` (файл можно перетащить
-   в зону загрузки). Загружать
+1. Production image
    `build/esp32.esp32.esp32c3/esp32_matrix_controller22.ino.bin` (появляется при
    сборке с `--export-binaries`). **Не** `merged.bin` — прошивка отклонит его
    (нет app-дескриптора), но лучше не путать. Перед заливкой проверяйте свежесть
    `build/`: `arduino-cli compile --output-dir <dir>` молча перезаписывает и его,
    так что там может лежать не та сборка, что вы думаете.
-2. **espota по сети**: команда `espota.py` выше (порт 3232). Через
-   `arduino-cli -l network` не работает: discovery сетевых портов требует mDNS,
-   а он на устройстве выключен за ненадобностью — IP матрицы фактически
-   статичный, espota работает по IP напрямую; заодно это экономит ~5–10 KB
-   heap и одну фоновую задачу. Если понадобится discovery —
-   `ArduinoOTA.setMdnsEnabled(true)` в `src/app.cpp`.
+2. Подпись `.sig`, созданную `sh tools/sign_ota.sh <image>`. Приватный ключ
+   находится локально в `.secrets/ota_signing_private.pem`, исключён из Git и
+   должен храниться как эксплуатационный secret. Неподписанный или подписанный
+   другим ключом image записывается только во временный OTA slot и не коммитится.
 
 Защита от кирпича:
 
@@ -83,8 +86,28 @@ USB (смена таблицы партиций по OTA невозможна). 
 ядра проверяйте клиентские таймауты.
 
 PlatformIO-конфигурация (`platformio.ini`, разметка `min_spiffs.csv` из ядра)
-сохранена, но PlatformIO требует Python ≥3.10 и на текущей машине не работает
-(системный Python 3.9).
+сохранена, но текущая локальная установка повреждена: launcher из
+`~/.platformio/penv/bin/` ссылается на отсутствующий Python, а старая установка
+в `~/Library/Python/3.9/bin/` несовместима с Python 3.9. Используйте
+`arduino-cli`, пока окружение PlatformIO не пересоздано.
+
+## Переподключение Wi-Fi
+
+При потере сохранённой сети прошивка сохраняет точку доступа настройки и сама
+повторяет подключение через `5 → 10 → 20 → 40 → 60` секунд. Пока роутер выключен,
+дальнейшие попытки идут раз в минуту; после успешного подключения backoff
+сбрасывается. Таймер начинается в момент потери связи или окончания неудачной
+попытки, поэтому он не зависит от uptime устройства. Та же политика работает,
+если сохранённая сеть была недоступна уже во время загрузки.
+
+Хостовый регрессионный тест политики:
+
+```bash
+c++ -std=c++11 -Wall -Wextra -pedantic tests/wifi_reconnect_policy_test.cpp \
+  -o /tmp/wifi_reconnect_policy_test && /tmp/wifi_reconnect_policy_test
+c++ -std=c++11 -Wall -Wextra -pedantic tests/t01_security_policy_test.cpp \
+  -o /tmp/t01_security_policy_test && /tmp/t01_security_policy_test
+```
 
 Для локального предпросмотра веб-интерфейса без прошивки:
 
@@ -102,7 +125,17 @@ PlatformIO-конфигурация (`platformio.ini`, разметка `min_spi
 Матрица показывает единственный экран: часы (формат 12/24 ч, без разделителя)
 и уличную температуру шрифтом `Micro 3×5`, плюс полосу прогресса печати Bambu
 внизу. Декоративные режимы (огонь/плазма/лава) и настройки разделителя удалены
-вместе с выбором режима.
+вместе с выбором режима. При кратком обрыве Wi-Fi, недоступности relay или
+временном статусе `unknown/offline` последний прогресс остаётся на экране;
+полоса очищается после явного статуса `idle`.
+
+В обычном статичном состоянии кадр проверяется раз в секунду, при этом кэш
+пропускает `FastLED.show()`, если минута, температура, настройки и состояние
+принтера не изменились. Частота 4 FPS остаётся только для анимированных
+состояний Bambu (`preparing`, `paused`, `finished`, `error`). Основной `loop()`
+обслуживает WebServer и Wi-Fi state machine с частотой 20 Гц и спит по 50 мс между
+проходами. Это исправило перегрев: на `4.0.4` датчик CPU показывал `71.3 °C`
+после 22 минут, на `4.0.5` — `49.3 °C` через 4 минуты и `51.3 °C` через 5 минут.
 
 Веб-интерфейс — пять разделов в нижней навигации:
 
@@ -121,16 +154,42 @@ PlatformIO-конфигурация (`platformio.ini`, разметка `min_spi
 интерфейсе — `1..255` с мягкой квадратичной калибровкой: точная регулировка на
 малой яркости, минимум — едва заметное свечение.
 
+При первом запуске `4.1.0` WebUI просит создать пароль администратора; session
+cookie — `HttpOnly/SameSite=Strict`, изменяющие запросы требуют CSRF token.
+Первичное создание admin-пароля принимается только через onboarding AP, не через
+сохранённую STA-сеть.
+Onboarding AP получает уникальные 12 цифр вместо общего `12345678`: матрица
+показывает их четырьмя группами по три цифры (число верхних точек — номер группы).
+Остаточная угроза текущей C3: Secure Boot, flash/NVS encryption и eFuse не
+включались, поэтому физическое чтение flash может раскрыть Wi-Fi/AP/relay secrets;
+T01 защищает сетевой доступ и OTA, но не выдаёт это за защиту от физического доступа.
+
 Анимации на самой матрице: янтарная «волна зажигания» при включении, значок
 Wi-Fi с дугами при поиске сети, столб прогресса при OTA (зелёная заливка —
 успех, красный крест — ошибка). Все рисуются с учётом настроенного
 поворота/отражения.
 
+Погодные запросы OWM и Open-Meteo выполняются в порядке HTTP → HTTPS. HTTP
+быстрее после холодного старта и не требует TLS-handshake, но для OWM раскрывает
+API-ключ в transit. На время `fetchWeather()` прошивка выключает Wi-Fi power save
+и затем возвращает `WIFI_PS_MIN_MODEM`. Не добавляйте в один вызов
+`fetchWeather()` одновременные HTTPS- и HTTP-клиенты: эксперимент `4.0.2`
+переполнил стек `weatherTask` и вызвал boot loop. Текущая реализация создаёт
+только один клиент за раз и запускает HTTPS только после неудачного HTTP.
+Диагностика gateway/DNS и resolved IP доступна в `/api/status` и `weatherError`.
+
+Положение температуры проверено для всех сочетаний поворота и зеркалирования.
+При автоцентрировании, `ct6TempY=10`, `rotation=2`, `flipH=true` строка `+17`
+полностью помещается в 16×16; полоса Bambu на строках 7–8 её не перекрывает.
+
 ### Быстрые локальные проверки
 
 ```bash
 sh tools/export_web_ui.sh
+sh tools/generate_web_ui_gzip.sh
 sh tools/check_web_ui_export.sh
+c++ -std=c++17 -Wall -Wextra -pedantic tests/t01_security_policy_test.cpp -o /tmp/t01_security_policy_test && /tmp/t01_security_policy_test
+c++ -std=c++17 -Wall -Wextra -pedantic tests/wifi_reconnect_policy_test.cpp -o /tmp/wifi_reconnect_policy_test && /tmp/wifi_reconnect_policy_test
 python3 -m py_compile tools/bambu_relay/relay.py tools/bambu_relay/mock_relay.py
 python3 -m unittest discover -s tools/bambu_relay -p "test_*.py"
 for f in tools/export_web_ui.sh tools/check_web_ui_export.sh tools/bambu_relay/openwrt/bambu-relay.init; do sh -n "$f" || exit 1; done
@@ -150,6 +209,8 @@ arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs .
 
 Запуск, деплой на OpenWrt-роутер, HTTP API и конфигурация relay описаны в
 [`tools/bambu_relay/README.md`](tools/bambu_relay/README.md).
+Проверка и безопасная замена истёкшего Cloud token — в
+[`tools/bambu_relay/TOKEN_ROTATION_RUNBOOK.md`](tools/bambu_relay/TOKEN_ROTATION_RUNBOOK.md).
 
 Со стороны матрицы в веб-интерфейсе (раздел `Принтер`) нужно включить:
 
