@@ -42,6 +42,7 @@
 #include "app.hpp"
 #include "bambu_legacy_migration.hpp"
 #include "ota_public_key.hpp"
+#include "printer_status_source.hpp"
 #include "security_policy.hpp"
 #include "wifi_reconnect_policy.hpp"
 
@@ -427,87 +428,7 @@ static void setWeatherDiag(int code, const char* error, uint8_t keyLen, const ch
   taskEXIT_CRITICAL(&weatherMux);
 }
 
-enum BambuLifecycle : uint8_t {
-  BAMBU_UNKNOWN   = 0,
-  BAMBU_IDLE      = 1,
-  BAMBU_PREPARING = 2,
-  BAMBU_PRINTING  = 3,
-  BAMBU_PAUSED    = 4,
-  BAMBU_FINISHED  = 5,
-  BAMBU_ERROR     = 6,
-  BAMBU_OFFLINE   = 7,
-};
-
-struct BambuState {
-  bool enabled = false;
-  bool configured = false;
-  bool connected = false;
-  bool printerOnline = false;
-  uint8_t lifecycle = BAMBU_UNKNOWN;
-  uint8_t displayLifecycle = BAMBU_UNKNOWN;
-  uint8_t progress = 0;
-  char detail[96] = "Bambu выключен";
-  char rawStatus[40] = "";
-  char rawStage[48] = "";
-};
-
-static BambuState bambuState;
-static portMUX_TYPE bambuStateMux = portMUX_INITIALIZER_UNLOCKED;
-
-static BambuState getBambuStateSnapshot() {
-  taskENTER_CRITICAL(&bambuStateMux);
-  BambuState snap = bambuState;
-  taskEXIT_CRITICAL(&bambuStateMux);
-  return snap;
-}
-
-static void setBambuStateSnapshot(const BambuState& next) {
-  taskENTER_CRITICAL(&bambuStateMux);
-  bambuState = next;
-  taskEXIT_CRITICAL(&bambuStateMux);
-}
-
-static uint8_t bambuOverlayLifecycle(uint8_t nextLifecycle) {
-  switch (nextLifecycle) {
-    case BAMBU_PREPARING:
-      return BAMBU_PREPARING;
-    case BAMBU_PRINTING:
-      return BAMBU_PRINTING;
-    case BAMBU_PAUSED:
-    case BAMBU_ERROR:
-    case BAMBU_FINISHED:
-      return nextLifecycle;
-    case BAMBU_IDLE:
-    case BAMBU_OFFLINE:
-    case BAMBU_UNKNOWN:
-    default:
-      return BAMBU_UNKNOWN;
-  }
-}
-
-static bool bambuHasVisibleOverlay(uint8_t lifecycle) {
-  return lifecycle == BAMBU_PREPARING ||
-         lifecycle == BAMBU_PRINTING ||
-         lifecycle == BAMBU_PAUSED ||
-         lifecycle == BAMBU_FINISHED ||
-         lifecycle == BAMBU_ERROR;
-}
-
-static uint8_t bambuDisplayLifecycleForUpdate(uint8_t currentDisplayLifecycle,
-                                              uint8_t nextLifecycle) {
-  if (bambuHasVisibleOverlay(nextLifecycle)) return bambuOverlayLifecycle(nextLifecycle);
-  if (nextLifecycle == BAMBU_IDLE) return BAMBU_UNKNOWN;
-
-  // UNKNOWN/OFFLINE are transport-quality states, not proof that a print ended.
-  // Keep the last visible overlay until relay reports an explicit idle state.
-  return bambuHasVisibleOverlay(currentDisplayLifecycle)
-    ? currentDisplayLifecycle
-    : BAMBU_UNKNOWN;
-}
-
-static void setBambuDetail(BambuState& st, const char* detail) {
-  strlcpy(st.detail, detail ? detail : "", sizeof(st.detail));
-}
+static portMUX_TYPE printerStatusMux = portMUX_INITIALIZER_UNLOCKED;
 
 static bool bambuHasRelayConfig(bool* enabledOut = nullptr,
                                 char* relayUrl = nullptr, size_t relayUrlSz = 0,
@@ -938,7 +859,9 @@ static bool loadConfigFromNvs(uint16_t ver, uint16_t csz, Config& out) {
   return false;
 }
 
-static uint8_t bambuResolveLifecycle(const String& rawStatus, const String& rawStage, float progress) {
+static PrinterLifecycle relayResolveLifecycle(const String& rawStatus,
+                                               const String& rawStage,
+                                               float progress) {
   String normalized;
   normalized.reserve(rawStatus.length() + rawStage.length());
   auto appendNorm = [&](const String& src) {
@@ -950,46 +873,85 @@ static uint8_t bambuResolveLifecycle(const String& rawStatus, const String& rawS
   appendNorm(rawStatus);
   appendNorm(rawStage);
 
-  if (normalized.indexOf("FAIL") >= 0 || normalized.indexOf("ERROR") >= 0 || normalized.indexOf("CANCEL") >= 0) return BAMBU_ERROR;
-  if (normalized.indexOf("PAUSE") >= 0) return BAMBU_PAUSED;
-  if (normalized.indexOf("DONE") >= 0 || normalized.indexOf("SUCCESS") >= 0 || normalized.indexOf("COMPLETE") >= 0 || normalized.indexOf("COMPLETED") >= 0 || normalized.indexOf("FINISH") >= 0) return BAMBU_FINISHED;
-  if (normalized.indexOf("PREPARE") >= 0 || normalized.indexOf("PREPARING") >= 0 || normalized.indexOf("STARTING") >= 0 || normalized.indexOf("HEATING") >= 0 || normalized.indexOf("DOWNLOAD") >= 0) return BAMBU_PREPARING;
-  if (normalized.indexOf("RUNNING") >= 0 || normalized.indexOf("PRINTING") >= 0 || normalized.indexOf("PROCESSING") >= 0) return BAMBU_PRINTING;
-  if (normalized.indexOf("OFFLINE") >= 0) return BAMBU_OFFLINE;
-  if (normalized.indexOf("IDLE") >= 0 || normalized.indexOf("WAIT") >= 0) return BAMBU_IDLE;
-  if (progress > 0.0f && progress < 100.0f) return BAMBU_PRINTING;
-  return BAMBU_UNKNOWN;
+  if (normalized.indexOf("FAIL") >= 0 || normalized.indexOf("ERROR") >= 0 || normalized.indexOf("CANCEL") >= 0) return PRINTER_ERROR;
+  if (normalized.indexOf("PAUSE") >= 0) return PRINTER_PAUSED;
+  if (normalized.indexOf("DONE") >= 0 || normalized.indexOf("SUCCESS") >= 0 || normalized.indexOf("COMPLETE") >= 0 || normalized.indexOf("COMPLETED") >= 0 || normalized.indexOf("FINISH") >= 0) return PRINTER_FINISHED;
+  if (normalized.indexOf("PREPARE") >= 0 || normalized.indexOf("PREPARING") >= 0 || normalized.indexOf("STARTING") >= 0 || normalized.indexOf("HEATING") >= 0 || normalized.indexOf("DOWNLOAD") >= 0) return PRINTER_PREPARING;
+  if (normalized.indexOf("RUNNING") >= 0 || normalized.indexOf("PRINTING") >= 0 || normalized.indexOf("PROCESSING") >= 0) return PRINTER_PRINTING;
+  if (normalized.indexOf("OFFLINE") >= 0) return PRINTER_OFFLINE;
+  if (normalized.indexOf("IDLE") >= 0 || normalized.indexOf("WAIT") >= 0) return PRINTER_IDLE;
+  if (progress > 0.0f && progress < 100.0f) return PRINTER_PRINTING;
+  return PRINTER_UNKNOWN;
 }
 
-static const char* bambuLifecycleLabel(uint8_t lifecycle) {
+static const char* printerLifecycleLabel(PrinterLifecycle lifecycle) {
   switch (lifecycle) {
-    case BAMBU_PRINTING: return "печать";
-    case BAMBU_PREPARING: return "подготовка";
-    case BAMBU_PAUSED: return "пауза";
-    case BAMBU_FINISHED: return "готово";
-    case BAMBU_ERROR: return "ошибка";
-    case BAMBU_IDLE: return "ожидание";
-    case BAMBU_OFFLINE: return "офлайн";
+    case PRINTER_PRINTING: return "печать";
+    case PRINTER_PREPARING: return "подготовка";
+    case PRINTER_PAUSED: return "пауза";
+    case PRINTER_FINISHED: return "готово";
+    case PRINTER_ERROR: return "ошибка";
+    case PRINTER_IDLE: return "ожидание";
+    case PRINTER_OFFLINE: return "офлайн";
     default: return "нет данных";
   }
 }
 
-static uint8_t bambuLifecycleFromString(const String& raw) {
+static PrinterLifecycle relayLifecycleFromString(const String& raw) {
   String normalized;
   normalized.reserve(raw.length());
   for (size_t i = 0; i < raw.length(); i++) {
     char ch = raw[i];
     if (isalnum((unsigned char)ch)) normalized += (char)toupper((unsigned char)ch);
   }
-  if (normalized == "PRINTING" || normalized == "RUNNING") return BAMBU_PRINTING;
-  if (normalized == "PREPARING" || normalized == "PREPARE") return BAMBU_PREPARING;
-  if (normalized == "PAUSED" || normalized == "PAUSE") return BAMBU_PAUSED;
-  if (normalized == "FINISHED" || normalized == "SUCCESS" || normalized == "DONE") return BAMBU_FINISHED;
-  if (normalized == "ERROR" || normalized == "FAILED" || normalized == "FAIL") return BAMBU_ERROR;
-  if (normalized == "OFFLINE") return BAMBU_OFFLINE;
-  if (normalized == "IDLE") return BAMBU_IDLE;
-  return BAMBU_UNKNOWN;
+  if (normalized == "PRINTING" || normalized == "RUNNING") return PRINTER_PRINTING;
+  if (normalized == "PREPARING" || normalized == "PREPARE") return PRINTER_PREPARING;
+  if (normalized == "PAUSED" || normalized == "PAUSE") return PRINTER_PAUSED;
+  if (normalized == "FINISHED" || normalized == "SUCCESS" || normalized == "DONE") return PRINTER_FINISHED;
+  if (normalized == "ERROR" || normalized == "FAILED" || normalized == "FAIL") return PRINTER_ERROR;
+  if (normalized == "OFFLINE") return PRINTER_OFFLINE;
+  if (normalized == "IDLE") return PRINTER_IDLE;
+  return PRINTER_UNKNOWN;
 }
+
+class RelayHttpSource : public PrinterStatusSource {
+ public:
+  PrinterStateSnapshot snapshot() const override {
+    taskENTER_CRITICAL(&printerStatusMux);
+    PrinterStateSnapshot copy = reducer_.snapshot();
+    taskEXIT_CRITICAL(&printerStatusMux);
+    return copy;
+  }
+
+  void configure(bool enabled, bool configured, const char* detail) {
+    taskENTER_CRITICAL(&printerStatusMux);
+    reducer_.configure(enabled, configured, detail);
+    taskEXIT_CRITICAL(&printerStatusMux);
+  }
+
+  void markUnavailable(bool transportConnected, PrinterLifecycle lifecycle,
+                       const char* detail) {
+    taskENTER_CRITICAL(&printerStatusMux);
+    reducer_.markUnavailable(transportConnected, lifecycle, detail);
+    taskEXIT_CRITICAL(&printerStatusMux);
+  }
+
+  uint32_t poll(const char* relayUrl, const char* relayKey);
+
+ private:
+  bool fetch(const char* relayUrl, const char* relayKey);
+
+  void apply(const PrinterStatePatch& patch) {
+    taskENTER_CRITICAL(&printerStatusMux);
+    reducer_.apply(patch);
+    taskEXIT_CRITICAL(&printerStatusMux);
+  }
+
+  PrinterStatusReducer reducer_;
+};
+
+static RelayHttpSource relayHttpSource;
+static PrinterStatusSource& printerStatusSource = relayHttpSource;
 
 class BoundedInputStream : public Stream {
  public:
@@ -1047,7 +1009,7 @@ static bool boundedHttpBodyAccepted(HTTPClient& http, BoundedInputStream& input,
   return contentLength >= 0 || input.drainUnknownLengthBody(http);
 }
 
-static bool bambuFetchRelayStatus(const char* relayUrl, const char* relayKey) {
+bool RelayHttpSource::fetch(const char* relayUrl, const char* relayKey) {
   if (!relayUrl || !relayUrl[0]) return false;
 
   HTTPClient http;
@@ -1083,6 +1045,10 @@ static bool bambuFetchRelayStatus(const char* relayUrl, const char* relayKey) {
   filter["stage"] = true;
   filter["detail"] = true;
   filter["lifecycle"] = true;
+  filter["jobName"] = true;
+  filter["currentLayer"] = true;
+  filter["totalLayers"] = true;
+  filter["remainingSeconds"] = true;
   JsonDocument doc;
   BoundedInputStream input(http.getStream(), MAX_RELAY_JSON_BYTES);
   DeserializationError jsonError = deserializeJson(
@@ -1096,47 +1062,103 @@ static bool bambuFetchRelayStatus(const char* relayUrl, const char* relayKey) {
     return false;
   }
 
-  bool connected = doc["connected"] | false;
-  bool printerOnline = doc["printerOnline"].isNull() ? connected : doc["printerOnline"].as<bool>();
-  float progress = doc["progress"] | 0.0f;
+  const bool connected = doc["connected"] | false;
+  const bool printerOnline = doc["printerOnline"].isNull()
+      ? connected
+      : doc["printerOnline"].as<bool>();
+  const bool hasProgress = !doc["progress"].isNull();
+  float progress = hasProgress ? doc["progress"].as<float>() : 0.0f;
+  // Relay progress is percent-valued. Preserve the long-standing fractional
+  // compatibility rule without turning the valid value 1 into 100%.
   if (progress >= 0.0f && progress < 1.0f) progress *= 100.0f;
   String rawStatus = String(doc["status"] | "");
   String rawStage = String(doc["stage"] | "");
   String detail = String(doc["detail"] | "");
   String lifecycleText = String(doc["lifecycle"] | "");
-  uint8_t lifecycle = bambuLifecycleFromString(lifecycleText);
-  if (lifecycle == BAMBU_UNKNOWN) lifecycle = bambuResolveLifecycle(rawStatus, rawStage, progress);
-  if (!printerOnline) lifecycle = BAMBU_OFFLINE;
-  if (lifecycle == BAMBU_FINISHED && progress < 100.0f) progress = 100.0f;
+  const bool hasLifecycleInput = !doc["lifecycle"].isNull() ||
+                                 !doc["status"].isNull() ||
+                                 !doc["stage"].isNull();
+  PrinterLifecycle lifecycle = relayLifecycleFromString(lifecycleText);
+  if (lifecycle == PRINTER_UNKNOWN && hasLifecycleInput)
+    lifecycle = relayResolveLifecycle(rawStatus, rawStage, progress);
+  if (!printerOnline) lifecycle = PRINTER_OFFLINE;
 
-  BambuState st = getBambuStateSnapshot();
-  st.enabled = true;
-  st.configured = true;
-  st.connected = connected;
-  st.printerOnline = printerOnline;
-  st.lifecycle = lifecycle;
-  uint8_t nextDisplayLifecycle = bambuDisplayLifecycleForUpdate(st.displayLifecycle, lifecycle);
-  bool retainingOverlay = (lifecycle == BAMBU_OFFLINE || lifecycle == BAMBU_UNKNOWN) &&
-                          bambuHasVisibleOverlay(st.displayLifecycle);
-  st.displayLifecycle = nextDisplayLifecycle;
-  if (!retainingOverlay) {
-    st.progress = (uint8_t)constrain((int)lroundf(progress), 0, 100);
+  PrinterStatePatch patch;
+  patch.present = PRINTER_PATCH_TRANSPORT_CONNECTED |
+                  PRINTER_PATCH_PRINTER_ONLINE;
+  patch.transportConnected = connected;
+  patch.printerOnline = printerOnline;
+  if (!printerOnline || hasLifecycleInput) {
+    patch.present |= PRINTER_PATCH_LIFECYCLE;
+    patch.lifecycle = lifecycle;
   }
-  strlcpy(st.rawStatus, rawStatus.c_str(), sizeof(st.rawStatus));
-  strlcpy(st.rawStage, rawStage.c_str(), sizeof(st.rawStage));
+  if (hasProgress) {
+    patch.present |= PRINTER_PATCH_PROGRESS;
+    patch.progress = (uint8_t)constrain((int)lroundf(progress), 0, 100);
+  }
+  // A stale/offline relay snapshot is a source-quality update, not a new
+  // printer-state snapshot. Keep the last confirmed job metadata with the
+  // visible overlay until an online update (especially explicit idle) arrives.
+  if (printerOnline) {
+    if (!doc["jobName"].isNull()) {
+      patch.present |= PRINTER_PATCH_JOB_NAME;
+      strlcpy(patch.jobName, doc["jobName"] | "", sizeof(patch.jobName));
+    }
+    if (!doc["stage"].isNull()) {
+      patch.present |= PRINTER_PATCH_STAGE;
+      strlcpy(patch.stage, rawStage.c_str(), sizeof(patch.stage));
+    }
+    if (!doc["currentLayer"].isNull()) {
+      patch.present |= PRINTER_PATCH_CURRENT_LAYER;
+      patch.currentLayer = doc["currentLayer"].as<uint16_t>();
+    }
+    if (!doc["totalLayers"].isNull()) {
+      patch.present |= PRINTER_PATCH_TOTAL_LAYERS;
+      patch.totalLayers = doc["totalLayers"].as<uint16_t>();
+    }
+    if (!doc["remainingSeconds"].isNull()) {
+      patch.present |= PRINTER_PATCH_REMAINING_SECONDS;
+      patch.remainingSeconds = doc["remainingSeconds"].as<uint32_t>();
+    }
+  }
   if (detail.length()) {
-    setBambuDetail(st, detail.c_str());
+    patch.present |= PRINTER_PATCH_DETAIL;
+    strlcpy(patch.detail, detail.c_str(), sizeof(patch.detail));
   } else if (!connected) {
-    setBambuDetail(st, "Relay недоступен");
+    patch.present |= PRINTER_PATCH_DETAIL;
+    strlcpy(patch.detail, "Relay недоступен", sizeof(patch.detail));
   } else {
     char msg[96];
-    snprintf(msg, sizeof(msg), "Relay: %s, %u%%", bambuLifecycleLabel(st.lifecycle), st.progress);
-    setBambuDetail(st, msg);
+    const PrinterStateSnapshot previous = snapshot();
+    const uint8_t shownProgress = hasProgress ? patch.progress : previous.progress;
+    const PrinterLifecycle shownLifecycle =
+        (patch.present & PRINTER_PATCH_LIFECYCLE) ? lifecycle : previous.lifecycle;
+    snprintf(msg, sizeof(msg), "Relay: %s, %u%%",
+             printerLifecycleLabel(shownLifecycle), shownProgress);
+    patch.present |= PRINTER_PATCH_DETAIL;
+    strlcpy(patch.detail, msg, sizeof(patch.detail));
   }
-  setBambuStateSnapshot(st);
+  apply(patch);
+  const PrinterStateSnapshot current = snapshot();
   Serial.printf("[BambuRelay] connected=%d lifecycle=%u progress=%u status='%s' stage='%s'\n",
-                connected ? 1 : 0, st.lifecycle, st.progress, st.rawStatus, st.rawStage);
+                connected ? 1 : 0, current.lifecycle, current.progress,
+                rawStatus.c_str(), rawStage.c_str());
   return true;
+}
+
+uint32_t RelayHttpSource::poll(const char* relayUrl, const char* relayKey) {
+  if (!fetch(relayUrl, relayKey)) {
+    markUnavailable(false, PRINTER_UNKNOWN, "Relay недоступен");
+    return 5000UL;
+  }
+
+  const PrinterStateSnapshot current = snapshot();
+  if (current.visibleLifecycle == PRINTER_PRINTING ||
+      current.visibleLifecycle == PRINTER_PAUSED ||
+      current.visibleLifecycle == PRINTER_ERROR) {
+    return 5000UL;
+  }
+  return 30000UL;
 }
 
 // ════════════════════════════════════════════════════════════
@@ -1388,13 +1410,13 @@ void showClockTemp() {
     tempColorKey = (int16_t)lroundf(t * 10.0f);
   }
 
-  BambuState printer = getBambuStateSnapshot();
+  PrinterStateSnapshot printer = printerStatusSource.snapshot();
   uint8_t overlayPhase = 0;
-  if (printer.displayLifecycle == BAMBU_FINISHED ||
-      printer.displayLifecycle == BAMBU_PAUSED ||
-      printer.displayLifecycle == BAMBU_ERROR) {
+  if (printer.visibleLifecycle == PRINTER_FINISHED ||
+      printer.visibleLifecycle == PRINTER_PAUSED ||
+      printer.visibleLifecycle == PRINTER_ERROR) {
     overlayPhase = (uint8_t)((millis() / 500UL) & 1UL);
-  } else if (printer.displayLifecycle == BAMBU_PREPARING) {
+  } else if (printer.visibleLifecycle == PRINTER_PREPARING) {
     overlayPhase = (uint8_t)((millis() / 250UL) & 3UL);
   }
 
@@ -1444,7 +1466,7 @@ void showClockTemp() {
   key.rotation = rSnap.rotation;
   key.flipH = rSnap.flipH;
   key.flipV = rSnap.flipV;
-  key.bambuLifecycle = printer.displayLifecycle;
+  key.bambuLifecycle = printer.visibleLifecycle;
   key.bambuProgress = printer.progress;
   key.overlayPhase = overlayPhase;
   key.wifiWarning = !wifiConnected.load() && hasSsid.load();
@@ -1487,8 +1509,8 @@ void showClockTemp() {
     drawStr3(tx, ty, tempText, tempCol);
   }
 
-  switch (printer.displayLifecycle) {
-    case BAMBU_PREPARING: {
+  switch (printer.visibleLifecycle) {
+    case PRINTER_PREPARING: {
       CRGB track = clockCol;
       track.nscale8(rSnap.colonBright);
       CRGB c = CRGB(0, 220, 70);
@@ -1500,7 +1522,7 @@ void showClockTemp() {
       }
       break;
     }
-    case BAMBU_PRINTING: {
+    case PRINTER_PRINTING: {
       CRGB track = clockCol;
       track.nscale8(rSnap.colonBright);
       CRGB fill = CRGB(0, 220, 70);
@@ -1522,7 +1544,7 @@ void showClockTemp() {
       }
       break;
     }
-    case BAMBU_FINISHED: {
+    case PRINTER_FINISHED: {
       if (overlayPhase) {
         CRGB c = CRGB(0, 220, 70);
         for (uint8_t x = 0; x < MW; x++) {
@@ -1532,19 +1554,19 @@ void showClockTemp() {
       }
       break;
     }
-    case BAMBU_PAUSED:
-    case BAMBU_ERROR: {
+    case PRINTER_PAUSED:
+    case PRINTER_ERROR: {
       if (overlayPhase) {
-        CRGB c = printer.displayLifecycle == BAMBU_PAUSED ? CRGB(255, 200, 0) : CRGB(255, 0, 0);
+        CRGB c = printer.visibleLifecycle == PRINTER_PAUSED ? CRGB(255, 200, 0) : CRGB(255, 0, 0);
         for (uint8_t y = 7; y <= 8; y++)
           for (uint8_t x = 0; x < MW; x++)
             px(x, y, c);
       }
       break;
     }
-    case BAMBU_IDLE:
-    case BAMBU_OFFLINE:
-    case BAMBU_UNKNOWN:
+    case PRINTER_IDLE:
+    case PRINTER_OFFLINE:
+    case PRINTER_UNKNOWN:
     default: break;
   }
 
@@ -2122,16 +2144,12 @@ void loadConfig() {
     if (!saveConfig()) Serial.println("[NVS] Failed to rewrite migrated state v2");
   }
 
-  BambuState st;
-  st.enabled = bambuCfg.enabled;
-  st.configured = bambuCfg.relayUrl[0] != '\0';
-  st.connected = false;
-  st.printerOnline = false;
-  st.lifecycle = BAMBU_UNKNOWN;
-  st.displayLifecycle = BAMBU_UNKNOWN;
-  setBambuDetail(st, bambuCfg.enabled ? (st.configured ? "Bambu relay ждёт WiFi" : "Заполните Relay URL")
-                                      : "Bambu выключен");
-  setBambuStateSnapshot(st);
+  const bool printerConfigured = bambuCfg.relayUrl[0] != '\0';
+  relayHttpSource.configure(
+      bambuCfg.enabled, printerConfigured,
+      bambuCfg.enabled
+          ? (printerConfigured ? "Bambu relay ждёт WiFi" : "Заполните Relay URL")
+          : "Bambu выключен");
 }
 
 // ════════════════════════════════════════════════════════════
@@ -2390,12 +2408,18 @@ void handleGetSettings() {
   doc["bambuRelayUrl"]     = bambuCfg.relayUrl;
   doc["bambuRelayKeySet"]  = bambuCfg.relayKey[0] != '\0';
   xSemaphoreGive(bambuCfgMtx);
-  { BambuState st = getBambuStateSnapshot();
+  { PrinterStateSnapshot st = printerStatusSource.snapshot();
     doc["bambuConfigured"] = st.configured;
-    doc["bambuConnected"]  = st.connected;
+    doc["bambuConnected"]  = st.transportConnected;
     doc["bambuPrinterOnline"] = st.printerOnline;
     doc["bambuLifecycle"]  = st.lifecycle;
+    doc["bambuVisibleLifecycle"] = st.visibleLifecycle;
     doc["bambuProgress"]   = st.progress;
+    doc["bambuCurrentLayer"] = st.currentLayer;
+    doc["bambuTotalLayers"] = st.totalLayers;
+    doc["bambuRemainingSeconds"] = st.remainingSeconds;
+    doc["bambuJobName"] = st.jobName;
+    doc["bambuStage"] = st.stage;
     doc["bambuDetail"]     = st.detail; }
   // Данные восхода/заката хранятся в RAM (не в cfg) — читаем вне мьютекса
   doc["sunTimeValid"]  = sunTimeValid.load();
@@ -2588,13 +2612,19 @@ void handleStatus() {
   }
   doc["savePending"] = savePending.load();
   doc["saveError"]   = saveError.load();
-  { BambuState st = getBambuStateSnapshot();
+  { PrinterStateSnapshot st = printerStatusSource.snapshot();
     doc["bambuEnabled"]    = st.enabled;
     doc["bambuConfigured"] = st.configured;
-    doc["bambuConnected"]  = st.connected;
+    doc["bambuConnected"]  = st.transportConnected;
     doc["bambuPrinterOnline"] = st.printerOnline;
     doc["bambuLifecycle"]  = st.lifecycle;
+    doc["bambuVisibleLifecycle"] = st.visibleLifecycle;
     doc["bambuProgress"]   = st.progress;
+    doc["bambuCurrentLayer"] = st.currentLayer;
+    doc["bambuTotalLayers"] = st.totalLayers;
+    doc["bambuRemainingSeconds"] = st.remainingSeconds;
+    doc["bambuJobName"] = st.jobName;
+    doc["bambuStage"] = st.stage;
     doc["bambuDetail"]     = st.detail; }
   // Данные восхода/заката — нужны для авто-обновления sunStatusTxt каждые 3 сек
   doc["sunTimeValid"] = sunTimeValid.load();
@@ -3021,8 +3051,8 @@ static void configureAccessPoint(bool keepStaConnected) {
   // В AP fallback не нужен постоянно бодрствующий радиомодуль: это только греет кристалл.
   esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
   apMode.store(true);
-  BambuState printer = getBambuStateSnapshot();
-  if (!bambuHasVisibleOverlay(printer.displayLifecycle))
+  PrinterStateSnapshot printer = printerStatusSource.snapshot();
+  if (!printerHasVisibleOverlay(printer.visibleLifecycle))
     apCredentialDisplayStartedMs = millis() | 1u;
   Serial.printf("[AP] Запущена: %s → %s  (unique password, ch6, %s, ps=min)\n",
     AP_NAME, WiFi.softAPIP().toString().c_str(), keepStaConnected ? "AP+STA" : "AP");
@@ -3167,65 +3197,28 @@ void bambuTask(void* param) {
     bool enabled = false;
     bool configured = bambuHasRelayConfig(&enabled, relayUrl, sizeof(relayUrl), relayKey, sizeof(relayKey));
 
-    BambuState st = getBambuStateSnapshot();
-    st.enabled = enabled;
-    st.configured = configured;
-
     if (!enabled) {
-      st.connected = false;
-      st.printerOnline = false;
-      st.lifecycle = BAMBU_UNKNOWN;
-      st.displayLifecycle = BAMBU_UNKNOWN;
-      st.progress = 0;
-      setBambuDetail(st, "Bambu выключен");
-      setBambuStateSnapshot(st);
+      relayHttpSource.configure(false, configured, "Bambu выключен");
       bambuSleepOrWake(2000);
       continue;
     }
 
     if (!configured) {
-      st.connected = false;
-      st.printerOnline = false;
-      st.lifecycle = BAMBU_UNKNOWN;
-      st.displayLifecycle = BAMBU_UNKNOWN;
-      st.progress = 0;
-      setBambuDetail(st, "Заполните Relay URL");
-      setBambuStateSnapshot(st);
+      relayHttpSource.configure(true, false, "Заполните Relay URL");
       bambuSleepOrWake(2000);
       continue;
     }
+
+    relayHttpSource.configure(true, true, "Bambu relay ждёт WiFi");
 
     if (!wifiConnected.load()) {
-      st.connected = false;
-      st.printerOnline = false;
-      st.lifecycle = BAMBU_UNKNOWN;
-      setBambuDetail(st, "Bambu Relay ждёт WiFi");
-      setBambuStateSnapshot(st);
+      relayHttpSource.markUnavailable(false, PRINTER_UNKNOWN,
+                                      "Bambu Relay ждёт WiFi");
       bambuSleepOrWake(2000);
       continue;
     }
 
-    if (bambuFetchRelayStatus(relayUrl, relayKey)) {
-      BambuState next = getBambuStateSnapshot();
-      uint32_t delayMs = 30000;
-      if (next.displayLifecycle == BAMBU_PRINTING ||
-          next.displayLifecycle == BAMBU_PAUSED ||
-          next.displayLifecycle == BAMBU_ERROR) {
-        delayMs = 5000;
-      }
-      bambuSleepOrWake(delayMs);
-      continue;
-    }
-
-    st = getBambuStateSnapshot();
-    st.connected = false;
-    st.printerOnline = false;
-    st.lifecycle = BAMBU_UNKNOWN;
-    strlcpy(st.rawStatus, "", sizeof(st.rawStatus));
-    strlcpy(st.rawStage, "", sizeof(st.rawStage));
-    setBambuDetail(st, "Relay недоступен");
-    setBambuStateSnapshot(st);
-    bambuSleepOrWake(5000);
+    bambuSleepOrWake(relayHttpSource.poll(relayUrl, relayKey));
   }
 }
 
@@ -3611,11 +3604,11 @@ void loop() {
   // 4 FPS нужны только мигающим/пульсирующим состояниям Bambu. Статичный экран
   // проверяем раз в секунду; showClockTemp() дополнительно пропускает FastLED.show(),
   // если минута, температура, настройки и состояние принтера не изменились.
-  BambuState printer = getBambuStateSnapshot();
-  bool animatedOverlay = printer.displayLifecycle == BAMBU_PREPARING ||
-                         printer.displayLifecycle == BAMBU_PAUSED ||
-                         printer.displayLifecycle == BAMBU_FINISHED ||
-                         printer.displayLifecycle == BAMBU_ERROR;
+  PrinterStateSnapshot printer = printerStatusSource.snapshot();
+  bool animatedOverlay = printer.visibleLifecycle == PRINTER_PREPARING ||
+                         printer.visibleLifecycle == PRINTER_PAUSED ||
+                         printer.visibleLifecycle == PRINTER_FINISHED ||
+                         printer.visibleLifecycle == PRINTER_ERROR;
   uint32_t drawIntervalMs = animatedOverlay ? 250UL : 1000UL;
   if (apCredentialDisplayStartedMs && millis() - lastDrawMs >= 200UL) {
     lastDrawMs = millis();
