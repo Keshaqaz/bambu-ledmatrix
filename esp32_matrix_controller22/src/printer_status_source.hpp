@@ -149,18 +149,20 @@ class PrinterStatusReducer {
       state_.progress = patch.progress > 100 ? 100 : patch.progress;
     if (state_.lifecycle == PRINTER_FINISHED) state_.progress = 100;
     if (state_.lifecycle == PRINTER_IDLE) state_.progress = 0;
-    if (!deferFinishedIdle && (patch.present & PRINTER_PATCH_CURRENT_LAYER))
-      state_.currentLayer = patch.currentLayer;
-    if (!deferFinishedIdle && (patch.present & PRINTER_PATCH_TOTAL_LAYERS))
-      state_.totalLayers = patch.totalLayers;
-    if (!deferFinishedIdle && (patch.present & PRINTER_PATCH_REMAINING_SECONDS))
-      state_.remainingSeconds = patch.remainingSeconds;
-    if (!deferFinishedIdle && (patch.present & PRINTER_PATCH_JOB_NAME))
-      copyText(state_.jobName, patch.jobName);
-    if (!deferFinishedIdle && (patch.present & PRINTER_PATCH_STAGE))
-      copyText(state_.stage, patch.stage);
-    if (!deferFinishedIdle && (patch.present & PRINTER_PATCH_DETAIL))
-      copyText(state_.detail, patch.detail);
+    if (!deferFinishedIdle) {
+      if (patch.present & PRINTER_PATCH_CURRENT_LAYER)
+        state_.currentLayer = patch.currentLayer;
+      if (patch.present & PRINTER_PATCH_TOTAL_LAYERS)
+        state_.totalLayers = patch.totalLayers;
+      if (patch.present & PRINTER_PATCH_REMAINING_SECONDS)
+        state_.remainingSeconds = patch.remainingSeconds;
+      if (patch.present & PRINTER_PATCH_JOB_NAME)
+        copyText(state_.jobName, patch.jobName);
+      if (patch.present & PRINTER_PATCH_STAGE)
+        copyText(state_.stage, patch.stage);
+      if (patch.present & PRINTER_PATCH_DETAIL)
+        copyText(state_.detail, patch.detail);
+    }
   }
 
   void advance(uint32_t nowMs) {
