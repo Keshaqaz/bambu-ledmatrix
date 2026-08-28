@@ -12,12 +12,12 @@
 
 `src/app.cpp`
 
-Установленная версия: `4.0.11-2026.08.20` (`app0`). Текущий исходник T01:
-`4.1.0-2026.08.27`; production-сборка занимает 1 276 941 байт flash (64%)
-и 42 044 байта глобальной памяти (12%). Baseline до T01 был 1 352 287 байт
-flash и 46 596 байт глобальной памяти: дельта −75 346 и −4 552 байта
-соответственно. На устройство T01 ещё не загружен, поэтому on-device heap,
-largest block и task high-water marks после изменения пока не сняты.
+Установленная версия: `4.0.11-2026.08.20` (`app0`). Текущий исходник T04:
+`4.2.0-2026.08.28`; production-сборка занимает 1 381 447 байт flash (70%)
+и 49 236 байт глобальной памяти (15%). От последней записанной T01-сборки это
++104 506 байт flash и +7 192 байта globals; относительно исходного ADR baseline
+дельта +29 160 и +2 640 байт. На устройство T04 не загружался, поэтому
+on-device minimum heap, largest block и task high-water marks пока не сняты.
 
 Что выбрать в Arduino IDE:
 
@@ -190,6 +190,10 @@ sh tools/generate_web_ui_gzip.sh
 sh tools/check_web_ui_export.sh
 c++ -std=c++17 -Wall -Wextra -pedantic tests/t01_security_policy_test.cpp -o /tmp/t01_security_policy_test && /tmp/t01_security_policy_test
 c++ -std=c++17 -Wall -Wextra -pedantic tests/wifi_reconnect_policy_test.cpp -o /tmp/wifi_reconnect_policy_test && /tmp/wifi_reconnect_policy_test
+c++ -std=c++17 -Wall -Wextra -pedantic tests/printer_status_source_test.cpp -o /tmp/printer_status_source_test && /tmp/printer_status_source_test
+c++ -std=c++17 -Wall -Wextra -pedantic tests/bambu_report_parser_test.cpp -o /tmp/bambu_report_parser_test && /tmp/bambu_report_parser_test
+c++ -std=c++17 -Wall -Wextra -pedantic tests/bambu_lifecycle_mapping_test.cpp -o /tmp/bambu_lifecycle_mapping_test && /tmp/bambu_lifecycle_mapping_test
+c++ -std=c++17 -Wall -Wextra -pedantic tests/bambu_credential_store_test.cpp -o /tmp/bambu_credential_store_test && /tmp/bambu_credential_store_test
 python3 -m py_compile tools/bambu_relay/relay.py tools/bambu_relay/mock_relay.py
 python3 -m unittest discover -s tools/bambu_relay -p "test_*.py"
 for f in tools/export_web_ui.sh tools/check_web_ui_export.sh tools/bambu_relay/openwrt/bambu-relay.init; do sh -n "$f" || exit 1; done
@@ -201,11 +205,22 @@ for f in tools/export_web_ui.sh tools/check_web_ui_export.sh tools/bambu_relay/o
 arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs .
 ```
 
-## Bambu Relay
+## Bambu Cloud и Relay
 
-Для live-статуса принтера используется внешний relay (`tools/bambu_relay/`).
-Прошивка ESP не выполняет прямой вход в Bambu Cloud: она только опрашивает
-`Relay URL`, а relay получает статус принтера по MQTT.
+T04 добавляет в WebUI direct Cloud onboarding: email/password, email/SMS
+verification, явный выбор принтера, MQTT `pushall`, refresh и logout. TOTP-код
+принимается, но текущий записанный контракт подтверждает только access-token в
+cookie и не подтверждает обязательный refresh token. В этом случае onboarding
+останавливается с recoverable `tfa_refresh_contract_missing`, не заменяя active
+credential; для завершения этой ветки нужна проверка реального ответа Bambu.
+Пароль существует только во время login operation и затирается после её
+завершения; active/candidate credentials хранятся атомарно с checksum и rollback.
+Google OAuth не эмулируется: для Google-created account сначала один раз задайте
+Bambu-пароль через официальный `Forgot password`.
+
+До T05 это shadow path: матрица и основной status WebUI продолжают читать
+`RelayHttpSource`, а direct snapshot доступен только в `/api/status.bambuDirect`.
+Внешний relay (`tools/bambu_relay/`) остаётся рабочим rollback path.
 
 Запуск, деплой на OpenWrt-роутер, HTTP API и конфигурация relay описаны в
 [`tools/bambu_relay/README.md`](tools/bambu_relay/README.md).
@@ -217,3 +232,7 @@ arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs .
 - тумблер `Статус печати`
 - `Relay URL = http://<хост_relay>:8787/status`
 - опционально `Relay Key`, если relay запущен с ключом
+
+Direct Cloud настраивается в соседней карточке того же раздела. Cloud REST,
+Cloud MQTT, weather HTTPS/sunrise и OTA проходят через единый координатор:
+одновременно на ESP32-C3 существует не более одного TLS-сеанса.

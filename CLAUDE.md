@@ -11,7 +11,7 @@ token operations).
 ## Project
 
 - Firmware project: `esp32_matrix_controller22/`
-- Deployed firmware: `4.0.11-2026.08.20`, partition `app0`; source is `4.1.0-2026.08.27` (T01) and has not been deployed
+- Deployed firmware: `4.0.11-2026.08.20`, partition `app0`; source is `4.2.0-2026.08.28` (T04) and has not been deployed
 - Target board: `ESP32C3 Dev Module` / FQBN `esp32:esp32:esp32c3:PartitionScheme=min_spiffs`
 - Main firmware: `src/app.cpp`; web UI source: `src/index_html.h`; browser preview export: `web/index.html` (re-export via `tools/export_web_ui.sh`, verify via `tools/check_web_ui_export.sh`)
 - Relay: `tools/bambu_relay/relay.py` (deployed on the OpenWrt router)
@@ -63,8 +63,26 @@ token operations).
 
 ## Bambu Integration
 
-- Relay-only: printer/cloud MQTT → relay on the router → ESP polls relay over HTTP. No ESP-side Bambu Cloud auth, no REST fallback.
-- `bambuFetchRelayStatus()` is the firmware-side ingestion point; `bambuHasRelayConfig()` treats `Relay URL` as the only required source
+- T04 direct Cloud shadow path owns email/password auth, email/SMS verification,
+  printer selection, refresh/logout and direct MQTT, while
+  renderer and primary status remain on `RelayHttpSource` until T05.
+- TOTP entry is implemented fail-closed, but the recorded contract only proves
+  an access-token cookie from `/api/sign-in/tfa`, not the refresh token required
+  by the active/candidate store. The firmware returns
+  `tfa_refresh_contract_missing` and preserves the old active credential rather
+  than guessing a token shape; live contract validation is still required.
+- `BambuCloud` uses versioned checksum-protected active/candidate credential
+  slots. Candidate is promoted only after account/directory checks, MQTT and the
+  first valid report; reboot/error removes candidate and preserves active.
+- Password and verification code are bounded to one operation and explicitly
+  wiped. API/UI/diagnostics expose state/reason codes, never tokens or password.
+- `BambuReportParser` consumes MQTT fragments without allocating
+  `total_data_len`; unknown/malformed/oversized reports cannot clear the last
+  valid direct snapshot.
+- `SecureNetworkCoordinator` serializes Cloud HTTP/MQTT, weather HTTPS,
+  sunrise and OTA so C3 never owns two TLS sessions. Relay remains the active
+  renderer and rollback source.
+- `bambuHasRelayConfig()` treats `Relay URL` as the only required renderer source.
 - **Progress semantics:** `mc_percent: 1` means 1%, not 100% (`< 1.0` scaling guard, not `<=`); `finished` forces progress to 100. Regression test: `test_progress_one_means_one_percent_while_finished_is_complete`. Do not "fix" this back.
 - Relay keeps `finished` briefly (grace period), then auto-demotes to `idle`; partial MQTT telemetry packets are ignored so they cannot wipe live print state
 - Relay returns `idle` instead of `unknown` when connected with no active print

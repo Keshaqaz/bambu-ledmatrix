@@ -354,9 +354,34 @@ details .dbody{padding:2px 13px 13px}
     <div class="note hide" id="bambuOff">Статус принтера на матрице отключён.</div>
   </div>
 
+  <div class="card" id="bambuCloudCard">
+    <div class="ch"><h2>Direct Cloud · shadow</h2><span class="pbadge idle" id="bcBadge">Не настроен</span></div>
+    <div class="note" id="bcHint" style="margin-bottom:12px">Войдите в Bambu Account. До этапа T05 матрица продолжает показывать проверенный relay snapshot.</div>
+    <div class="banner warn" id="bcGoogleNote"><span>Аккаунт создан через Google? Один раз задайте Bambu-пароль через <a href="https://bambulab.com/en/sign-in" target="_blank" rel="noreferrer" style="color:inherit"><b>официальную страницу входа → Forgot password</b></a>, затем вернитесь сюда.</span></div>
+    <div id="bcLogin">
+      <div class="field"><label>Email или телефон Bambu Account</label><input type="text" id="bcEmail" autocomplete="username"></div>
+      <div class="field"><label>Пароль Bambu</label>
+        <div class="pass"><input type="password" id="bcPassword" autocomplete="off"><span class="eye" onclick="eye('bcPassword')">👁</span></div></div>
+      <div class="field"><label>Регион аккаунта</label><select id="bcRegion"><option value="global">Global</option><option value="china">China</option></select></div>
+      <button class="btn" id="bcLoginBtn" onclick="bambuCloudLogin()">Войти</button>
+    </div>
+    <div class="hide" id="bcVerify">
+      <div class="field"><label id="bcVerifyLabel">Код подтверждения</label><input type="text" id="bcCode" inputmode="numeric" autocomplete="off" maxlength="12"></div>
+      <button class="btn" onclick="bambuCloudVerify()">Подтвердить</button>
+    </div>
+    <div class="hide" id="bcPrinters">
+      <div class="note" style="margin-bottom:8px">Выберите принтер явно:</div>
+      <div id="bcPrinterList"></div>
+    </div>
+    <div class="hide" id="bcReady">
+      <div class="banner ok"><span><b>Direct Cloud готов.</b> Snapshot доступен в диагностике; отображение остаётся на relay до T05.</span></div>
+      <div class="g2"><button class="btn2" onclick="bambuCloudRefresh()">Проверить refresh</button><button class="btn2 btn-danger" onclick="bambuCloudLogout()">Выйти из Bambu</button></div>
+    </div>
+  </div>
+
   <div class="card" id="bambuCfg">
-    <div class="ch"><h2>Relay</h2></div>
-    <div class="note" style="margin-bottom:11px">Данные приходят только через relay на роутере — устройство не ходит в Bambu Cloud напрямую.</div>
+    <div class="ch"><h2>Relay · active renderer</h2></div>
+    <div class="note" style="margin-bottom:11px">Безопасный rollback path остаётся активным источником матрицы на всём T04.</div>
     <div class="field"><label>Relay URL</label><input type="text" id="bambuRelayUrl" placeholder="http://192.168.1.1:8787/status"></div>
     <div class="field"><label>Relay Key</label>
       <div class="pass"><input type="password" id="bambuRelayKey" data-clear="false" placeholder="Новый ключ (необязательно)" oninput="secretEdited('bambuRelayKey','rkeyState')"><span class="eye" onclick="eye('bambuRelayKey')">👁</span></div>
@@ -455,7 +480,7 @@ let hydrating=false,autosaveReady=false,autosaveTimer=0,autosavePending=false,au
 let csrfToken='',authProvisioned=true,appStarted=false;
 
 /* ── preview mode: моки для file:// ── */
-let mockConnResult=0,mockSettings={brightness:80,autoColor:true,use24h:true,ntpServer:'pool.ntp.org',tzOffset:3,tzFromWeather:true,updateMin:10,weatherProvider:0,apiKeySet:true,city:'Moscow',owmLat:55.7558,owmLon:37.6173,owmUseCoords:false,rotation:0,flipH:false,flipV:false,autoBrightness:false,brightnessDay:80,brightnessNight:20,dayStartHour:7,nightStartHour:22,autoBrSunMode:false,ct6ClockX:0,ct6ClockY:2,ct6TempX:-1,ct6TempY:9,ct6ClockR:255,ct6ClockG:128,ct6ClockB:0,ct6TempR:0,ct6TempG:200,ct6TempB:255,bambuEnabled:true,bambuRelayUrl:'http://192.168.1.1:8787/status',bambuRelayKeySet:true,bambuConnected:true,bambuPrinterOnline:true,bambuLifecycle:3,bambuProgress:42,bambuDetail:'Preview: печать 42%',sunTimeValid:true,sunriseH:6,sunriseM:12,sunsetH:20,sunsetM:4};
+let mockConnResult=0,mockBambuAuth={state:'signed_out',operationId:'',operationExpiresIn:0,error:'',configured:false,candidatePending:false,printers:[]},mockSettings={brightness:80,autoColor:true,use24h:true,ntpServer:'pool.ntp.org',tzOffset:3,tzFromWeather:true,updateMin:10,weatherProvider:0,apiKeySet:true,city:'Moscow',owmLat:55.7558,owmLon:37.6173,owmUseCoords:false,rotation:0,flipH:false,flipV:false,autoBrightness:false,brightnessDay:80,brightnessNight:20,dayStartHour:7,nightStartHour:22,autoBrSunMode:false,ct6ClockX:0,ct6ClockY:2,ct6TempX:-1,ct6TempY:9,ct6ClockR:255,ct6ClockG:128,ct6ClockB:0,ct6TempR:0,ct6TempG:200,ct6TempB:255,bambuEnabled:true,bambuRelayUrl:'http://192.168.1.1:8787/status',bambuRelayKeySet:true,bambuConnected:true,bambuPrinterOnline:true,bambuLifecycle:3,bambuProgress:42,bambuDetail:'Preview: печать 42%',sunTimeValid:true,sunriseH:6,sunriseM:12,sunsetH:20,sunsetM:4};
 function mockJson(payload,status=200){return new Response(JSON.stringify(payload),{status,headers:{'Content-Type':'application/json'}});}
 function mockStatus(){return {wifi:true,ap:false,ssid:'Home WiFi',ip:'192.168.1.65',temp:23.4,cpuTemp:41.2,uptime:'3ч 14м',heap:'214 KB',heapInternalMinimum:128000,heapInternalLargest:92000,taskStackFree:{loop:6200,weather:4100,printer:3600,wifi:0},fwVersion:'preview',fwPartition:'app0',rssi:'-58 dBm',weatherSource:'owm',weatherError:'',weatherAgeSec:240,connResult:mockConnResult,connIp:mockConnResult===2?'192.168.1.88':'',connStatus:0,connStatusText:'',savePending:false,saveError:false,bambuEnabled:mockSettings.bambuEnabled,bambuConfigured:true,bambuConnected:true,bambuPrinterOnline:true,bambuLifecycle:3,bambuProgress:42,bambuDetail:mockSettings.bambuDetail,sunTimeValid:true,sunriseH:6,sunriseM:12,sunsetH:20,sunsetM:4};}
 async function apiFetch(url,opts={}){const headers=new Headers(opts.headers||{});if(opts.body!==undefined&&!headers.has('Content-Type'))headers.set('Content-Type','application/json');const method=(opts.method||'GET').toUpperCase();
@@ -466,6 +491,14 @@ async function apiFetch(url,opts={}){const headers=new Headers(opts.headers||{})
     if(url==='/api/scan')return mockJson({networks:[{ssid:'Home WiFi',rssi:-42,enc:true},{ssid:'Workshop',rssi:-67,enc:true},{ssid:'Open Cafe',rssi:-78,enc:false}]});
     if(url==='/api/connect'&&method==='POST'){mockConnResult=1;setTimeout(()=>{mockConnResult=2;},900);return mockJson({ok:true,pending:true});}
     if(url==='/api/disconnect'&&method==='POST'){mockConnResult=0;return mockJson({ok:true});}
+    if(url==='/api/bambu/auth/status'&&method==='GET')return mockJson(mockBambuAuth);
+    if(url==='/api/bambu/auth/login'&&method==='POST'){
+      mockBambuAuth={state:'printer_selection_required',operationId:'preview-operation',operationExpiresIn:300,error:'',configured:false,candidatePending:false,printers:[{serial:'01P00A000000001',name:'Preview X1C'}]};
+      return mockJson({accepted:true,operationId:'preview-operation'},202);}
+    if(url==='/api/bambu/auth/verify'&&method==='POST')return mockJson({accepted:true},202);
+    if(url==='/api/bambu/printer/select'&&method==='POST'){mockBambuAuth={state:'ready',operationId:'',operationExpiresIn:0,error:'',configured:true,candidatePending:false,printers:[]};return mockJson({accepted:true},202);}
+    if(url==='/api/bambu/logout'&&method==='POST'){mockBambuAuth={state:'signed_out',operationId:'',operationExpiresIn:0,error:'',configured:false,candidatePending:false,printers:[]};return mockJson({accepted:true},202);}
+    if(url==='/api/bambu/refresh'&&method==='POST')return mockJson({accepted:true},202);
     if((url==='/api/reboot'||url==='/api/weather/refresh')&&method==='POST')return mockJson({ok:true});
   }
   if(!['GET','HEAD','OPTIONS'].includes(method)&&csrfToken)headers.set('X-CSRF-Token',csrfToken);
@@ -600,6 +633,46 @@ function updPrinter(d){
     g('cPrnTxt').innerHTML=(d.bambuLifecycle===3)?'Печать <b>'+prog+'%</b>':escapeHtml(lc[1]);
   }}
 
+let bambuOperationId='';
+const BAMBU_STATE_TEXT={signed_out:'Не настроен',submitting_credentials:'Проверка входа…',verification_required_email:'Нужен код email',verification_required_sms:'Нужен код SMS',verification_required_totp:'Нужен TOTP',fetching_printers:'Получаем принтеры…',printer_selection_required:'Выберите принтер',connecting:'Подключаем MQTT…',ready:'Готово',recoverable_error:'Можно повторить'};
+const BAMBU_ERRORS={invalid_credentials:'Неверный аккаунт или пароль.',operation_expired:'Попытка входа истекла — начните снова.',token_envelope_incomplete:'Cloud не вернул полный credential envelope.',tfa_refresh_contract_missing:'TOTP подтверждён, но Cloud не вернул refresh credential; active запись не изменена.',account_identity_missing:'Не удалось подтвердить идентификатор аккаунта.',no_printers:'В аккаунте не найдено принтеров.',candidate_save_failed:'Candidate не сохранён; прежняя active запись не изменена.',candidate_mqtt_failed:'Candidate не прошёл MQTT-проверку; выполнен rollback.',candidate_report_timeout:'Принтер не прислал валидный report вовремя; выполнен rollback.',candidate_commit_failed:'Первый report получен, но commit не завершён.',refresh_rollback:'Refresh не прошёл; восстановлена прежняя active запись.',tls_busy:'Защищённая сеть занята — повторите позже.'};
+function renderBambuAuth(d){
+  bambuOperationId=d.operationId||bambuOperationId;
+  const state=d.state||'signed_out',configured=!!d.configured;
+  g('bcBadge').textContent=BAMBU_STATE_TEXT[state]||'Можно повторить';
+  g('bcBadge').className='pbadge '+(state==='ready'?'printing':(state==='recoverable_error'?'error':'idle'));
+  g('bcLogin').classList.toggle('hide',state!=='signed_out'&&state!=='recoverable_error');
+  const verify=state.startsWith('verification_required_');
+  g('bcVerify').classList.toggle('hide',!verify);
+  g('bcPrinters').classList.toggle('hide',state!=='printer_selection_required');
+  g('bcReady').classList.toggle('hide',state!=='ready'&&!(state==='recoverable_error'&&configured));
+  g('bcGoogleNote').classList.toggle('hide',state!=='signed_out'&&state!=='recoverable_error');
+  if(verify)g('bcVerifyLabel').textContent=state.endsWith('totp')?'Код из приложения-аутентификатора':(state.endsWith('sms')?'Код из SMS':'Код из email');
+  const err=d.error?(BAMBU_ERRORS[d.error]||'Операция не завершена; можно безопасно повторить.') : '';
+  g('bcHint').textContent=err||(state==='ready'?'Direct snapshot получен. Матрица остаётся на relay до T05.':(BAMBU_STATE_TEXT[state]||'Direct Cloud'));
+  if(state==='printer_selection_required'){
+    const list=g('bcPrinterList');list.innerHTML='';
+    (d.printers||[]).forEach(p=>{const b=document.createElement('button');b.className='btn2';b.style.marginBottom='7px';b.textContent=(p.name||'Bambu printer')+' · '+(p.serial||'');b.onclick=()=>bambuCloudSelect(p.serial);list.appendChild(b);});
+  }}
+async function fetchBambuAuth(){try{const r=await apiFetch('/api/bambu/auth/status');if(r.ok)renderBambuAuth(await r.json());}catch(e){}}
+async function bambuCloudLogin(){
+  const email=g('bcEmail').value.trim(),password=g('bcPassword').value,region=g('bcRegion').value;
+  if(!email||!password){toast('Введите аккаунт и Bambu-пароль');return;}
+  g('bcLoginBtn').disabled=true;
+  try{const r=await apiFetch('/api/bambu/auth/login',{method:'POST',body:JSON.stringify({email,password,region})});const d=await r.json();if(!r.ok)throw new Error('login');bambuOperationId=d.operationId||'';toast('Вход отправлен');setTimeout(fetchBambuAuth,400);}
+  catch(e){toast('Не удалось начать вход');}
+  finally{g('bcPassword').value='';g('bcLoginBtn').disabled=false;}}
+async function bambuCloudVerify(){
+  const code=g('bcCode').value.trim();if(!code||!bambuOperationId){toast('Введите актуальный код');return;}
+  try{const r=await apiFetch('/api/bambu/auth/verify',{method:'POST',body:JSON.stringify({operationId:bambuOperationId,code})});if(!r.ok)throw new Error('verify');g('bcCode').value='';toast('Код отправлен');setTimeout(fetchBambuAuth,400);}
+  catch(e){g('bcCode').value='';toast('Код отклонён или истёк');}}
+async function bambuCloudSelect(serial){
+  try{const r=await apiFetch('/api/bambu/printer/select',{method:'POST',body:JSON.stringify({operationId:bambuOperationId,serial})});if(!r.ok)throw new Error('select');toast('Проверяем MQTT и первый report');setTimeout(fetchBambuAuth,400);}
+  catch(e){toast('Выбор принтера не принят');}}
+async function bambuCloudLogout(){if(!confirm('Удалить Direct Cloud credentials с устройства? Relay останется без изменений.'))return;
+  try{const r=await apiFetch('/api/bambu/logout',{method:'POST',body:'{}'});if(!r.ok)throw new Error('logout');bambuOperationId='';toast('Cloud credentials удаляются');setTimeout(fetchBambuAuth,400);}catch(e){toast('Cloud занят — повторите позже');}}
+async function bambuCloudRefresh(){try{const r=await apiFetch('/api/bambu/refresh',{method:'POST',body:'{}'});if(!r.ok)throw new Error('refresh');toast('Refresh запущен с rollback');setTimeout(fetchBambuAuth,400);}catch(e){toast('Refresh сейчас недоступен');}}
+
 /* ── система: время ── */
 function onTzAuto(){g('tzManualWrap').classList.toggle('hide',g('tzAuto').checked);updTzHint();}
 function updTzHint(d){
@@ -715,6 +788,7 @@ async function fetchStatus(){
     g('sunTxt').textContent=d.sunTimeValid?sunFmt(d):'—';
     /* принтер */
     updPrinter(d);
+    fetchBambuAuth();
     /* система */
     if(d.fwVersion)g('sFw').textContent=d.fwVersion+' · '+(d.fwPartition||'?');
     g('sUp').textContent=d.uptime||'—';

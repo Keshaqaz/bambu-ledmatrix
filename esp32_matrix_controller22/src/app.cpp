@@ -40,10 +40,12 @@
 #include <mbedtls/sha256.h>
 #include <atomic>
 #include "app.hpp"
+#include "bambu_cloud.hpp"
 #include "bambu_legacy_migration.hpp"
 #include "ota_public_key.hpp"
 #include "printer_status_source.hpp"
 #include "security_policy.hpp"
+#include "secure_network_coordinator.hpp"
 #include "wifi_reconnect_policy.hpp"
 
 // PlatformIO compiles sources as plain C++ and does not apply Arduino's .ino
@@ -80,6 +82,13 @@ void handleSessionStatus();
 void handleSessionBootstrap();
 void handleSessionLogin();
 void handleSessionLogout();
+void handleBambuAuthStatus();
+void handleBambuAuthLogin();
+void handleBambuAuthVerify();
+void handleBambuPrinters();
+void handleBambuPrinterSelect();
+void handleBambuLogout();
+void handleBambuRefresh();
 void handleUpdateUpload();
 void handleUpdateFinal();
 void showBoot();
@@ -100,7 +109,7 @@ void loop();
 static constexpr uint16_t CONFIG_VERSION = 332;
 // Версия прошивки: поднимать при каждой OTA-итерации — по смене значения в
 // /api/status видно, что обновление реально применилось.
-static constexpr const char* FW_VERSION = "4.1.0-2026.08.27";
+static constexpr const char* FW_VERSION = "4.2.0-2026.08.28";
 static constexpr uint32_t STORED_STATE_MAGIC = 0x4D415458UL; // MATX
 static constexpr uint16_t STORED_STATE_VERSION = 2;
 static constexpr size_t BAMBU_TOKEN_CAPACITY = 384;
@@ -358,6 +367,8 @@ static std::atomic<uint32_t> rebootMs{0};
 // OTA: пока идёт приём образа, weatherTask/bambuTask приостанавливаются, чтобы
 // TLS-handshake (~12 KB heap) не стартовал посреди записи флеша.
 static std::atomic<bool> otaInProgress{false};
+static SecureNetworkCoordinator secureNetworkCoordinator;
+static BambuCloud bambuCloud(secureNetworkCoordinator);
 
 // Boot-guard / анти-кирпич: счётчик незавершённых загрузок в отдельном NVS
 // namespace "bootguard" (StoredStateBlob в "matrix" не трогаем). 3 сбоя подряд →
@@ -455,6 +466,15 @@ static void bambuSleepOrWake(uint32_t delayMs) {
   if (delayMs == 0) return;
   ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(delayMs));
 }
+
+class BambuCloudExternalTlsPause {
+ public:
+  BambuCloudExternalTlsPause() { bambuCloud.pauseForExternalTls(); }
+  ~BambuCloudExternalTlsPause() {
+    bambuCloud.resumeAfterExternalTls();
+    wakeBambuTask();
+  }
+};
 
 // ── Асинхронное подключение к WiFi ──────────────────────────────────────────
 // handleConnectWifi() только сохраняет параметры и возвращает ответ браузеру.
@@ -1803,12 +1823,18 @@ void fetchWeather() {
       owmOk = runOwmRequest(client, false, nullptr);
     }
     if (!owmOk) {
-      WiFiClientSecure client;
-      client.setInsecure(); // CA не проверяем ради RAM.
-      // Ядро ESP32 Arduino 3.x: setTimeout() — миллисекунды, setHandshakeTimeout() — секунды.
-      client.setTimeout(8000);
-      client.setHandshakeTimeout(8);
-      owmOk = runOwmRequest(client, true, &client);
+      BambuCloudExternalTlsPause cloudPause;
+      SecureNetworkLease tlsLease(secureNetworkCoordinator, SECURE_NETWORK_WEATHER);
+      if (!tlsLease.acquired()) {
+        setWeatherDiag(0, "owm https deferred: tls busy", keyLen, "owm");
+      } else {
+        WiFiClientSecure client;
+        client.setInsecure(); // CA не проверяем ради RAM.
+        // Ядро ESP32 Arduino 3.x: setTimeout() — миллисекунды, setHandshakeTimeout() — секунды.
+        client.setTimeout(8000);
+        client.setHandshakeTimeout(8);
+        owmOk = runOwmRequest(client, true, &client);
+      }
     }
   }
 
@@ -1944,6 +1970,12 @@ void fetchWeather() {
     meteoOk = runMeteoRequest(client, false, nullptr);
   }
   if (!meteoOk) {
+    BambuCloudExternalTlsPause cloudPause;
+    SecureNetworkLease tlsLease(secureNetworkCoordinator, SECURE_NETWORK_WEATHER);
+    if (!tlsLease.acquired()) {
+      setWeatherDiag(0, "open-meteo https deferred: tls busy", keyLen, "open-meteo");
+      return;
+    }
     WiFiClientSecure client;
     client.setInsecure();
     client.setTimeout(meteoTimeout);
@@ -1957,6 +1989,12 @@ void fetchWeather() {
 // Вызывается только из weatherTask.
 void fetchSunriseSunset() {
   if (!wifiConnected) return;
+  BambuCloudExternalTlsPause cloudPause;
+  SecureNetworkLease tlsLease(secureNetworkCoordinator, SECURE_NETWORK_SUNRISE);
+  if (!tlsLease.acquired()) {
+    Serial.println("[Sun] TLS занят — запрос отложен");
+    return;
+  }
   float lat, lon, tzF;
   xSemaphoreTake(cfgMtx, portMAX_DELAY);
   lat = cfg.owmLat;
@@ -2367,6 +2405,148 @@ void handleSessionLogout() {
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
+static const char* bambuAuthPhaseName(BambuAuthPhase phase) {
+  switch (phase) {
+    case BAMBU_AUTH_SIGNED_OUT: return "signed_out";
+    case BAMBU_AUTH_SUBMITTING_CREDENTIALS: return "submitting_credentials";
+    case BAMBU_AUTH_VERIFICATION_EMAIL: return "verification_required_email";
+    case BAMBU_AUTH_VERIFICATION_SMS: return "verification_required_sms";
+    case BAMBU_AUTH_VERIFICATION_TOTP: return "verification_required_totp";
+    case BAMBU_AUTH_FETCHING_PRINTERS: return "fetching_printers";
+    case BAMBU_AUTH_PRINTER_SELECTION: return "printer_selection_required";
+    case BAMBU_AUTH_CONNECTING: return "connecting";
+    case BAMBU_AUTH_READY: return "ready";
+    case BAMBU_AUTH_RECOVERABLE_ERROR: return "recoverable_error";
+    default: return "recoverable_error";
+  }
+}
+
+static void appendBambuCloudStatus(JsonDocument& doc,
+                                   const BambuCloudPublicStatus& status,
+                                   bool includePrinters) {
+  doc["state"] = bambuAuthPhaseName(status.phase);
+  doc["operationId"] = status.operationId;
+  doc["operationExpiresIn"] = status.operationExpiresIn;
+  doc["error"] = status.error;
+  doc["configured"] = status.hasActiveCredential;
+  doc["candidatePending"] = status.candidatePending;
+  doc["mqttConnected"] = status.mqttConnected;
+  doc["firstValidReport"] = status.firstValidReport;
+  doc["mqttReconnectCount"] = status.mqttReconnectCount;
+  doc["rejectedReports"] = status.rejectedReports;
+  doc["maximumReportBytes"] = status.maximumReportBytes;
+  if (includePrinters) {
+    JsonArray printers = doc["printers"].to<JsonArray>();
+    for (uint8_t i = 0; i < status.printerCount; ++i) {
+      JsonObject printer = printers.add<JsonObject>();
+      printer["serial"] = status.printers[i].serial;
+      printer["name"] = status.printers[i].name;
+    }
+  }
+}
+
+void handleBambuAuthStatus() {
+  if (!checkAuth()) { server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
+  JsonDocument doc;
+  appendBambuCloudStatus(doc, bambuCloud.publicStatus(), true);
+  sendJsonDocument(200, doc);
+}
+
+void handleBambuAuthLogin() {
+  if (!checkMutationAuth()) { server.send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
+  JsonDocument doc;
+  if (!parseBoundedBody(doc, 512)) return;
+  const char* emailValue = doc["email"] | "";
+  const char* passwordValue = doc["password"] | "";
+  char email[96] = "";
+  char password[96] = "";
+  strlcpy(email, emailValue, sizeof(email));
+  strlcpy(password, passwordValue, sizeof(password));
+  const bool china = strcmp(doc["region"] | "global", "china") == 0;
+  char operationId[17] = "";
+  const bool accepted = bambuCloud.submitLogin(email, password, china, operationId);
+  char* storedPassword = const_cast<char*>(passwordValue);
+  if (storedPassword && storedPassword[0]) secureZero(storedPassword, strlen(storedPassword));
+  secureZero(password, sizeof(password));
+  secureZero(email, sizeof(email));
+  doc.clear();
+  if (!accepted) {
+    server.send(409, "application/json", "{\"error\":\"login_busy_or_invalid\"}");
+    return;
+  }
+  wakeBambuTask();
+  JsonDocument response;
+  response["accepted"] = true;
+  response["operationId"] = operationId;
+  sendJsonDocument(202, response);
+  secureZero(operationId, sizeof(operationId));
+}
+
+void handleBambuAuthVerify() {
+  if (!checkMutationAuth()) { server.send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
+  JsonDocument doc;
+  if (!parseBoundedBody(doc, 256)) return;
+  char operationId[17] = "";
+  char code[16] = "";
+  strlcpy(operationId, doc["operationId"] | "", sizeof(operationId));
+  strlcpy(code, doc["code"] | "", sizeof(code));
+  const bool accepted = bambuCloud.submitVerification(operationId, code);
+  char* storedCode = const_cast<char*>(doc["code"].as<const char*>());
+  if (storedCode && storedCode[0]) secureZero(storedCode, strlen(storedCode));
+  secureZero(code, sizeof(code));
+  secureZero(operationId, sizeof(operationId));
+  doc.clear();
+  if (!accepted) {
+    server.send(409, "application/json", "{\"error\":\"verification_expired_or_invalid\"}");
+    return;
+  }
+  wakeBambuTask();
+  server.send(202, "application/json", "{\"accepted\":true}");
+}
+
+void handleBambuPrinters() {
+  if (!checkAuth()) { server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
+  BambuCloudPublicStatus status = bambuCloud.publicStatus();
+  JsonDocument doc;
+  appendBambuCloudStatus(doc, status, true);
+  sendJsonDocument(200, doc);
+}
+
+void handleBambuPrinterSelect() {
+  if (!checkMutationAuth()) { server.send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
+  JsonDocument doc;
+  if (!parseBoundedBody(doc, 256)) return;
+  const bool accepted = bambuCloud.selectPrinter(
+      doc["operationId"] | "", doc["serial"] | "");
+  doc.clear();
+  if (!accepted) {
+    server.send(409, "application/json", "{\"error\":\"selection_expired_or_invalid\"}");
+    return;
+  }
+  wakeBambuTask();
+  server.send(202, "application/json", "{\"accepted\":true}");
+}
+
+void handleBambuLogout() {
+  if (!checkMutationAuth()) { server.send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
+  if (!bambuCloud.logout()) {
+    server.send(409, "application/json", "{\"error\":\"cloud_busy\"}");
+    return;
+  }
+  wakeBambuTask();
+  server.send(202, "application/json", "{\"accepted\":true}");
+}
+
+void handleBambuRefresh() {
+  if (!checkMutationAuth()) { server.send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
+  if (!bambuCloud.requestRefresh()) {
+    server.send(409, "application/json", "{\"error\":\"cloud_not_ready\"}");
+    return;
+  }
+  wakeBambuTask();
+  server.send(202, "application/json", "{\"accepted\":true}");
+}
+
 void handleRoot() {
   server.sendHeader("Cache-Control", "no-store");
   server.sendHeader("X-Content-Type-Options", "nosniff");
@@ -2630,6 +2810,33 @@ void handleStatus() {
   { PrinterStateSnapshot printer = printerStatusSource.snapshot();
     doc["bambuEnabled"] = printer.enabled;
     appendPrinterStatus(doc, printer); }
+  {
+    BambuCloudPublicStatus cloudStatus = bambuCloud.publicStatus();
+    JsonObject cloud = doc["bambuDirect"].to<JsonObject>();
+    cloud["state"] = bambuAuthPhaseName(cloudStatus.phase);
+    cloud["configured"] = cloudStatus.hasActiveCredential;
+    cloud["candidatePending"] = cloudStatus.candidatePending;
+    cloud["mqttConnected"] = cloudStatus.mqttConnected;
+    cloud["firstValidReport"] = cloudStatus.firstValidReport;
+    cloud["error"] = cloudStatus.error;
+    cloud["mqttReconnectCount"] = cloudStatus.mqttReconnectCount;
+    cloud["rejectedReports"] = cloudStatus.rejectedReports;
+    cloud["maximumReportBytes"] = cloudStatus.maximumReportBytes;
+    PrinterStateSnapshot direct = bambuCloud.source().snapshot();
+    JsonObject snapshot = cloud["snapshot"].to<JsonObject>();
+    snapshot["configured"] = direct.configured;
+    snapshot["transportConnected"] = direct.transportConnected;
+    snapshot["printerOnline"] = direct.printerOnline;
+    snapshot["lifecycle"] = direct.lifecycle;
+    snapshot["visibleLifecycle"] = direct.visibleLifecycle;
+    snapshot["progress"] = direct.progress;
+    snapshot["currentLayer"] = direct.currentLayer;
+    snapshot["totalLayers"] = direct.totalLayers;
+    snapshot["remainingSeconds"] = direct.remainingSeconds;
+    snapshot["jobName"] = direct.jobName;
+    snapshot["stage"] = direct.stage;
+    snapshot["detail"] = direct.detail;
+  }
   // Данные восхода/заката — нужны для авто-обновления sunStatusTxt каждые 3 сек
   doc["sunTimeValid"] = sunTimeValid.load();
   { uint32_t snt = sunTimes.load();
@@ -2768,6 +2975,7 @@ static bool otaUploadAuthorized = false;
 static uint8_t otaSignature[96] = {};
 static size_t otaSignatureLength = 0;
 static char otaUploadError[64] = "";
+static bool otaTlsLeaseHeld = false;
 
 static void otaResetVerification() {
   if (otaSha256Initialized) mbedtls_sha256_free(&otaSha256);
@@ -2857,14 +3065,25 @@ static void showOtaError() {
   clearMatrix(); FastLED.show();
 }
 
-static void otaEnterUpdateMode() {
+static bool otaEnterUpdateMode() {
   otaInProgress.store(true);
+  bambuCloud.stopForOta();
+  if (!secureNetworkCoordinator.acquire(SECURE_NETWORK_OTA)) {
+    otaInProgress.store(false);
+    return false;
+  }
+  otaTlsLeaseHeld = true;
   clearMatrix(); FastLED.show();        // прежний кадр гасим; дальше рисуем прогресс
   esp_wifi_set_ps(WIFI_PS_NONE);        // power save рвёт приём при flash-операциях
+  return true;
 }
 
 static void otaAbortUpdateMode() {
   otaInProgress.store(false);
+  if (otaTlsLeaseHeld) {
+    secureNetworkCoordinator.release(SECURE_NETWORK_OTA);
+    otaTlsLeaseHeld = false;
+  }
   showOtaError();
   esp_wifi_set_ps(WIFI_PS_MIN_MODEM);   // steady state и в STA, и в AP
 }
@@ -2887,7 +3106,10 @@ void handleUpdateUpload() {
         break;
       }
       otaUploadAuthorized = true;
-      otaEnterUpdateMode();
+      if (!otaEnterUpdateMode()) {
+        strlcpy(otaUploadError, "secure_network_busy", sizeof(otaUploadError));
+        break;
+      }
       flushDeferredSave(true);          // дописать отложенный конфиг до перешивки
       // Точный размер приходит query-параметром (?size=N от веб-UI): Update.begin
       // проверит влезание в слот до первой записи. Без параметра — UNKNOWN.
@@ -2965,6 +3187,7 @@ void handleUpdateUpload() {
 void handleUpdateFinal() {
   if (!checkMutationAuth() || !otaUploadAuthorized) {
     otaResetVerification();
+    if (otaInProgress.load() || otaTlsLeaseHeld) otaAbortUpdateMode();
     server.send(403, "application/json", "{\"error\":\"forbidden\"}");
     return;
   }
@@ -2984,6 +3207,11 @@ void handleUpdateFinal() {
   xSemaphoreGive(prefsMtx);
   server.send(200, "application/json", "{\"ok\":true}");
   otaResetVerification();
+  otaInProgress.store(false);
+  if (otaTlsLeaseHeld) {
+    secureNetworkCoordinator.release(SECURE_NETWORK_OTA);
+    otaTlsLeaseHeld = false;
+  }
   rebootMs.store(millis()); rebootPending.store(true); // ответ успевает уйти клиенту
 }
 
@@ -3196,6 +3424,7 @@ void weatherTask(void* param) {
 void bambuTask(void* param) {
   for (;;) {
     if (otaInProgress.load()) { vTaskDelay(200 / portTICK_PERIOD_MS); continue; }
+    bambuCloud.service(wifiConnected.load(), otaInProgress.load());
     char relayUrl[sizeof(bambuCfg.relayUrl)];
     char relayKey[sizeof(bambuCfg.relayKey)];
     bool enabled = false;
@@ -3281,6 +3510,7 @@ void setup() {
 
   loadConfig();
   initializeSecurityState();
+  if (!bambuCloud.begin()) fatalHalt("Failed to initialize Bambu Cloud");
   hasSsid.store(cfg.ssid[0] != '\0'); // синхронизируем с загруженным конфигом
   // Яркость при старте: если авто-режим уже успел сохранить последнее вычисленное
   // значение, применяем его сразу. Как только NTP даст актуальное время, loop()
@@ -3392,6 +3622,13 @@ void setup() {
   server.on("/api/session/bootstrap",    HTTP_POST, handleSessionBootstrap);
   server.on("/api/session/login",        HTTP_POST, handleSessionLogin);
   server.on("/api/session/logout",       HTTP_POST, handleSessionLogout);
+  server.on("/api/bambu/auth/status",    HTTP_GET,  handleBambuAuthStatus);
+  server.on("/api/bambu/auth/login",     HTTP_POST, handleBambuAuthLogin);
+  server.on("/api/bambu/auth/verify",    HTTP_POST, handleBambuAuthVerify);
+  server.on("/api/bambu/printers",       HTTP_GET,  handleBambuPrinters);
+  server.on("/api/bambu/printer/select", HTTP_POST, handleBambuPrinterSelect);
+  server.on("/api/bambu/logout",         HTTP_POST, handleBambuLogout);
+  server.on("/api/bambu/refresh",        HTTP_POST, handleBambuRefresh);
   server.on("/api/settings",  HTTP_GET,  handleGetSettings);
   server.on("/api/settings",  HTTP_POST, handlePostSettings);
   server.on("/api/status",    HTTP_GET,  handleStatus);
