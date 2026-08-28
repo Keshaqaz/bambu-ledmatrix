@@ -109,7 +109,7 @@ void loop();
 static constexpr uint16_t CONFIG_VERSION = 332;
 // Версия прошивки: поднимать при каждой OTA-итерации — по смене значения в
 // /api/status видно, что обновление реально применилось.
-static constexpr const char* FW_VERSION = "4.2.0-2026.08.28";
+static constexpr const char* FW_VERSION = "4.2.1-2026.08.28";
 static constexpr uint32_t STORED_STATE_MAGIC = 0x4D415458UL; // MATX
 static constexpr uint16_t STORED_STATE_VERSION = 2;
 static constexpr size_t BAMBU_TOKEN_CAPACITY = 384;

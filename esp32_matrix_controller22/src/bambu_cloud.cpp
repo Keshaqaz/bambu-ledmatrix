@@ -3,11 +3,19 @@
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <stdlib.h>
+#include <strings.h>
 #include <time.h>
+
+#include "bambu_auth_contract.hpp"
 
 namespace {
 
 static constexpr size_t kMaximumCloudJsonBytes = 16384;
+static constexpr size_t kMaximumPortalCookieBytes = 512;
+static constexpr size_t kMaximumPortalTokenJsonBytes = 2048;
+static constexpr size_t kMaximumPortalHeaderLineBytes = 768;
+static constexpr size_t kMaximumPortalHeadersBytes = 4096;
 static constexpr uint32_t kOperationTtlMs = 5UL * 60UL * 1000UL;
 static constexpr uint32_t kCandidateReportTtlMs = 90UL * 1000UL;
 static constexpr uint32_t kDirectReportStaleMs = 70UL * 1000UL;
@@ -93,11 +101,379 @@ static const char* firstString(JsonVariantConst object, const char* a,
   return value;
 }
 
+struct PortalResponseMetadata {
+  int statusCode = 0;
+  int contentLength = -1;
+  bool chunked = false;
+};
+
+class SecureWipeGuard {
+ public:
+  SecureWipeGuard(void* memory, size_t length)
+      : memory_(memory), length_(length) {}
+  ~SecureWipeGuard() { bambuSecureZero(memory_, length_); }
+
+ private:
+  void* memory_;
+  size_t length_;
+};
+
+static bool secureWrite(NetworkClient& client, const char* data, size_t length) {
+  while (length) {
+    const size_t written = client.write(
+        reinterpret_cast<const uint8_t*>(data), length);
+    if (written == 0) return false;
+    data += written;
+    length -= written;
+  }
+  return true;
+}
+
+static bool secureWrite(NetworkClient& client, const char* text) {
+  return secureWrite(client, text, strlen(text));
+}
+
+static bool readBoundedHttpLine(NetworkClient& client, char* line,
+                                size_t lineSize, size_t& totalBytes,
+                                size_t maximumBytes) {
+  if (!line || lineSize < 2) return false;
+  size_t length = 0;
+  for (;;) {
+    char value = 0;
+    if (client.readBytes(&value, 1) != 1 || ++totalBytes > maximumBytes) {
+      line[0] = '\0';
+      return false;
+    }
+    if (value == '\n') {
+      if (length && line[length - 1] == '\r') --length;
+      line[length] = '\0';
+      return true;
+    }
+    if (length + 1 >= lineSize) {
+      line[0] = '\0';
+      return false;
+    }
+    line[length++] = value;
+  }
+}
+
+static bool headerValueContains(const char* value, const char* needle) {
+  const size_t needleLength = strlen(needle);
+  for (const char* cursor = value; cursor && *cursor; ++cursor) {
+    if (strncasecmp(cursor, needle, needleLength) == 0) return true;
+  }
+  return false;
+}
+
+static bool sendPortalRequest(NetworkClient& client, const char* method,
+                              const char* path, const char* body,
+                              const char* sessionCookie) {
+  static const char kPortalHeaders[] =
+      " HTTP/1.0\r\n"
+      "Host: bambulab.com\r\n"
+      "Accept: application/json\r\n"
+      "Content-Type: application/json\r\n"
+      "User-Agent: bambu_network_agent/02.07.01.51\r\n"
+      "X-BBL-Client-Name: BambuStudio\r\n"
+      "X-BBL-Client-Type: slicer\r\n"
+      "X-BBL-Client-Version: 02.07.01.62\r\n"
+      "X-BBL-Language: en-US\r\n"
+      "X-BBL-OS-Type: linux\r\n"
+      "X-BBL-OS-Version: esp32\r\n"
+      "X-BBL-Agent-Version: 02.07.01.51\r\n"
+      "Accept-Encoding: identity\r\n"
+      "Connection: close\r\n";
+  if (!secureWrite(client, method) || !secureWrite(client, " ") ||
+      !secureWrite(client, path) || !secureWrite(client, kPortalHeaders)) {
+    return false;
+  }
+  if (sessionCookie && sessionCookie[0] &&
+      (!secureWrite(client, "Cookie: ") ||
+       !secureWrite(client, sessionCookie) || !secureWrite(client, "\r\n"))) {
+    return false;
+  }
+  if (body) {
+    char contentLength[24] = {};
+    snprintf(contentLength, sizeof(contentLength), "%u",
+             static_cast<unsigned>(strlen(body)));
+    if (!secureWrite(client, "Content-Length: ") ||
+        !secureWrite(client, contentLength) || !secureWrite(client, "\r\n")) {
+      return false;
+    }
+  }
+  if (!secureWrite(client, "\r\n")) return false;
+  return !body || secureWrite(client, body);
+}
+
+static bool readPortalHeaders(NetworkClient& client,
+                              PortalResponseMetadata& metadata,
+                              char* sessionCookie, size_t sessionCookieSize,
+                              char* error, size_t errorSize) {
+  char line[kMaximumPortalHeaderLineBytes] = {};
+  SecureWipeGuard lineGuard(line, sizeof(line));
+  size_t totalBytes = 0;
+  if (!readBoundedHttpLine(client, line, sizeof(line), totalBytes,
+                           kMaximumPortalHeadersBytes)) {
+    copyCode(error, errorSize, "response_headers_oversized");
+    return false;
+  }
+  const char* status = strchr(line, ' ');
+  metadata.statusCode = status ? atoi(status + 1) : 0;
+  if (metadata.statusCode <= 0) {
+    copyCode(error, errorSize, "bad_response");
+    return false;
+  }
+
+  int cookiePriority = 0;
+  for (;;) {
+    if (!readBoundedHttpLine(client, line, sizeof(line), totalBytes,
+                             kMaximumPortalHeadersBytes)) {
+      if (sessionCookie) bambuSecureZero(sessionCookie, sessionCookieSize);
+      copyCode(error, errorSize, "response_headers_oversized");
+      return false;
+    }
+    if (!line[0]) break;
+    if (strncasecmp(line, "Content-Length:", 15) == 0) {
+      const char* value = line + 15;
+      while (*value == ' ' || *value == '\t') ++value;
+      char* end = nullptr;
+      const unsigned long length = strtoul(value, &end, 10);
+      if (end == value || (*end && *end != ' ' && *end != '\t') ||
+          length > 0x7fffffffUL) {
+        copyCode(error, errorSize, "bad_response");
+        return false;
+      }
+      metadata.contentLength = static_cast<int>(length);
+    } else if (strncasecmp(line, "Transfer-Encoding:", 18) == 0) {
+      metadata.chunked = headerValueContains(line + 18, "chunked");
+    } else if (sessionCookie &&
+               strncasecmp(line, "Set-Cookie:", 11) == 0) {
+      const char* value = line + 11;
+      while (*value == ' ' || *value == '\t') ++value;
+      bambuSelectSessionCookie(value, sessionCookie, sessionCookieSize,
+                               cookiePriority);
+    }
+  }
+  if (metadata.statusCode != 200) {
+    if (sessionCookie) bambuSecureZero(sessionCookie, sessionCookieSize);
+    snprintf(error, errorSize, "http_%d", metadata.statusCode);
+    return false;
+  }
+  return true;
+}
+
+static bool readExact(NetworkClient& client, char* destination, size_t length) {
+  return length == 0 || client.readBytes(destination, length) == length;
+}
+
+static bool readPortalBody(NetworkClient& client,
+                           const PortalResponseMetadata& metadata,
+                           char* output, size_t outputSize, size_t& outputLength,
+                           char* error, size_t errorSize) {
+  outputLength = 0;
+  if (!output || outputSize < 2) return false;
+  const size_t capacity = outputSize - 1;
+  if (metadata.chunked) {
+    size_t framingBytes = 0;
+    char line[64] = {};
+    SecureWipeGuard lineGuard(line, sizeof(line));
+    for (;;) {
+      if (!readBoundedHttpLine(client, line, sizeof(line), framingBytes, 1024)) {
+        copyCode(error, errorSize, "bad_response");
+        return false;
+      }
+      char* end = nullptr;
+      const unsigned long chunkLength = strtoul(line, &end, 16);
+      if (end == line || (*end && *end != ';') ||
+          chunkLength > capacity - outputLength) {
+        copyCode(error, errorSize,
+                 chunkLength > capacity - outputLength ? "response_oversized" :
+                                                         "bad_response");
+        return false;
+      }
+      if (chunkLength == 0) {
+        do {
+          if (!readBoundedHttpLine(client, line, sizeof(line), framingBytes,
+                                   1024)) {
+            copyCode(error, errorSize, "bad_response");
+            return false;
+          }
+        } while (line[0]);
+        break;
+      }
+      if (!readExact(client, output + outputLength,
+                     static_cast<size_t>(chunkLength))) {
+        copyCode(error, errorSize, "bad_response");
+        return false;
+      }
+      outputLength += static_cast<size_t>(chunkLength);
+      char terminator[2] = {};
+      if (!readExact(client, terminator, sizeof(terminator)) ||
+          terminator[0] != '\r' || terminator[1] != '\n') {
+        copyCode(error, errorSize, "bad_response");
+        return false;
+      }
+    }
+  } else if (metadata.contentLength >= 0) {
+    if (static_cast<size_t>(metadata.contentLength) > capacity) {
+      copyCode(error, errorSize, "response_oversized");
+      return false;
+    }
+    outputLength = static_cast<size_t>(metadata.contentLength);
+    if (!readExact(client, output, outputLength)) {
+      copyCode(error, errorSize, "bad_response");
+      return false;
+    }
+  } else {
+    uint32_t lastDataMs = millis();
+    while (client.connected() || client.available()) {
+      const int available = client.available();
+      if (available <= 0) {
+        if (millis() - lastDataMs > 12000) {
+          copyCode(error, errorSize, "bad_response");
+          return false;
+        }
+        delay(1);
+        continue;
+      }
+      if (outputLength == capacity) {
+        copyCode(error, errorSize, "response_oversized");
+        return false;
+      }
+      const size_t wanted = min(static_cast<size_t>(available),
+                                capacity - outputLength);
+      const int received = client.read(
+          reinterpret_cast<uint8_t*>(output + outputLength), wanted);
+      if (received <= 0) {
+        copyCode(error, errorSize, "bad_response");
+        return false;
+      }
+      outputLength += static_cast<size_t>(received);
+      lastDataMs = millis();
+    }
+  }
+  output[outputLength] = '\0';
+  return true;
+}
+
+static bool openPortalConnection(SecureNetworkCoordinator& coordinator,
+                                 SecureNetworkLease& lease,
+                                 WiFiClientSecure& client,
+                                 char* error, size_t errorSize) {
+  (void)coordinator;
+  if (!lease.acquired()) {
+    copyCode(error, errorSize, "tls_busy");
+    return false;
+  }
+  client.setCACert(kBambuCloudCa);
+  client.setTimeout(12000);
+  client.setHandshakeTimeout(12);
+  if (!client.connect("bambulab.com", 443)) {
+    copyCode(error, errorSize, "https_connect_failed");
+    return false;
+  }
+  return true;
+}
+
+static bool portalTotpRequest(SecureNetworkCoordinator& coordinator,
+                              const char* body, char* sessionCookie,
+                              size_t sessionCookieSize, char* error,
+                              size_t errorSize) {
+  if (sessionCookie && sessionCookieSize)
+    bambuSecureZero(sessionCookie, sessionCookieSize);
+  SecureNetworkLease lease(coordinator, SECURE_NETWORK_CLOUD_HTTP);
+  WiFiClientSecure client;
+  if (!openPortalConnection(coordinator, lease, client, error, errorSize))
+    return false;
+  if (!sendPortalRequest(client, "POST", "/api/sign-in/tfa", body, nullptr)) {
+    copyCode(error, errorSize, "https_write_failed");
+    client.stop();
+    return false;
+  }
+  PortalResponseMetadata metadata;
+  const bool ok = readPortalHeaders(client, metadata, sessionCookie,
+                                    sessionCookieSize, error, errorSize);
+  client.stop();
+  if (!ok && sessionCookie)
+    bambuSecureZero(sessionCookie, sessionCookieSize);
+  return ok;
+}
+
+static bool portalTokenRequest(SecureNetworkCoordinator& coordinator,
+                               const char* sessionCookie, char* accessToken,
+                               size_t accessTokenSize, char* refreshToken,
+                               size_t refreshTokenSize,
+                               uint32_t& accessLifetime,
+                               uint32_t& refreshLifetime, char* error,
+                               size_t errorSize) {
+  if (accessToken && accessTokenSize)
+    bambuSecureZero(accessToken, accessTokenSize);
+  if (refreshToken && refreshTokenSize)
+    bambuSecureZero(refreshToken, refreshTokenSize);
+  accessLifetime = 0;
+  refreshLifetime = 0;
+  SecureNetworkLease lease(coordinator, SECURE_NETWORK_CLOUD_HTTP);
+  WiFiClientSecure client;
+  if (!openPortalConnection(coordinator, lease, client, error, errorSize))
+    return false;
+  if (!sendPortalRequest(client, "GET", "/api/auth/token", nullptr,
+                         sessionCookie)) {
+    copyCode(error, errorSize, "https_write_failed");
+    client.stop();
+    return false;
+  }
+  PortalResponseMetadata metadata;
+  if (!readPortalHeaders(client, metadata, nullptr, 0, error, errorSize)) {
+    client.stop();
+    return false;
+  }
+  char body[kMaximumPortalTokenJsonBytes + 1] = {};
+  size_t bodyLength = 0;
+  bool ok = readPortalBody(client, metadata, body, sizeof(body), bodyLength,
+                           error, errorSize);
+  client.stop();
+  if (!ok) {
+    bambuSecureZero(body, sizeof(body));
+    return false;
+  }
+
+  JsonDocument response;
+  const DeserializationError jsonError = deserializeJson(
+      response, body, bodyLength, DeserializationOption::NestingLimit(4));
+  JsonVariantConst data = responseData(response);
+  BambuAuthEnvelopeInput envelope;
+  envelope.token = data["token"] | "";
+  envelope.accessToken = data["accessToken"] | "";
+  envelope.access_token = data["access_token"] | "";
+  envelope.refreshToken = data["refreshToken"] | "";
+  envelope.refresh_token = data["refresh_token"] | "";
+  envelope.expiresIn = data["expiresIn"] | 0;
+  envelope.refreshExpiresIn = data["refreshExpiresIn"] | 0;
+  ok = !jsonError && bambuCopyAuthEnvelope(
+      envelope, accessToken, accessTokenSize, refreshToken, refreshTokenSize,
+      accessLifetime, refreshLifetime);
+  const char* secrets[] = {envelope.token, envelope.accessToken,
+                           envelope.access_token, envelope.refreshToken,
+                           envelope.refresh_token};
+  for (const char* secret : secrets) {
+    if (secret && secret[0])
+      bambuSecureZero(const_cast<char*>(secret), strlen(secret));
+  }
+  bambuSecureZero(body, sizeof(body));
+  if (jsonError) {
+    copyCode(error, errorSize,
+             jsonError == DeserializationError::NoMemory ? "json_no_memory" :
+                                                           "bad_response");
+  } else if (!ok) {
+    copyCode(error, errorSize, "tfa_token_envelope_incomplete");
+  }
+  return ok;
+}
+
 static bool cloudJsonRequest(SecureNetworkCoordinator& coordinator,
                              const char* url, const char* method,
                              const char* body, const char* bearer,
-                             JsonDocument& response, char* cookieToken,
-                             size_t cookieTokenSize, char* error,
+                             JsonDocument& response, char* error,
                              size_t errorSize) {
   SecureNetworkLease lease(coordinator, SECURE_NETWORK_CLOUD_HTTP);
   if (!lease.acquired()) { copyCode(error, errorSize, "tls_busy"); return false; }
@@ -111,8 +487,6 @@ static bool cloudJsonRequest(SecureNetworkCoordinator& coordinator,
   http.setReuse(false);
   http.useHTTP10(true);
   if (!http.begin(client, url)) { copyCode(error, errorSize, "https_begin_failed"); return false; }
-  const char* collected[] = {"Set-Cookie"};
-  http.collectHeaders(collected, 1);
   http.addHeader("Accept", "application/json");
   http.addHeader("Content-Type", "application/json");
   http.addHeader("User-Agent", "bambu_network_agent/02.07.01.51");
@@ -146,27 +520,6 @@ static bool cloudJsonRequest(SecureNetworkCoordinator& coordinator,
              jsonError == DeserializationError::NoMemory ? "json_no_memory" : "bad_response");
     http.end();
     return false;
-  }
-  if (cookieToken && cookieTokenSize) {
-    cookieToken[0] = '\0';
-    String cookie = http.header("Set-Cookie");
-    const char* cursor = cookie.c_str();
-    while (cursor && *cursor) {
-      while (*cursor == ' ' || *cursor == ';') ++cursor;
-      if (strncmp(cursor, "token=", 6) == 0) {
-        cursor += 6;
-        const char* end = strchr(cursor, ';');
-        size_t length = end ? static_cast<size_t>(end - cursor) : strlen(cursor);
-        if (length && length < cookieTokenSize) {
-          memcpy(cookieToken, cursor, length);
-          cookieToken[length] = '\0';
-        }
-        break;
-      }
-      cursor = strchr(cursor, ';');
-      if (cursor) ++cursor;
-    }
-    if (cookie.length()) bambuSecureZero(cookie.begin(), cookie.length());
   }
   http.end();
   return true;
@@ -557,7 +910,7 @@ bool BambuCloud::postLogin(const PendingRequest& request, bool verification,
   snprintf(url, sizeof(url), "%s/v1/user-service/user/login", host);
   JsonDocument response;
   bool ok = cloudJsonRequest(coordinator_, url, "POST", body, nullptr,
-                             response, nullptr, 0, error, errorSize);
+                             response, error, errorSize);
   bambuSecureZero(body, sizeof(body));
   if (!ok) {
     if (!verification &&
@@ -640,7 +993,7 @@ bool BambuCloud::sendVerificationCode(bool sms, char* error, size_t errorSize) {
              : "https://api.bambulab.com/v1/user-service/user/sendemail/code");
   JsonDocument response;
   bool ok = cloudJsonRequest(coordinator_, url, "POST", body, nullptr,
-                             response, nullptr, 0, error, errorSize);
+                             response, error, errorSize);
   bambuSecureZero(body, sizeof(body));
   requestDoc.clear();
   return ok;
@@ -656,36 +1009,27 @@ bool BambuCloud::postTotp(const char* code, char* error, size_t errorSize) {
       const_cast<char*>(requestDoc["tfaCode"].as<const char*>());
   if (codeInDocument) bambuSecureZero(codeInDocument, strlen(codeInDocument));
   requestDoc.clear();
-  JsonDocument response;
-  char cookieToken[BAMBU_CLOUD_TOKEN_CAPACITY] = "";
-  bool ok = cloudJsonRequest(coordinator_, "https://bambulab.com/api/sign-in/tfa",
-                             "POST", body, nullptr, response, cookieToken,
-                             sizeof(cookieToken), error, errorSize);
+  char sessionCookie[kMaximumPortalCookieBytes] = "";
+  bool ok = portalTotpRequest(coordinator_, body, sessionCookie,
+                              sizeof(sessionCookie), error, errorSize);
   bambuSecureZero(body, sizeof(body));
-  if (!ok) { bambuSecureZero(cookieToken, sizeof(cookieToken)); return false; }
-  JsonVariantConst data = responseData(response);
-  const char* access = firstString(data, "accessToken", "access_token");
-  const char* refresh = firstString(data, "refreshToken", "refresh_token");
-  if (!access[0]) access = cookieToken;
-  if (!access[0] || !refresh[0] ||
-      strlen(access) >= sizeof(pendingAuth_.accessToken) ||
-      strlen(refresh) >= sizeof(pendingAuth_.refreshToken)) {
-    if (access[0] && access != cookieToken)
-      bambuSecureZero(const_cast<char*>(access), strlen(access));
-    if (refresh[0]) bambuSecureZero(const_cast<char*>(refresh), strlen(refresh));
-    bambuSecureZero(cookieToken, sizeof(cookieToken));
-    copyCode(error, errorSize, "tfa_refresh_contract_missing");
+  if (!ok) {
+    bambuSecureZero(sessionCookie, sizeof(sessionCookie));
     return false;
   }
-  strlcpy(pendingAuth_.accessToken, access, sizeof(pendingAuth_.accessToken));
-  strlcpy(pendingAuth_.refreshToken, refresh, sizeof(pendingAuth_.refreshToken));
-  pendingAuth_.accessExpiresIn = data["expiresIn"] | 0;
-  pendingAuth_.refreshExpiresIn = data["refreshExpiresIn"] | 0;
-  if (access != cookieToken)
-    bambuSecureZero(const_cast<char*>(access), strlen(access));
-  bambuSecureZero(const_cast<char*>(refresh), strlen(refresh));
-  bambuSecureZero(cookieToken, sizeof(cookieToken));
-  return true;
+  if (!sessionCookie[0]) {
+    bambuSecureZero(sessionCookie, sizeof(sessionCookie));
+    copyCode(error, errorSize, "tfa_session_cookie_missing");
+    return false;
+  }
+
+  ok = portalTokenRequest(
+      coordinator_, sessionCookie, pendingAuth_.accessToken,
+      sizeof(pendingAuth_.accessToken), pendingAuth_.refreshToken,
+      sizeof(pendingAuth_.refreshToken), pendingAuth_.accessExpiresIn,
+      pendingAuth_.refreshExpiresIn, error, errorSize);
+  bambuSecureZero(sessionCookie, sizeof(sessionCookie));
+  return ok;
 }
 
 void BambuCloud::processVerification(PendingRequest& request) {
@@ -715,8 +1059,8 @@ bool BambuCloud::discoverAccountAndPrinters(char* error, size_t errorSize) {
   snprintf(url, sizeof(url), "%s/v1/design-user-service/my/preference", apiHost);
   JsonDocument profile;
   if (!cloudJsonRequest(coordinator_, url, "GET", nullptr,
-                        pendingAuth_.accessToken, profile, nullptr, 0,
-                        error, errorSize)) return false;
+                        pendingAuth_.accessToken, profile, error, errorSize))
+    return false;
   JsonVariantConst profileData = responseData(profile);
   const char* uid = firstString(profileData, "uid", "userId", "user_id");
   if (!uid[0]) uid = firstString(profileData, "accountId", "account_id");
@@ -729,8 +1073,8 @@ bool BambuCloud::discoverAccountAndPrinters(char* error, size_t errorSize) {
   snprintf(url, sizeof(url), "%s/v1/iot-service/api/user/bind", apiHost);
   JsonDocument directory;
   if (!cloudJsonRequest(coordinator_, url, "GET", nullptr,
-                        pendingAuth_.accessToken, directory, nullptr, 0,
-                        error, errorSize)) return false;
+                        pendingAuth_.accessToken, directory, error, errorSize))
+    return false;
   JsonVariantConst directoryData = responseData(directory);
   JsonArrayConst devices = directoryData["devices"].as<JsonArrayConst>();
   if (devices.isNull()) devices = directory["devices"].as<JsonArrayConst>();
@@ -807,7 +1151,7 @@ void BambuCloud::processRefresh() {
   JsonDocument response;
   char error[64] = "";
   bool ok = cloudJsonRequest(coordinator_, url, "POST", body, nullptr,
-                             response, nullptr, 0, error, sizeof(error));
+                             response, error, sizeof(error));
   bambuSecureZero(body, sizeof(body));
   BambuCloudCredential candidate;
   if (ok) {
