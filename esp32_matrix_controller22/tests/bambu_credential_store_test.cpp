@@ -45,6 +45,15 @@ int main() {
                                     notRotated));
   assert(strcmp(notRotated.refreshToken, "refresh-c") == 0);
 
+  BambuRefreshRecovery recovery;
+  assert(bambuRefreshRecoverySet(recovery, "uid-a", "rotated-refresh"));
+  assert(bambuRefreshRecoveryValid(recovery));
+  assert(bambuRefreshRecoveryMatches(recovery, "uid-a"));
+  assert(!bambuRefreshRecoveryMatches(recovery, "uid-b"));
+  assert(strcmp(recovery.refreshToken, "rotated-refresh") == 0);
+  recovery.refreshToken[0] = 'X';
+  assert(!bambuRefreshRecoveryValid(recovery));
+
   afterReboot.logout();
   assert(!afterReboot.active(active));
   assert(bambuCredentialMemoryIsZero(persisted));

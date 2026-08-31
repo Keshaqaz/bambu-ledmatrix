@@ -7,6 +7,7 @@
 #include <mqtt_client.h>
 
 #include "bambu_cloud_credentials.hpp"
+#include "bambu_refresh_policy.hpp"
 #include "bambu_report_parser.hpp"
 #include "printer_status_source.hpp"
 #include "secure_network_coordinator.hpp"
@@ -43,6 +44,9 @@ struct BambuCloudPublicStatus {
   uint32_t mqttReconnectCount;
   uint32_t rejectedReports;
   uint32_t maximumReportBytes;
+  uint8_t automaticRefreshFailures;
+  uint32_t nextRefreshAttemptIn;
+  bool automaticRefreshPending;
 };
 
 class DirectCloudSource : public PrinterStatusSource {
@@ -83,7 +87,6 @@ class BambuCloud {
                    char operationId[17]);
   bool submitVerification(const char* operationId, const char* code);
   bool selectPrinter(const char* operationId, const char* serial);
-  bool requestRefresh();
   bool logout();
 
   BambuCloudPublicStatus publicStatus() const;
@@ -143,10 +146,16 @@ class BambuCloud {
   void clearPendingAuth();
   void clearPendingRequest();
   void makeOperationId(char output[17]);
+  void maybeScheduleAutomaticRefresh();
+  void noteRefreshFailure();
+  void noteRefreshSuccess(bool refreshed);
 
   bool loadCredentials();
   bool persistCandidate();
   bool persistPromotion();
+  bool persistRefreshRecovery(const char* accountUid,
+                              const char* refreshToken);
+  void clearRefreshRecovery();
   void removeCandidateFromNvs();
   void eraseCredentialNvs();
 
@@ -155,15 +164,23 @@ class BambuCloud {
   mutable SemaphoreHandle_t mutex_;
   SemaphoreHandle_t operationMutex_;
   BambuCredentialSlots credentialSlots_;
+  BambuRefreshRecovery refreshRecovery_;
   BambuCredentialTransaction credentialTx_;
   PendingRequest request_;
   PendingAuth pendingAuth_;
   BambuCloudPublicStatus status_;
   uint32_t operationDeadlineMs_;
+  uint32_t nextRefreshAttemptMs_;
+  uint32_t lastSuccessfulRefreshMs_;
+  uint8_t refreshFailureCount_;
+  bool refreshRetryScheduled_;
+  bool refreshCandidatePending_;
+  bool activeCredentialBlocked_;
   esp_mqtt_client_handle_t mqttClient_;
   bool mqttLeaseHeld_;
   std::atomic<bool> mqttUsingCandidate_{false};
   std::atomic<bool> candidateTransportFailed_{false};
+  std::atomic<bool> activeCredentialRejected_{false};
   std::atomic<bool> mqttStopping_{false};
   std::atomic<bool> externalTlsPaused_{false};
   bool initialized_;

@@ -19,6 +19,9 @@ static constexpr size_t kMaximumPortalHeadersBytes = 4096;
 static constexpr uint32_t kOperationTtlMs = 5UL * 60UL * 1000UL;
 static constexpr uint32_t kCandidateReportTtlMs = 90UL * 1000UL;
 static constexpr uint32_t kDirectReportStaleMs = 70UL * 1000UL;
+static constexpr uint32_t kFallbackTokenLifetimeSeconds =
+    90UL * 24UL * 60UL * 60UL;
+static constexpr const char* kRefreshRecoveryNvsKey = "refreshNext";
 
 // Current api.bambulab.com and *.mqtt.bambulab.com chains converge on this
 // DigiCert Global Root G2 CA. Unlike the public weather path, Cloud credentials
@@ -85,6 +88,12 @@ class CloudBoundedStream : public Stream {
 static void copyCode(char* destination, size_t size, const char* source) {
   if (!destination || size == 0) return;
   strlcpy(destination, source ? source : "cloud_error", size);
+}
+
+static void makeCloudDeviceId(char output[37]) {
+  const uint64_t chipId = ESP.getEfuseMac() & 0x0000ffffffffffffULL;
+  snprintf(output, 37, "00000000-0000-4000-8000-%012llx",
+           static_cast<unsigned long long>(chipId));
 }
 
 static JsonVariantConst responseData(const JsonDocument& document) {
@@ -487,16 +496,22 @@ static bool cloudJsonRequest(SecureNetworkCoordinator& coordinator,
   http.setReuse(false);
   http.useHTTP10(true);
   if (!http.begin(client, url)) { copyCode(error, errorSize, "https_begin_failed"); return false; }
-  http.addHeader("Accept", "application/json");
-  http.addHeader("Content-Type", "application/json");
+  char deviceId[37] = {};
+  makeCloudDeviceId(deviceId);
   http.addHeader("User-Agent", "bambu_network_agent/02.07.01.51");
   http.addHeader("X-BBL-Client-Name", "BambuStudio");
   http.addHeader("X-BBL-Client-Type", "slicer");
   http.addHeader("X-BBL-Client-Version", "02.07.01.62");
+  http.addHeader("X-BBL-Device-ID", deviceId);
   http.addHeader("X-BBL-Language", "en-US");
   http.addHeader("X-BBL-OS-Type", "linux");
   http.addHeader("X-BBL-OS-Version", "esp32");
   http.addHeader("X-BBL-Agent-Version", "02.07.01.51");
+  http.addHeader("X-BBL-Executable-info", "{}");
+  http.addHeader("X-BBL-Agent-OS-Type", "linux");
+  http.addHeader("X-BBL-Executable-Env", "false");
+  http.addHeader("Accept", "application/json");
+  http.addHeader("Content-Type", "application/json");
   if (bearer && bearer[0]) http.addHeader("Authorization", String("Bearer ") + bearer);
   int code = strcmp(method, "GET") == 0 ? http.GET() :
              http.POST(reinterpret_cast<uint8_t*>(const_cast<char*>(body ? body : "{}")),
@@ -625,7 +640,11 @@ void DirectCloudSource::service(uint32_t nowMs) {
 BambuCloud::BambuCloud(SecureNetworkCoordinator& coordinator)
     : coordinator_(coordinator), mutex_(nullptr), operationMutex_(nullptr),
       credentialTx_(credentialSlots_),
-      operationDeadlineMs_(0), mqttClient_(nullptr), mqttLeaseHeld_(false),
+      operationDeadlineMs_(0), nextRefreshAttemptMs_(0),
+      lastSuccessfulRefreshMs_(0), refreshFailureCount_(0),
+      refreshRetryScheduled_(false), refreshCandidatePending_(false),
+      activeCredentialBlocked_(false),
+      mqttClient_(nullptr), mqttLeaseHeld_(false),
       mqttUsingCandidate_(false), initialized_(false) {
   bambuSecureZero(&request_, sizeof(request_));
   bambuSecureZero(&pendingAuth_, sizeof(pendingAuth_));
@@ -640,10 +659,23 @@ bool BambuCloud::begin() {
   if (!loadCredentials()) return false;
   BambuCloudCredential active;
   const bool hasActive = credentialTx_.active(active);
+  const bool recoveryMatchesActive =
+      hasActive && bambuRefreshRecoveryMatches(refreshRecovery_,
+                                               active.accountUid);
+  if (bambuRefreshRecoveryValid(refreshRecovery_) &&
+      !recoveryMatchesActive) {
+    clearRefreshRecovery();
+  }
   xSemaphoreTake(mutex_, portMAX_DELAY);
   status_.hasActiveCredential = hasActive;
   status_.candidatePending = false;
   status_.phase = hasActive ? BAMBU_AUTH_CONNECTING : BAMBU_AUTH_SIGNED_OUT;
+  if (recoveryMatchesActive) {
+    // The previous refresh reached the Cloud but did not complete local
+    // promotion. Resume it immediately instead of waiting for active expiry.
+    refreshRetryScheduled_ = true;
+    nextRefreshAttemptMs_ = millis();
+  }
   xSemaphoreGive(mutex_);
   source_.configure(hasActive, hasActive ? "Direct Cloud ждёт MQTT" : "Direct Cloud не настроен");
   bambuSecureZero(&active, sizeof(active));
@@ -735,19 +767,6 @@ bool BambuCloud::selectPrinter(const char* operationId, const char* serial) {
   return true;
 }
 
-bool BambuCloud::requestRefresh() {
-  if (!initialized_) return false;
-  xSemaphoreTake(mutex_, portMAX_DELAY);
-  if (request_.action != ACTION_NONE || !status_.hasActiveCredential) {
-    xSemaphoreGive(mutex_);
-    return false;
-  }
-  request_.action = ACTION_REFRESH;
-  status_.phase = BAMBU_AUTH_CONNECTING;
-  xSemaphoreGive(mutex_);
-  return true;
-}
-
 bool BambuCloud::logout() {
   if (!initialized_) return false;
   xSemaphoreTake(mutex_, portMAX_DELAY);
@@ -769,8 +788,84 @@ BambuCloudPublicStatus BambuCloud::publicStatus() const {
     copy.operationExpiresIn = 0;
   copy.rejectedReports = source_.rejectedReports();
   copy.maximumReportBytes = source_.maximumReportBytes();
+  if (refreshRetryScheduled_ &&
+      !bambuRefreshDeadlineReached(millis(), nextRefreshAttemptMs_)) {
+    copy.nextRefreshAttemptIn =
+        static_cast<uint32_t>(nextRefreshAttemptMs_ - millis()) / 1000UL;
+  } else {
+    copy.nextRefreshAttemptIn = 0;
+  }
   xSemaphoreGive(mutex_);
   return copy;
+}
+
+void BambuCloud::noteRefreshFailure() {
+  xSemaphoreTake(mutex_, portMAX_DELAY);
+  if (refreshFailureCount_ < 255) ++refreshFailureCount_;
+  refreshRetryScheduled_ = true;
+  nextRefreshAttemptMs_ =
+      millis() + bambuRefreshRetryDelayMs(refreshFailureCount_);
+  status_.automaticRefreshFailures = refreshFailureCount_;
+  status_.automaticRefreshPending = false;
+  xSemaphoreGive(mutex_);
+}
+
+void BambuCloud::noteRefreshSuccess(bool refreshed) {
+  xSemaphoreTake(mutex_, portMAX_DELAY);
+  refreshFailureCount_ = 0;
+  refreshRetryScheduled_ = false;
+  nextRefreshAttemptMs_ = 0;
+  lastSuccessfulRefreshMs_ = refreshed ? millis() : 0;
+  activeCredentialBlocked_ = false;
+  status_.automaticRefreshFailures = 0;
+  status_.automaticRefreshPending = false;
+  xSemaphoreGive(mutex_);
+}
+
+void BambuCloud::maybeScheduleAutomaticRefresh() {
+  if (credentialTx_.hasCandidate()) return;
+  xSemaphoreTake(mutex_, portMAX_DELAY);
+  const bool phaseAllowsRefresh =
+      status_.phase == BAMBU_AUTH_CONNECTING ||
+      status_.phase == BAMBU_AUTH_READY ||
+      status_.phase == BAMBU_AUTH_RECOVERABLE_ERROR;
+  const bool canSchedule = request_.action == ACTION_NONE &&
+                           status_.hasActiveCredential && phaseAllowsRefresh;
+  const bool retryScheduled = refreshRetryScheduled_;
+  const uint32_t nextAttempt = nextRefreshAttemptMs_;
+  const uint32_t lastSuccess = lastSuccessfulRefreshMs_;
+  xSemaphoreGive(mutex_);
+  if (!canSchedule) return;
+
+  BambuCloudCredential active;
+  if (!credentialTx_.active(active)) return;
+  const PrinterStateSnapshot printer = source_.snapshot();
+  const auto lifecycleIsBusy = [](PrinterLifecycle lifecycle) {
+    return lifecycle == PRINTER_PREPARING || lifecycle == PRINTER_PRINTING ||
+           lifecycle == PRINTER_PAUSED;
+  };
+  BambuRefreshPolicyInput input;
+  input.nowEpoch = static_cast<uint32_t>(time(nullptr));
+  input.uptimeMs = millis();
+  input.accessExpiresAt = active.accessExpiresAt;
+  input.refreshExpiresAt = active.refreshExpiresAt;
+  input.lastSuccessfulRefreshMs = lastSuccess;
+  input.nextAttemptMs = nextAttempt;
+  input.retryScheduled = retryScheduled;
+  input.printerBusy = lifecycleIsBusy(printer.lifecycle) ||
+                      lifecycleIsBusy(printer.visibleLifecycle);
+  const BambuRefreshDecision decision = bambuRefreshDecision(input);
+  bambuSecureZero(&active, sizeof(active));
+  if (decision == BAMBU_REFRESH_WAIT) return;
+
+  xSemaphoreTake(mutex_, portMAX_DELAY);
+  if (request_.action == ACTION_NONE && status_.hasActiveCredential &&
+      !credentialTx_.hasCandidate()) {
+    request_.action = ACTION_REFRESH;
+    status_.phase = BAMBU_AUTH_CONNECTING;
+    status_.automaticRefreshPending = true;
+  }
+  xSemaphoreGive(mutex_);
 }
 
 void BambuCloud::clearPendingRequest() {
@@ -806,12 +901,16 @@ void BambuCloud::service(bool wifiAvailable, bool otaActive) {
   const bool expired = operationExpired();
   if (credentialTx_.hasCandidate() &&
       (candidateTransportFailed_.exchange(false) || expired)) {
+    const bool refreshFailed = refreshCandidatePending_;
     stopMqtt();
     credentialTx_.rollback();
     removeCandidateFromNvs();
     mqttUsingCandidate_.store(false);
+    refreshCandidatePending_ = false;
+    if (refreshFailed) noteRefreshFailure();
     clearPendingAuth();
-    fail(expired ? "candidate_report_timeout" : "candidate_mqtt_failed");
+    fail(refreshFailed ? "auto_refresh_retry" :
+         (expired ? "candidate_report_timeout" : "candidate_mqtt_failed"));
   } else if (expired) {
     xSemaphoreTake(mutex_, portMAX_DELAY);
     const bool expirable = status_.phase != BAMBU_AUTH_SIGNED_OUT &&
@@ -831,6 +930,24 @@ void BambuCloud::service(bool wifiAvailable, bool otaActive) {
     if (mqttClient_) stopMqtt();
     return;
   }
+
+  if (activeCredentialRejected_.exchange(false)) {
+    stopMqtt();
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    activeCredentialBlocked_ = true;
+    const bool retryDue = !refreshRetryScheduled_ ||
+                          bambuRefreshDeadlineReached(
+                              millis(), nextRefreshAttemptMs_);
+    if (retryDue && request_.action == ACTION_NONE &&
+        status_.hasActiveCredential && !credentialTx_.hasCandidate()) {
+      request_.action = ACTION_REFRESH;
+      status_.phase = BAMBU_AUTH_CONNECTING;
+      status_.automaticRefreshPending = true;
+    }
+    xSemaphoreGive(mutex_);
+  }
+
+  maybeScheduleAutomaticRefresh();
 
   PendingRequest request;
   bambuSecureZero(&request, sizeof(request));
@@ -861,6 +978,10 @@ void BambuCloud::service(bool wifiAvailable, bool otaActive) {
       mqttUsingCandidate_.store(false);
     }
     if (mayConnect && available && coordinator_.available()) {
+      if (!candidate && activeCredentialBlocked_) {
+        bambuSecureZero(&credential, sizeof(credential));
+        return;
+      }
       source_.resetValidation();
       if (!startMqtt(credential)) {
         if (candidate) candidateTransportFailed_.store(true);
@@ -1102,6 +1223,7 @@ bool BambuCloud::discoverAccountAndPrinters(char* error, size_t errorSize) {
 }
 
 void BambuCloud::processSelection(PendingRequest& request) {
+  refreshCandidatePending_ = false;
   BambuCloudCredential candidate;
   if (!bambuCredentialSet(candidate, pendingAuth_.uid, request.serial,
                           pendingAuth_.accessToken, pendingAuth_.refreshToken,
@@ -1132,11 +1254,20 @@ void BambuCloud::processSelection(PendingRequest& request) {
 }
 
 void BambuCloud::processRefresh() {
+  refreshCandidatePending_ = false;
   BambuCloudCredential active;
-  if (!credentialTx_.active(active)) { fail("no_active_credential"); return; }
+  if (!credentialTx_.active(active)) {
+    noteRefreshFailure();
+    fail("no_active_credential");
+    return;
+  }
   stopMqtt();
+  const char* postedRefreshToken =
+      bambuRefreshRecoveryMatches(refreshRecovery_, active.accountUid)
+          ? refreshRecovery_.refreshToken
+          : active.refreshToken;
   JsonDocument requestDoc;
-  requestDoc["refreshToken"] = active.refreshToken;
+  requestDoc["refreshToken"] = postedRefreshToken;
   char body[768];
   serializeJson(requestDoc, body, sizeof(body));
   char* refreshInDocument =
@@ -1158,13 +1289,33 @@ void BambuCloud::processRefresh() {
     JsonVariantConst data = responseData(response);
     const char* access = firstString(data, "accessToken", "access_token");
     const char* refresh = firstString(data, "refreshToken", "refresh_token");
+    const char* nextRefreshToken = refresh[0] ? refresh : postedRefreshToken;
+    const uint32_t accessLifetime = data["expiresIn"] | 0;
+    const uint32_t refreshLifetime = data["refreshExpiresIn"] | 0;
+    const uint32_t accessExpiresAt = expiryTimestamp(
+        accessLifetime ? accessLifetime : kFallbackTokenLifetimeSeconds);
+    uint32_t refreshExpiresAt = refreshLifetime
+                                    ? expiryTimestamp(refreshLifetime)
+                                    : active.refreshExpiresAt;
+    const time_t now = time(nullptr);
+    if (!refreshExpiresAt ||
+        (now >= static_cast<time_t>(BAMBU_REFRESH_VALID_EPOCH) &&
+         refreshExpiresAt <= static_cast<uint32_t>(now))) {
+      refreshExpiresAt = expiryTimestamp(kFallbackTokenLifetimeSeconds);
+    }
     ok = bambuBuildRefreshCandidate(
-        active, access, refresh, expiryTimestamp(data["expiresIn"] | 0),
-        expiryTimestamp(data["refreshExpiresIn"] | 0), candidate);
+        active, access, nextRefreshToken, accessExpiresAt, refreshExpiresAt,
+        candidate);
+    if (ok) {
+      ok = persistRefreshRecovery(active.accountUid, nextRefreshToken);
+    }
     if (access[0]) bambuSecureZero(const_cast<char*>(access), strlen(access));
     if (refresh[0]) bambuSecureZero(const_cast<char*>(refresh), strlen(refresh));
   }
-  if (ok) ok = credentialTx_.begin(candidate) && persistCandidate();
+  if (ok) {
+    ok = credentialTx_.begin(candidate) && persistCandidate();
+    refreshCandidatePending_ = ok;
+  }
   if (ok) {
     source_.resetValidation();
     mqttUsingCandidate_ = true;
@@ -1176,9 +1327,14 @@ void BambuCloud::processRefresh() {
     credentialTx_.rollback();
     removeCandidateFromNvs();
     mqttUsingCandidate_ = false;
+    refreshCandidatePending_ = false;
     source_.resetValidation();
-    startMqtt(active);
-    fail(error[0] ? error : "refresh_rollback");
+    if (!activeCredentialBlocked_) startMqtt(active);
+    noteRefreshFailure();
+    const bool rejected = strcmp(error, "http_400") == 0 ||
+                          strcmp(error, "http_401") == 0 ||
+                          strcmp(error, "http_403") == 0;
+    fail(rejected ? "auto_refresh_rejected" : "auto_refresh_retry");
   }
   bambuSecureZero(&candidate, sizeof(candidate));
   bambuSecureZero(&active, sizeof(active));
@@ -1187,12 +1343,21 @@ void BambuCloud::processRefresh() {
 void BambuCloud::processLogout() {
   stopMqtt();
   credentialTx_.logout();
+  bambuSecureZero(&refreshRecovery_, sizeof(refreshRecovery_));
   eraseCredentialNvs();
   clearPendingAuth();
   xSemaphoreTake(mutex_, portMAX_DELAY);
   bambuSecureZero(&status_, sizeof(status_));
   status_.phase = BAMBU_AUTH_SIGNED_OUT;
+  status_.automaticRefreshFailures = 0;
+  status_.automaticRefreshPending = false;
   operationDeadlineMs_ = 0;
+  nextRefreshAttemptMs_ = 0;
+  lastSuccessfulRefreshMs_ = 0;
+  refreshFailureCount_ = 0;
+  refreshRetryScheduled_ = false;
+  refreshCandidatePending_ = false;
+  activeCredentialBlocked_ = false;
   xSemaphoreGive(mutex_);
   source_.configure(false, "Direct Cloud не настроен");
 }
@@ -1316,6 +1481,14 @@ void BambuCloud::handleMqttEvent(esp_mqtt_event_handle_t event) {
     if (mqttUsingCandidate_.load() && !mqttStopping_.load() &&
         !source_.firstValidReport())
       candidateTransportFailed_.store(true);
+    else if (!mqttStopping_.load() && event->error_handle &&
+             event->error_handle->error_type ==
+                 MQTT_ERROR_TYPE_CONNECTION_REFUSED &&
+             (event->error_handle->connect_return_code ==
+                  MQTT_CONNECTION_REFUSE_BAD_USERNAME ||
+              event->error_handle->connect_return_code ==
+                  MQTT_CONNECTION_REFUSE_NOT_AUTHORIZED))
+      activeCredentialRejected_.store(true);
   } else if (event->event_id == MQTT_EVENT_DATA) {
     source_.acceptFragment(event->data, event->data_len,
                            event->current_data_offset, event->total_data_len,
@@ -1329,15 +1502,29 @@ void BambuCloud::handleMqttEvent(esp_mqtt_event_handle_t event) {
 void BambuCloud::finalizeCandidateIfValidated() {
   if (!source_.firstValidReport()) return;
   if (credentialTx_.hasCandidate()) {
-    if (!persistPromotion()) {
+    const BambuCloudCredential* validated = credentialTx_.candidate();
+    // Replace any recovery token from an older account before committing a
+    // newly validated login. If removal later fails, reboot still sees a token
+    // that belongs to the newly promoted active credential.
+    const bool recoveryReady =
+        validated && persistRefreshRecovery(validated->accountUid,
+                                             validated->refreshToken);
+    if (!recoveryReady || !persistPromotion()) {
+      const bool refreshFailed = refreshCandidatePending_;
       stopMqtt();
       credentialTx_.rollback();
       removeCandidateFromNvs();
       mqttUsingCandidate_.store(false);
+      refreshCandidatePending_ = false;
+      if (refreshFailed) noteRefreshFailure();
       clearPendingAuth();
-      fail("candidate_commit_failed");
+      fail(refreshFailed ? "auto_refresh_retry" : "candidate_commit_failed");
       return;
     }
+    const bool refreshSucceeded = refreshCandidatePending_;
+    refreshCandidatePending_ = false;
+    clearRefreshRecovery();
+    noteRefreshSuccess(refreshSucceeded);
     mqttUsingCandidate_ = false;
     clearPendingAuth();
     xSemaphoreTake(mutex_, portMAX_DELAY);
@@ -1371,6 +1558,17 @@ bool BambuCloud::loadCredentials() {
     credentialTx_.recover();
     store.remove("candidate");
   }
+  if (store.getBytesLength(kRefreshRecoveryNvsKey) ==
+          sizeof(BambuRefreshRecovery) &&
+      store.getBytes(kRefreshRecoveryNvsKey, &refreshRecovery_,
+                     sizeof(refreshRecovery_)) == sizeof(refreshRecovery_) &&
+      bambuRefreshRecoveryValid(refreshRecovery_)) {
+    // A valid recovery token takes precedence over the active credential until
+    // a refreshed candidate is promoted.
+  } else {
+    bambuSecureZero(&refreshRecovery_, sizeof(refreshRecovery_));
+    store.remove(kRefreshRecoveryNvsKey);
+  }
   store.end();
   return true;
 }
@@ -1403,6 +1601,40 @@ bool BambuCloud::persistPromotion() {
   }
   store.end();
   return ok;
+}
+
+bool BambuCloud::persistRefreshRecovery(const char* accountUid,
+                                        const char* refreshToken) {
+  if (bambuRefreshRecoveryMatches(refreshRecovery_, accountUid) &&
+      refreshToken &&
+      strcmp(refreshRecovery_.refreshToken, refreshToken) == 0) {
+    return true;
+  }
+  BambuRefreshRecovery candidate;
+  if (!bambuRefreshRecoverySet(candidate, accountUid, refreshToken)) {
+    return false;
+  }
+  Preferences store;
+  if (!store.begin("bambucloud", false)) {
+    bambuSecureZero(&candidate, sizeof(candidate));
+    return false;
+  }
+  const bool ok =
+      store.putBytes(kRefreshRecoveryNvsKey, &candidate, sizeof(candidate)) ==
+      sizeof(candidate);
+  store.end();
+  if (ok) refreshRecovery_ = candidate;
+  bambuSecureZero(&candidate, sizeof(candidate));
+  return ok;
+}
+
+void BambuCloud::clearRefreshRecovery() {
+  Preferences store;
+  if (store.begin("bambucloud", false)) {
+    store.remove(kRefreshRecoveryNvsKey);
+    store.end();
+  }
+  bambuSecureZero(&refreshRecovery_, sizeof(refreshRecovery_));
 }
 
 void BambuCloud::removeCandidateFromNvs() {

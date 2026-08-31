@@ -6,6 +6,8 @@
 
 static constexpr uint32_t BAMBU_CREDENTIAL_MAGIC = 0x42434C44UL;  // BCLD
 static constexpr uint16_t BAMBU_CREDENTIAL_VERSION = 1;
+static constexpr uint32_t BAMBU_REFRESH_RECOVERY_MAGIC = 0x42525246UL;  // BRRF
+static constexpr uint16_t BAMBU_REFRESH_RECOVERY_VERSION = 1;
 static constexpr size_t BAMBU_CLOUD_UID_CAPACITY = 40;
 static constexpr size_t BAMBU_CLOUD_SERIAL_CAPACITY = 40;
 static constexpr size_t BAMBU_CLOUD_TOKEN_CAPACITY = 512;
@@ -40,6 +42,66 @@ struct BambuCloudCredential {
 
   BambuCloudCredential() { bambuSecureZero(this, sizeof(*this)); }
 };
+
+// The Cloud may invalidate the posted refresh token as soon as it returns a
+// rotated one. Keep that newest token independently from the active/candidate
+// credential transaction so a reboot or failed MQTT validation can retry
+// without falling back to an already invalidated token.
+struct BambuRefreshRecovery {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t size;
+  char accountUid[BAMBU_CLOUD_UID_CAPACITY];
+  char refreshToken[BAMBU_CLOUD_TOKEN_CAPACITY];
+  uint32_t checksum;
+
+  BambuRefreshRecovery() { bambuSecureZero(this, sizeof(*this)); }
+};
+
+inline uint32_t bambuRefreshRecoveryChecksum(
+    const BambuRefreshRecovery& value) {
+  return bambuCredentialChecksumBytes(
+      reinterpret_cast<const uint8_t*>(&value),
+      offsetof(BambuRefreshRecovery, checksum));
+}
+
+inline bool bambuRefreshRecoverySet(BambuRefreshRecovery& value,
+                                    const char* accountUid,
+                                    const char* refreshToken) {
+  BambuRefreshRecovery candidate;
+  if (!accountUid || !refreshToken) return false;
+  const size_t uidLength = strlen(accountUid);
+  const size_t tokenLength = strlen(refreshToken);
+  if (uidLength == 0 || uidLength >= sizeof(candidate.accountUid) ||
+      tokenLength == 0 || tokenLength >= sizeof(candidate.refreshToken)) {
+    bambuSecureZero(&candidate, sizeof(candidate));
+    return false;
+  }
+  memcpy(candidate.accountUid, accountUid, uidLength + 1);
+  memcpy(candidate.refreshToken, refreshToken, tokenLength + 1);
+  candidate.magic = BAMBU_REFRESH_RECOVERY_MAGIC;
+  candidate.version = BAMBU_REFRESH_RECOVERY_VERSION;
+  candidate.size = sizeof(BambuRefreshRecovery);
+  candidate.checksum = bambuRefreshRecoveryChecksum(candidate);
+  value = candidate;
+  bambuSecureZero(&candidate, sizeof(candidate));
+  return true;
+}
+
+inline bool bambuRefreshRecoveryValid(const BambuRefreshRecovery& value) {
+  return value.magic == BAMBU_REFRESH_RECOVERY_MAGIC &&
+         value.version == BAMBU_REFRESH_RECOVERY_VERSION &&
+         value.size == sizeof(BambuRefreshRecovery) &&
+         value.accountUid[0] != '\0' &&
+         value.refreshToken[0] != '\0' &&
+         value.checksum == bambuRefreshRecoveryChecksum(value);
+}
+
+inline bool bambuRefreshRecoveryMatches(const BambuRefreshRecovery& value,
+                                        const char* accountUid) {
+  return bambuRefreshRecoveryValid(value) && accountUid && accountUid[0] &&
+         strcmp(value.accountUid, accountUid) == 0;
+}
 
 inline uint32_t bambuCredentialChecksum(const BambuCloudCredential& value) {
   return bambuCredentialChecksumBytes(

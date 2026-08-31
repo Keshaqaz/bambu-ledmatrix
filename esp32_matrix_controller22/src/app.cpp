@@ -88,7 +88,6 @@ void handleBambuAuthVerify();
 void handleBambuPrinters();
 void handleBambuPrinterSelect();
 void handleBambuLogout();
-void handleBambuRefresh();
 void handleUpdateUpload();
 void handleUpdateFinal();
 void showBoot();
@@ -109,7 +108,7 @@ void loop();
 static constexpr uint16_t CONFIG_VERSION = 332;
 // Версия прошивки: поднимать при каждой OTA-итерации — по смене значения в
 // /api/status видно, что обновление реально применилось.
-static constexpr const char* FW_VERSION = "4.2.1-2026.08.28";
+static constexpr const char* FW_VERSION = "4.2.2-2026.08.31";
 static constexpr uint32_t STORED_STATE_MAGIC = 0x4D415458UL; // MATX
 static constexpr uint16_t STORED_STATE_VERSION = 2;
 static constexpr size_t BAMBU_TOKEN_CAPACITY = 384;
@@ -2435,6 +2434,9 @@ static void appendBambuCloudStatus(JsonDocument& doc,
   doc["mqttReconnectCount"] = status.mqttReconnectCount;
   doc["rejectedReports"] = status.rejectedReports;
   doc["maximumReportBytes"] = status.maximumReportBytes;
+  doc["automaticRefreshPending"] = status.automaticRefreshPending;
+  doc["automaticRefreshFailures"] = status.automaticRefreshFailures;
+  doc["nextRefreshAttemptIn"] = status.nextRefreshAttemptIn;
   if (includePrinters) {
     JsonArray printers = doc["printers"].to<JsonArray>();
     for (uint8_t i = 0; i < status.printerCount; ++i) {
@@ -2531,16 +2533,6 @@ void handleBambuLogout() {
   if (!checkMutationAuth()) { server.send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
   if (!bambuCloud.logout()) {
     server.send(409, "application/json", "{\"error\":\"cloud_busy\"}");
-    return;
-  }
-  wakeBambuTask();
-  server.send(202, "application/json", "{\"accepted\":true}");
-}
-
-void handleBambuRefresh() {
-  if (!checkMutationAuth()) { server.send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
-  if (!bambuCloud.requestRefresh()) {
-    server.send(409, "application/json", "{\"error\":\"cloud_not_ready\"}");
     return;
   }
   wakeBambuTask();
@@ -2822,6 +2814,9 @@ void handleStatus() {
     cloud["mqttReconnectCount"] = cloudStatus.mqttReconnectCount;
     cloud["rejectedReports"] = cloudStatus.rejectedReports;
     cloud["maximumReportBytes"] = cloudStatus.maximumReportBytes;
+    cloud["automaticRefreshPending"] = cloudStatus.automaticRefreshPending;
+    cloud["automaticRefreshFailures"] = cloudStatus.automaticRefreshFailures;
+    cloud["nextRefreshAttemptIn"] = cloudStatus.nextRefreshAttemptIn;
     PrinterStateSnapshot direct = bambuCloud.source().snapshot();
     JsonObject snapshot = cloud["snapshot"].to<JsonObject>();
     snapshot["configured"] = direct.configured;
@@ -3628,7 +3623,6 @@ void setup() {
   server.on("/api/bambu/printers",       HTTP_GET,  handleBambuPrinters);
   server.on("/api/bambu/printer/select", HTTP_POST, handleBambuPrinterSelect);
   server.on("/api/bambu/logout",         HTTP_POST, handleBambuLogout);
-  server.on("/api/bambu/refresh",        HTTP_POST, handleBambuRefresh);
   server.on("/api/settings",  HTTP_GET,  handleGetSettings);
   server.on("/api/settings",  HTTP_POST, handlePostSettings);
   server.on("/api/status",    HTTP_GET,  handleStatus);

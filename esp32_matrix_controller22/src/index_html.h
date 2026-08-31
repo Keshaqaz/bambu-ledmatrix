@@ -374,8 +374,9 @@ details .dbody{padding:2px 13px 13px}
       <div id="bcPrinterList"></div>
     </div>
     <div class="hide" id="bcReady">
-      <div class="banner ok"><span><b>Direct Cloud готов.</b> Snapshot доступен в диагностике; отображение остаётся на relay до T05.</span></div>
-      <div class="g2"><button class="btn2" onclick="bambuCloudRefresh()">Проверить refresh</button><button class="btn2 btn-danger" onclick="bambuCloudLogout()">Выйти из Bambu</button></div>
+      <div class="banner ok"><span><b>Direct Cloud готов.</b> Доступ продлевается автоматически; отображение остаётся на relay до T05.</span></div>
+      <div class="hint" id="bcRefreshState">Токены обновляются автоматически.</div>
+      <button class="btn2 btn-danger" onclick="bambuCloudLogout()">Выйти из Bambu</button>
     </div>
   </div>
 
@@ -498,7 +499,6 @@ async function apiFetch(url,opts={}){const headers=new Headers(opts.headers||{})
     if(url==='/api/bambu/auth/verify'&&method==='POST')return mockJson({accepted:true},202);
     if(url==='/api/bambu/printer/select'&&method==='POST'){mockBambuAuth={state:'ready',operationId:'',operationExpiresIn:0,error:'',configured:true,candidatePending:false,printers:[]};return mockJson({accepted:true},202);}
     if(url==='/api/bambu/logout'&&method==='POST'){mockBambuAuth={state:'signed_out',operationId:'',operationExpiresIn:0,error:'',configured:false,candidatePending:false,printers:[]};return mockJson({accepted:true},202);}
-    if(url==='/api/bambu/refresh'&&method==='POST')return mockJson({accepted:true},202);
     if((url==='/api/reboot'||url==='/api/weather/refresh')&&method==='POST')return mockJson({ok:true});
   }
   if(!['GET','HEAD','OPTIONS'].includes(method)&&csrfToken)headers.set('X-CSRF-Token',csrfToken);
@@ -635,7 +635,7 @@ function updPrinter(d){
 
 let bambuOperationId='';
 const BAMBU_STATE_TEXT={signed_out:'Не настроен',submitting_credentials:'Проверка входа…',verification_required_email:'Нужен код email',verification_required_sms:'Нужен код SMS',verification_required_totp:'Нужен TOTP',fetching_printers:'Получаем принтеры…',printer_selection_required:'Выберите принтер',connecting:'Подключаем MQTT…',ready:'Готово',recoverable_error:'Можно повторить'};
-const BAMBU_ERRORS={invalid_credentials:'Неверный аккаунт или пароль.',operation_expired:'Попытка входа истекла — начните снова.',token_envelope_incomplete:'Cloud не вернул полный credential envelope.',tfa_session_cookie_missing:'TOTP подтверждён, но Cloud не создал сессию; active запись не изменена.',tfa_token_envelope_incomplete:'Cloud-сессия не вернула полный credential envelope; active запись не изменена.',account_identity_missing:'Не удалось подтвердить идентификатор аккаунта.',no_printers:'В аккаунте не найдено принтеров.',candidate_save_failed:'Candidate не сохранён; прежняя active запись не изменена.',candidate_mqtt_failed:'Candidate не прошёл MQTT-проверку; выполнен rollback.',candidate_report_timeout:'Принтер не прислал валидный report вовремя; выполнен rollback.',candidate_commit_failed:'Первый report получен, но commit не завершён.',refresh_rollback:'Refresh не прошёл; восстановлена прежняя active запись.',tls_busy:'Защищённая сеть занята — повторите позже.'};
+const BAMBU_ERRORS={invalid_credentials:'Неверный аккаунт или пароль.',operation_expired:'Попытка входа истекла — начните снова.',token_envelope_incomplete:'Cloud не вернул полный credential envelope.',tfa_session_cookie_missing:'TOTP подтверждён, но Cloud не создал сессию; active запись не изменена.',tfa_token_envelope_incomplete:'Cloud-сессия не вернула полный credential envelope; active запись не изменена.',account_identity_missing:'Не удалось подтвердить идентификатор аккаунта.',no_printers:'В аккаунте не найдено принтеров.',candidate_save_failed:'Candidate не сохранён; прежняя active запись не изменена.',candidate_mqtt_failed:'Candidate не прошёл MQTT-проверку; выполнен rollback.',candidate_report_timeout:'Принтер не прислал валидный report вовремя; выполнен rollback.',candidate_commit_failed:'Первый report получен, но commit не завершён.',auto_refresh_retry:'Автообновление временно не прошло; устройство повторит его само.',auto_refresh_rejected:'Cloud отклонил refresh credential; автоматические повторы продолжатся.',tls_busy:'Защищённая сеть занята — повторите позже.'};
 function renderBambuAuth(d){
   bambuOperationId=d.operationId||bambuOperationId;
   const state=d.state||'signed_out',configured=!!d.configured;
@@ -650,6 +650,7 @@ function renderBambuAuth(d){
   if(verify)g('bcVerifyLabel').textContent=state.endsWith('totp')?'Код из приложения-аутентификатора':(state.endsWith('sms')?'Код из SMS':'Код из email');
   const err=d.error?(BAMBU_ERRORS[d.error]||'Операция не завершена; можно безопасно повторить.') : '';
   g('bcHint').textContent=err||(state==='ready'?'Direct snapshot получен. Матрица остаётся на relay до T05.':(BAMBU_STATE_TEXT[state]||'Direct Cloud'));
+  const refreshState=g('bcRefreshState');if(refreshState)refreshState.textContent=d.automaticRefreshPending?'Автоматическое обновление выполняется…':d.automaticRefreshFailures?('Следующая автоматическая попытка через '+Math.max(1,Math.ceil((d.nextRefreshAttemptIn||0)/60))+' мин.'):'Токены обновляются автоматически.';
   if(state==='printer_selection_required'){
     const list=g('bcPrinterList');list.innerHTML='';
     (d.printers||[]).forEach(p=>{const b=document.createElement('button');b.className='btn2';b.style.marginBottom='7px';b.textContent=(p.name||'Bambu printer')+' · '+(p.serial||'');b.onclick=()=>bambuCloudSelect(p.serial);list.appendChild(b);});
@@ -671,7 +672,6 @@ async function bambuCloudSelect(serial){
   catch(e){toast('Выбор принтера не принят');}}
 async function bambuCloudLogout(){if(!confirm('Удалить Direct Cloud credentials с устройства? Relay останется без изменений.'))return;
   try{const r=await apiFetch('/api/bambu/logout',{method:'POST',body:'{}'});if(!r.ok)throw new Error('logout');bambuOperationId='';toast('Cloud credentials удаляются');setTimeout(fetchBambuAuth,400);}catch(e){toast('Cloud занят — повторите позже');}}
-async function bambuCloudRefresh(){try{const r=await apiFetch('/api/bambu/refresh',{method:'POST',body:'{}'});if(!r.ok)throw new Error('refresh');toast('Refresh запущен с rollback');setTimeout(fetchBambuAuth,400);}catch(e){toast('Refresh сейчас недоступен');}}
 
 /* ── система: время ── */
 function onTzAuto(){g('tzManualWrap').classList.toggle('hide',g('tzAuto').checked);updTzHint();}
