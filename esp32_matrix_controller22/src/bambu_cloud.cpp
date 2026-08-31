@@ -3,6 +3,7 @@
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <esp_tls_errors.h>
 #include <stdlib.h>
 #include <strings.h>
 #include <time.h>
@@ -645,7 +646,7 @@ BambuCloud::BambuCloud(SecureNetworkCoordinator& coordinator)
       refreshRetryScheduled_(false), refreshCandidatePending_(false),
       activeCredentialBlocked_(false),
       mqttClient_(nullptr), mqttLeaseHeld_(false),
-      mqttUsingCandidate_(false), initialized_(false) {
+      mqttUsingCandidate_(false), initialized_(false), wifiWasAvailable_(false) {
   bambuSecureZero(&request_, sizeof(request_));
   bambuSecureZero(&pendingAuth_, sizeof(pendingAuth_));
   bambuSecureZero(&status_, sizeof(status_));
@@ -788,6 +789,14 @@ BambuCloudPublicStatus BambuCloud::publicStatus() const {
     copy.operationExpiresIn = 0;
   copy.rejectedReports = source_.rejectedReports();
   copy.maximumReportBytes = source_.maximumReportBytes();
+  copy.recoveryReason = mqttRecovery_.reason();
+  copy.recoveryFailures = mqttRecovery_.failures();
+  const uint32_t mqttReserve = mqttTaskMinimumReserve_.load();
+  copy.mqttTaskStackReserve =
+      mqttReserve == UINT32_MAX ? 0 : mqttReserve;
+  if (mqttRecovery_.deadlineMs() && !mqttRecovery_.ready(millis()))
+    copy.nextRecoveryAttemptIn =
+        static_cast<uint32_t>(mqttRecovery_.deadlineMs() - millis()) / 1000UL;
   if (refreshRetryScheduled_ &&
       !bambuRefreshDeadlineReached(millis(), nextRefreshAttemptMs_)) {
     copy.nextRefreshAttemptIn =
@@ -800,6 +809,7 @@ BambuCloudPublicStatus BambuCloud::publicStatus() const {
 }
 
 void BambuCloud::noteRefreshFailure() {
+  mqttRecovery_.fail(RECOVERY_API, millis());
   xSemaphoreTake(mutex_, portMAX_DELAY);
   if (refreshFailureCount_ < 255) ++refreshFailureCount_;
   refreshRetryScheduled_ = true;
@@ -928,7 +938,18 @@ void BambuCloud::service(bool wifiAvailable, bool otaActive) {
   if (otaActive || externalTlsPaused_.load()) return;
   if (!wifiAvailable) {
     if (mqttClient_) stopMqtt();
+    if (wifiWasAvailable_) mqttRecovery_.fail(RECOVERY_WIFI, millis());
+    wifiWasAvailable_ = false;
     return;
+  }
+  if (!wifiWasAvailable_) {
+    wifiWasAvailable_ = true;
+    mqttRecovery_.reset();
+    activeTransportFailureReason_.store(RECOVERY_MQTT);
+  }
+
+  if (activeTransportFailed_.exchange(false)) {
+    stopMqtt();
   }
 
   if (activeCredentialRejected_.exchange(false)) {
@@ -977,7 +998,8 @@ void BambuCloud::service(bool wifiAvailable, bool otaActive) {
       available = credentialTx_.active(credential);
       mqttUsingCandidate_.store(false);
     }
-    if (mayConnect && available && coordinator_.available()) {
+    if (mayConnect && available && coordinator_.available() &&
+        mqttRecovery_.ready(millis())) {
       if (!candidate && activeCredentialBlocked_) {
         bambuSecureZero(&credential, sizeof(credential));
         return;
@@ -985,7 +1007,10 @@ void BambuCloud::service(bool wifiAvailable, bool otaActive) {
       source_.resetValidation();
       if (!startMqtt(credential)) {
         if (candidate) candidateTransportFailed_.store(true);
-        else fail("mqtt_start_failed");
+        else {
+          mqttRecovery_.fail(RECOVERY_MQTT, millis());
+          fail("mqtt_start_retry");
+        }
       }
     }
     bambuSecureZero(&credential, sizeof(credential));
@@ -1382,6 +1407,8 @@ bool BambuCloud::startMqtt(const BambuCloudCredential& credential) {
   config.credentials.authentication.password = credential.accessToken;
   config.session.keepalive = 5;
   config.network.timeout_ms = 12000;
+  config.network.reconnect_timeout_ms = 10000;
+  config.network.disable_auto_reconnect = true;
   mqttClient_ = esp_mqtt_client_init(&config);
   if (!mqttClient_) {
     coordinator_.release(SECURE_NETWORK_CLOUD_MQTT);
@@ -1429,11 +1456,20 @@ void BambuCloud::stopForOta() {
   stopMqtt();
 }
 
-void BambuCloud::pauseForExternalTls() {
-  externalTlsPaused_.store(true);
-  if (!operationMutex_) return;
+bool BambuCloud::pauseForExternalTls() {
+  if (!operationMutex_) return false;
   SemaphoreGuard operation(operationMutex_);
+  const PrinterStateSnapshot printer = source_.snapshot();
+  const bool activePrint = printer.lifecycle == PRINTER_PREPARING ||
+                           printer.lifecycle == PRINTER_PRINTING ||
+                           printer.lifecycle == PRINTER_PAUSED ||
+                           printer.visibleLifecycle == PRINTER_PREPARING ||
+                           printer.visibleLifecycle == PRINTER_PRINTING ||
+                           printer.visibleLifecycle == PRINTER_PAUSED;
+  if (mqttClient_ && activePrint) return false;
+  externalTlsPaused_.store(true);
   stopMqtt();
+  return true;
 }
 
 void BambuCloud::resumeAfterExternalTls() {
@@ -1448,6 +1484,11 @@ void BambuCloud::mqttEventThunk(void* handlerArgs, esp_event_base_t,
 
 void BambuCloud::handleMqttEvent(esp_mqtt_event_handle_t event) {
   if (!event) return;
+  const uint32_t reserve = uxTaskGetStackHighWaterMark(nullptr);
+  uint32_t previousReserve = mqttTaskMinimumReserve_.load();
+  while (reserve < previousReserve &&
+         !mqttTaskMinimumReserve_.compare_exchange_weak(previousReserve,
+                                                         reserve)) {}
   if (event->event_id == MQTT_EVENT_CONNECTED) {
     BambuCloudCredential credential;
     const BambuCloudCredential* candidate = credentialTx_.candidate();
@@ -1467,11 +1508,19 @@ void BambuCloud::handleMqttEvent(esp_mqtt_event_handle_t event) {
     xSemaphoreTake(mutex_, portMAX_DELAY);
     status_.mqttConnected = true;
     xSemaphoreGive(mutex_);
+    mqttRecovery_.reset();
+    activeTransportFailureReason_.store(RECOVERY_MQTT);
     source_.setTransportConnected(true, "MQTT подключен, ждём report");
   } else if (event->event_id == MQTT_EVENT_DISCONNECTED) {
     if (mqttUsingCandidate_.load() && !mqttStopping_.load() &&
         !source_.firstValidReport())
       candidateTransportFailed_.store(true);
+    else if (!mqttStopping_.load()) {
+      const RecoveryReason reason = static_cast<RecoveryReason>(
+          activeTransportFailureReason_.exchange(RECOVERY_MQTT));
+      mqttRecovery_.fail(reason, millis());
+      activeTransportFailed_.store(true);
+    }
     xSemaphoreTake(mutex_, portMAX_DELAY);
     status_.mqttConnected = false;
     status_.mqttReconnectCount++;
@@ -1489,6 +1538,15 @@ void BambuCloud::handleMqttEvent(esp_mqtt_event_handle_t event) {
               event->error_handle->connect_return_code ==
                   MQTT_CONNECTION_REFUSE_NOT_AUTHORIZED))
       activeCredentialRejected_.store(true);
+    else if (!mqttStopping_.load() && !mqttUsingCandidate_.load()) {
+      RecoveryReason reason = RECOVERY_MQTT;
+      if (event->error_handle &&
+          event->error_handle->esp_tls_last_esp_err ==
+              ESP_ERR_ESP_TLS_CANNOT_RESOLVE_HOSTNAME) {
+        reason = RECOVERY_DNS;
+      }
+      activeTransportFailureReason_.store(reason);
+    }
   } else if (event->event_id == MQTT_EVENT_DATA) {
     source_.acceptFragment(event->data, event->data_len,
                            event->current_data_offset, event->total_data_len,

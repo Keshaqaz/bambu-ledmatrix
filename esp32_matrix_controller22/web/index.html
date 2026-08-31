@@ -158,22 +158,9 @@ details .dbody{padding:2px 13px 13px}
   border:1px solid var(--accent);color:var(--text);padding:10px 18px;border-radius:11px;font-size:.79rem;
   opacity:0;transition:.3s;pointer-events:none;z-index:99;box-shadow:0 8px 24px rgba(0,0,0,.5)}
 .toast.show{opacity:1;transform:translateX(-50%)}
-.auth{position:fixed;inset:0;z-index:200;background:rgba(8,9,12,.96);display:flex;align-items:center;justify-content:center;padding:20px}
-.authbox{width:min(420px,100%);background:var(--card);border:1px solid var(--border2);border-radius:16px;padding:20px}
-.authbox h1{font-size:1rem;letter-spacing:.06em;margin-bottom:8px}.authbox .note{margin-bottom:14px}
 .dis{opacity:.4;pointer-events:none;transition:.2s}
 .hide{display:none!important}
 </style></head><body>
-
-<div class="auth hide" id="authGate">
-  <div class="authbox">
-    <h1 id="authTitle">Вход в LED Matrix</h1>
-    <div class="note" id="authHint">Введите пароль администратора.</div>
-    <div class="field"><label>Пароль администратора</label><input type="password" id="adminPass" autocomplete="current-password"></div>
-    <div class="note err hide" id="authError" style="margin-bottom:10px"></div>
-    <button class="btn" id="authBtn" onclick="submitAuth()">Войти</button>
-  </div>
-</div>
 
 <div class="shell">
 
@@ -354,7 +341,7 @@ details .dbody{padding:2px 13px 13px}
 
   <div class="card" id="bambuCloudCard">
     <div class="ch"><h2>Direct Cloud · shadow</h2><span class="pbadge idle" id="bcBadge">Не настроен</span></div>
-    <div class="note" id="bcHint" style="margin-bottom:12px">Войдите в Bambu Account. До этапа T05 матрица продолжает показывать проверенный relay snapshot.</div>
+    <div class="note" id="bcHint" style="margin-bottom:12px">Войдите в Bambu Account. Relay остаётся shadow и мгновенным rollback path.</div>
     <div class="banner warn" id="bcGoogleNote"><span>Аккаунт создан через Google? Один раз задайте Bambu-пароль через <a href="https://bambulab.com/en/sign-in" target="_blank" rel="noreferrer" style="color:inherit"><b>официальную страницу входа → Forgot password</b></a>, затем вернитесь сюда.</span></div>
     <div id="bcLogin">
       <div class="field"><label>Email или телефон Bambu Account</label><input type="text" id="bcEmail" autocomplete="username"></div>
@@ -372,15 +359,16 @@ details .dbody{padding:2px 13px 13px}
       <div id="bcPrinterList"></div>
     </div>
     <div class="hide" id="bcReady">
-      <div class="banner ok"><span><b>Direct Cloud готов.</b> Доступ продлевается автоматически; отображение остаётся на relay до T05.</span></div>
+      <div class="banner ok"><span><b>Direct Cloud готов.</b> Доступ продлевается автоматически; источник можно переключить без перезагрузки.</span></div>
       <div class="hint" id="bcRefreshState">Токены обновляются автоматически.</div>
       <button class="btn2 btn-danger" onclick="bambuCloudLogout()">Выйти из Bambu</button>
     </div>
   </div>
 
   <div class="card" id="bambuCfg">
-    <div class="ch"><h2>Relay · active renderer</h2></div>
-    <div class="note" style="margin-bottom:11px">Безопасный rollback path остаётся активным источником матрицы на всём T04.</div>
+    <div class="ch"><h2>Источник статуса</h2></div>
+    <div class="field"><label>Renderer source</label><select id="bambuSource" onchange="requestAutoSave(0)"><option value="relay">Relay</option><option value="cloud_direct">Direct Cloud</option></select></div>
+    <div class="note" style="margin-bottom:11px">Переключение применяется сразу. Relay продолжает опрашиваться для shadow comparison и ручного rollback.</div>
     <div class="field"><label>Relay URL</label><input type="text" id="bambuRelayUrl" placeholder="http://192.168.1.1:8787/status"></div>
     <div class="field"><label>Relay Key</label>
       <div class="pass"><input type="password" id="bambuRelayKey" data-clear="false" placeholder="Новый ключ (необязательно)" oninput="secretEdited('bambuRelayKey','rkeyState')"><span class="eye" onclick="eye('bambuRelayKey')">👁</span></div>
@@ -449,7 +437,6 @@ details .dbody{padding:2px 13px 13px}
   <div class="card">
     <div class="ch"><h2>Управление</h2></div>
     <button class="btn2 btn-danger" onclick="rebootDevice()">Перезагрузить устройство</button>
-    <button class="btn2" style="margin-top:8px" onclick="logoutSession()">Выйти из WebUI</button>
   </div>
 </div>
 
@@ -476,10 +463,10 @@ const PREVIEW_MODE=window.location.protocol==='file:';
 let st={rot:0,provider:0,locCoords:false,sunBySun:false};
 let connBusy=false,scanBusy=false,prevConnResult=0,toastTimer=0;
 let hydrating=false,autosaveReady=false,autosaveTimer=0,autosavePending=false,autosaveRunning=false,autosaveQueued=false,autosaveNoticeTimer=0,saveAwaitPersist=false;
-let csrfToken='',authProvisioned=true,appStarted=false;
+let appStarted=false;
 
 /* ── preview mode: моки для file:// ── */
-let mockConnResult=0,mockBambuAuth={state:'signed_out',operationId:'',operationExpiresIn:0,error:'',configured:false,candidatePending:false,printers:[]},mockSettings={brightness:80,autoColor:true,use24h:true,ntpServer:'pool.ntp.org',tzOffset:3,tzFromWeather:true,updateMin:10,weatherProvider:0,apiKeySet:true,city:'Moscow',owmLat:55.7558,owmLon:37.6173,owmUseCoords:false,rotation:0,flipH:false,flipV:false,autoBrightness:false,brightnessDay:80,brightnessNight:20,dayStartHour:7,nightStartHour:22,autoBrSunMode:false,ct6ClockX:0,ct6ClockY:2,ct6TempX:-1,ct6TempY:9,ct6ClockR:255,ct6ClockG:128,ct6ClockB:0,ct6TempR:0,ct6TempG:200,ct6TempB:255,bambuEnabled:true,bambuRelayUrl:'http://192.168.1.1:8787/status',bambuRelayKeySet:true,bambuConnected:true,bambuPrinterOnline:true,bambuLifecycle:3,bambuProgress:42,bambuDetail:'Preview: печать 42%',sunTimeValid:true,sunriseH:6,sunriseM:12,sunsetH:20,sunsetM:4};
+let mockConnResult=0,mockBambuAuth={state:'signed_out',operationId:'',operationExpiresIn:0,error:'',configured:false,candidatePending:false,printers:[]},mockSettings={brightness:80,autoColor:true,use24h:true,ntpServer:'pool.ntp.org',tzOffset:3,tzFromWeather:true,updateMin:10,weatherProvider:0,apiKeySet:true,city:'Moscow',owmLat:55.7558,owmLon:37.6173,owmUseCoords:false,rotation:0,flipH:false,flipV:false,autoBrightness:false,brightnessDay:80,brightnessNight:20,dayStartHour:7,nightStartHour:22,autoBrSunMode:false,ct6ClockX:0,ct6ClockY:2,ct6TempX:-1,ct6TempY:9,ct6ClockR:255,ct6ClockG:128,ct6ClockB:0,ct6TempR:0,ct6TempG:200,ct6TempB:255,bambuEnabled:true,bambuSource:'relay',bambuRelayUrl:'http://192.168.1.1:8787/status',bambuRelayKeySet:true,bambuConnected:true,bambuPrinterOnline:true,bambuLifecycle:3,bambuProgress:42,bambuDetail:'Preview: печать 42%',sunTimeValid:true,sunriseH:6,sunriseM:12,sunsetH:20,sunsetM:4};
 function mockJson(payload,status=200){return new Response(JSON.stringify(payload),{status,headers:{'Content-Type':'application/json'}});}
 function mockStatus(){return {wifi:true,ap:false,ssid:'Home WiFi',ip:'192.168.1.65',temp:23.4,cpuTemp:41.2,uptime:'3ч 14м',heap:'214 KB',heapInternalMinimum:128000,heapInternalLargest:92000,taskStackFree:{loop:6200,weather:4100,printer:3600,wifi:0},fwVersion:'preview',fwPartition:'app0',rssi:'-58 dBm',weatherSource:'owm',weatherError:'',weatherAgeSec:240,connResult:mockConnResult,connIp:mockConnResult===2?'192.168.1.88':'',connStatus:0,connStatusText:'',savePending:false,saveError:false,bambuEnabled:mockSettings.bambuEnabled,bambuConfigured:true,bambuConnected:true,bambuPrinterOnline:true,bambuLifecycle:3,bambuProgress:42,bambuDetail:mockSettings.bambuDetail,sunTimeValid:true,sunriseH:6,sunriseM:12,sunsetH:20,sunsetM:4};}
 async function apiFetch(url,opts={}){const headers=new Headers(opts.headers||{});if(opts.body!==undefined&&!headers.has('Content-Type'))headers.set('Content-Type','application/json');const method=(opts.method||'GET').toUpperCase();
@@ -499,25 +486,7 @@ async function apiFetch(url,opts={}){const headers=new Headers(opts.headers||{})
     if(url==='/api/bambu/logout'&&method==='POST'){mockBambuAuth={state:'signed_out',operationId:'',operationExpiresIn:0,error:'',configured:false,candidatePending:false,printers:[]};return mockJson({accepted:true},202);}
     if((url==='/api/reboot'||url==='/api/weather/refresh')&&method==='POST')return mockJson({ok:true});
   }
-  if(!['GET','HEAD','OPTIONS'].includes(method)&&csrfToken)headers.set('X-CSRF-Token',csrfToken);
-  const res=await fetch(url,Object.assign({},opts,{headers}));
-  if(res.status===401||res.status===403){showAuth(true);throw new Error('unauthorized');}
-  return res;}
-
-function showAuth(provisioned){authProvisioned=provisioned;g('authGate').classList.remove('hide');g('authError').classList.add('hide');
-  g('authTitle').textContent=provisioned?'Вход в LED Matrix':'Первичная настройка защиты';
-  g('authHint').textContent=provisioned?'Введите пароль администратора.':'Создайте пароль администратора (минимум 10 символов). Он не сохраняется в браузере.';
-  g('authBtn').textContent=provisioned?'Войти':'Защитить устройство';g('adminPass').autocomplete=provisioned?'current-password':'new-password';}
-async function submitAuth(){const password=g('adminPass').value,err=g('authError');err.classList.add('hide');
-  if(password.length<10){err.textContent='Минимум 10 символов';err.classList.remove('hide');return;}
-  g('authBtn').disabled=true;
-  try{const url=authProvisioned?'/api/session/login':'/api/session/bootstrap';const res=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password})});
-    const data=await res.json();if(!res.ok)throw new Error(data.error||'auth_failed');csrfToken=data.csrf||'';g('adminPass').value='';g('authGate').classList.add('hide');startApp();}
-  catch(e){err.textContent=e.message==='invalid_credentials'?'Неверный пароль':'Не удалось настроить вход';err.classList.remove('hide');}
-  finally{g('authBtn').disabled=false;}}
-async function initAuth(){if(PREVIEW_MODE){csrfToken='preview';startApp();return;}
-  try{const data=await(await fetch('/api/session')).json();if(data.authenticated){csrfToken=data.csrf||'';startApp();}else showAuth(!!data.provisioned);}
-  catch(e){showAuth(true);g('authError').textContent='Устройство не ответило';g('authError').classList.remove('hide');}}
+  return fetch(url,Object.assign({},opts,{headers}));}
 
 /* ── базовые утилиты ── */
 function go(p){document.querySelectorAll('.page').forEach(e=>e.classList.toggle('on',e.id==='pg-'+p));
@@ -633,7 +602,7 @@ function updPrinter(d){
 
 let bambuOperationId='';
 const BAMBU_STATE_TEXT={signed_out:'Не настроен',submitting_credentials:'Проверка входа…',verification_required_email:'Нужен код email',verification_required_sms:'Нужен код SMS',verification_required_totp:'Нужен TOTP',fetching_printers:'Получаем принтеры…',printer_selection_required:'Выберите принтер',connecting:'Подключаем MQTT…',ready:'Готово',recoverable_error:'Можно повторить'};
-const BAMBU_ERRORS={invalid_credentials:'Неверный аккаунт или пароль.',operation_expired:'Попытка входа истекла — начните снова.',token_envelope_incomplete:'Cloud не вернул полный credential envelope.',tfa_session_cookie_missing:'TOTP подтверждён, но Cloud не создал сессию; active запись не изменена.',tfa_token_envelope_incomplete:'Cloud-сессия не вернула полный credential envelope; active запись не изменена.',account_identity_missing:'Не удалось подтвердить идентификатор аккаунта.',no_printers:'В аккаунте не найдено принтеров.',candidate_save_failed:'Candidate не сохранён; прежняя active запись не изменена.',candidate_mqtt_failed:'Candidate не прошёл MQTT-проверку; выполнен rollback.',candidate_report_timeout:'Принтер не прислал валидный report вовремя; выполнен rollback.',candidate_commit_failed:'Первый report получен, но commit не завершён.',auto_refresh_retry:'Автообновление временно не прошло; устройство повторит его само.',auto_refresh_rejected:'Cloud отклонил refresh credential; автоматические повторы продолжатся.',tls_busy:'Защищённая сеть занята — повторите позже.'};
+const BAMBU_ERRORS={invalid_credentials:'Неверный аккаунт или пароль.',operation_expired:'Попытка входа истекла — начните снова.',token_envelope_incomplete:'Cloud не вернул полный credential envelope.',tfa_session_cookie_missing:'TOTP подтверждён, но Cloud не создал сессию; active запись не изменена.',tfa_token_envelope_incomplete:'Cloud-сессия не вернула полный credential envelope; active запись не изменена.',account_identity_missing:'Не удалось подтвердить идентификатор аккаунта.',no_printers:'В аккаунте не найдено принтеров.',candidate_save_failed:'Candidate не сохранён; прежняя active запись не изменена.',candidate_mqtt_failed:'Candidate не прошёл MQTT-проверку; выполнен rollback.',candidate_report_timeout:'Принтер не прислал валидный report вовремя; выполнен rollback.',candidate_commit_failed:'Первый report получен, но commit не завершён.',mqtt_start_retry:'MQTT временно недоступен; устройство повторит подключение с bounded backoff.',auto_refresh_retry:'Автообновление временно не прошло; устройство повторит его само.',auto_refresh_rejected:'Cloud отклонил refresh credential; автоматические повторы продолжатся.',tls_busy:'Защищённая сеть занята — повторите позже.'};
 function renderBambuAuth(d){
   bambuOperationId=d.operationId||bambuOperationId;
   const state=d.state||'signed_out',configured=!!d.configured;
@@ -647,7 +616,7 @@ function renderBambuAuth(d){
   g('bcGoogleNote').classList.toggle('hide',state!=='signed_out'&&state!=='recoverable_error');
   if(verify)g('bcVerifyLabel').textContent=state.endsWith('totp')?'Код из приложения-аутентификатора':(state.endsWith('sms')?'Код из SMS':'Код из email');
   const err=d.error?(BAMBU_ERRORS[d.error]||'Операция не завершена; можно безопасно повторить.') : '';
-  g('bcHint').textContent=err||(state==='ready'?'Direct snapshot получен. Матрица остаётся на relay до T05.':(BAMBU_STATE_TEXT[state]||'Direct Cloud'));
+  g('bcHint').textContent=err||(state==='ready'?'Direct snapshot получен; источник можно переключить без перезагрузки.':(BAMBU_STATE_TEXT[state]||'Direct Cloud'));
   const refreshState=g('bcRefreshState');if(refreshState)refreshState.textContent=d.automaticRefreshPending?'Автоматическое обновление выполняется…':d.automaticRefreshFailures?('Следующая автоматическая попытка через '+Math.max(1,Math.ceil((d.nextRefreshAttemptIn||0)/60))+' мин.'):'Токены обновляются автоматически.';
   if(state==='printer_selection_required'){
     const list=g('bcPrinterList');list.innerHTML='';
@@ -709,6 +678,7 @@ async function loadSettings(){
     g('clkColor').value=rgbToHex(d.ct6ClockR??255,d.ct6ClockG??128,d.ct6ClockB??0);
     g('tmpColor').value=rgbToHex(d.ct6TempR??0,d.ct6TempG??200,d.ct6TempB??255);
     g('bambuOn').checked=!!d.bambuEnabled;onBambu();
+    g('bambuSource').value=d.bambuSource==='cloud_direct'?'cloud_direct':'relay';
     g('bambuRelayUrl').value=d.bambuRelayUrl||'';
     secretInit('bambuRelayKey','rkeyState',!!d.bambuRelayKeySet);
     g('sunTxt').textContent=d.sunTimeValid?sunFmt(d):'—';
@@ -743,6 +713,7 @@ function buildSavePayload(){
     ct6ClockR:cc.r,ct6ClockG:cc.g,ct6ClockB:cc.b,
     ct6TempR:tc.r,ct6TempG:tc.g,ct6TempB:tc.b,
     bambuEnabled:g('bambuOn').checked,
+    bambuSource:g('bambuSource').value,
     bambuRelayUrl:g('bambuRelayUrl').value.trim(),
     bambuRelayKey:secretValue('bambuRelayKey')
   };
@@ -850,9 +821,6 @@ async function disconnWifi(){if(!confirm('Отключиться и забыть
 async function rebootDevice(){if(!confirm('Перезагрузить устройство?'))return;
   try{const res=await apiFetch('/api/reboot',{method:'POST',body:'{}'});if(!res.ok)throw new Error('reboot_failed');toast('Перезагрузка…');}
   catch(e){toast('Не удалось перезагрузить устройство');}}
-async function logoutSession(){try{await apiFetch('/api/session/logout',{method:'POST',body:'{}'});}catch(e){}
-  csrfToken='';appStarted=false;clearInterval(statusInterval);statusInterval=0;showAuth(true);}
-
 /* ── OTA ── */
 let fwBusy=false;
 function fwMsg(t,color){const el=g('fwResult');el.textContent=t;el.style.color=color||'';}
@@ -881,7 +849,6 @@ async function uploadFirmware(){
   const fd=new FormData();fd.append('firmware',f,f.name);
   const xhr=new XMLHttpRequest();
   xhr.open('POST','/api/update?size='+f.size);
-  xhr.setRequestHeader('X-CSRF-Token',csrfToken);
   const sigBytes=new Uint8Array(await sigFile.arrayBuffer());
   xhr.setRequestHeader('X-OTA-Signature',btoa(String.fromCharCode(...sigBytes)));
   xhr.timeout=300000;
@@ -891,7 +858,6 @@ async function uploadFirmware(){
       fwMsg('Прошивка загружена, устройство перезагружается…','var(--green)');toast('Перезагрузка…');
       // После OTA слот всегда меняется (app0↔app1) — ждём смены fwVersion/fwPartition
       const poll=setInterval(async()=>{try{const response=await fetch('/api/status');
-        if(response.status===401){clearInterval(poll);csrfToken='';appStarted=false;statusInterval=-1;showAuth(true);fwMsg('✅ Устройство перезагрузилось — войдите снова и проверьте версию','var(--green)');finish(true);return;}
         const d=await response.json();
         const cur=d.fwVersion+' · '+(d.fwPartition||'?');
         if(d.fwVersion&&cur!==prevFw){clearInterval(poll);fwMsg('✅ Обновлено: '+cur,'var(--green)');finish(true);}}catch(e){}},2000);
@@ -909,7 +875,7 @@ const drop=g('drop');
 /* ── init ── */
 let statusInterval=0;
 function startApp(){if(appStarted){fetchStatus();return;}appStarted=true;loadSettings();fetchStatus();statusInterval=setInterval(fetchStatus,3000);}
-initAuth();
+startApp();
 document.addEventListener('visibilitychange',()=>{if(fwBusy)return;clearInterval(statusInterval);statusInterval=0;
   if(!document.hidden){fetchStatus();statusInterval=setInterval(fetchStatus,3000);}});
 window.addEventListener('beforeunload',e=>{if(autosaveRunning||autosavePending||autosaveQueued){e.preventDefault();e.returnValue='Изменения ещё сохраняются';}});

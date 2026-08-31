@@ -46,6 +46,7 @@
 #include "printer_status_source.hpp"
 #include "security_policy.hpp"
 #include "secure_network_coordinator.hpp"
+#include "t05_resilience.hpp"
 #include "wifi_reconnect_policy.hpp"
 
 // PlatformIO compiles sources as plain C++ and does not apply Arduino's .ino
@@ -68,7 +69,6 @@ void fetchSunriseSunset();
 void bambuTask(void* param);
 bool saveConfig();
 void loadConfig();
-bool checkAuth();
 void handleRoot();
 void handleGetSettings();
 void handlePostSettings();
@@ -78,10 +78,6 @@ void handleConnectWifi();
 void handleDisconnectWifi();
 void handleReboot();
 void handleWeatherRefresh();
-void handleSessionStatus();
-void handleSessionBootstrap();
-void handleSessionLogin();
-void handleSessionLogout();
 void handleBambuAuthStatus();
 void handleBambuAuthLogin();
 void handleBambuAuthVerify();
@@ -108,14 +104,13 @@ void loop();
 static constexpr uint16_t CONFIG_VERSION = 332;
 // Версия прошивки: поднимать при каждой OTA-итерации — по смене значения в
 // /api/status видно, что обновление реально применилось.
-static constexpr const char* FW_VERSION = "4.2.2-2026.08.31";
+static constexpr const char* FW_VERSION = "4.3.0-2026.08.31";
 static constexpr uint32_t STORED_STATE_MAGIC = 0x4D415458UL; // MATX
 static constexpr uint16_t STORED_STATE_VERSION = 2;
 static constexpr size_t BAMBU_TOKEN_CAPACITY = 384;
 static constexpr uint8_t MIN_UI_BRIGHTNESS = 1;
 static constexpr size_t MAX_SETTINGS_BODY_BYTES = 4096;
 static constexpr size_t MAX_CONNECT_BODY_BYTES = 256;
-static constexpr size_t MAX_SESSION_BODY_BYTES = 192;
 static constexpr size_t MAX_RELAY_JSON_BYTES = 4096;
 static constexpr size_t MAX_WEATHER_JSON_BYTES = 12288;
 
@@ -172,8 +167,8 @@ struct Config {
   uint8_t  rotation        = 0;   // 0=нормальный 1=90°CW 2=180° 3=270°CW
   bool     flipH           = false; // зеркало по горизонтали
   bool     flipV           = false; // зеркало по вертикали
-  char     webPass[32]     = ""; // legacy NVS bytes; runtime auth lives in SecurityState
-  char     apPass[64]      = ""; // legacy NVS bytes; runtime AP password lives in SecurityState
+  char     webPass[32]     = ""; // legacy NVS bytes; ignored by security level 0
+  char     apPass[64]      = ""; // legacy NVS bytes; ignored by security level 0
 
   // Режим 6 «Часы + Темп»: позиция строк и независимые цвета.
   // Автоцвет влияет только на температуру; часы всегда берут ct6ClockRGB.
@@ -319,17 +314,6 @@ struct LegacyStoredStateBlobV1 {
   uint32_t checksum;
 };
 
-struct SecurityState {
-  uint32_t magic = 0x53454331UL; // SEC1
-  uint16_t version = 1;
-  uint16_t size = sizeof(SecurityState);
-  char apPassword[13] = "";      // 12 random decimal digits + NUL
-  uint8_t adminSalt[16] = {};
-  uint8_t adminHash[32] = {};
-  bool adminProvisioned = false;
-  uint32_t checksum = 0;
-};
-
 Config     cfg;
 BambuConfig bambuCfg;
 Preferences prefs;
@@ -341,13 +325,6 @@ WebServer server(80);
 DNSServer dnsServer;
 
 static char AP_NAME[32] = "ESP32-Matrix";
-static SecurityState securityState;
-static uint32_t apCredentialDisplayStartedMs = 0;
-static uint8_t sessionToken[32] = {};
-static uint8_t csrfToken[32] = {};
-static bool sessionActive = false;
-static uint32_t sessionLastSeenMs = 0;
-static constexpr uint32_t SESSION_IDLE_TIMEOUT_MS = 30UL * 60UL * 1000UL;
 
 float    currentTemp    = -999.0f;
 std::atomic<bool> wifiConnected{false};
@@ -368,6 +345,8 @@ static std::atomic<uint32_t> rebootMs{0};
 static std::atomic<bool> otaInProgress{false};
 static SecureNetworkCoordinator secureNetworkCoordinator;
 static BambuCloud bambuCloud(secureNetworkCoordinator);
+static std::atomic<PrinterSourceMode> printerSourceMode{PRINTER_SOURCE_RELAY};
+static constexpr const char* PREF_PRINTER_SOURCE = "bsource";
 
 // Boot-guard / анти-кирпич: счётчик незавершённых загрузок в отдельном NVS
 // namespace "bootguard" (StoredStateBlob в "matrix" не трогаем). 3 сбоя подряд →
@@ -468,11 +447,16 @@ static void bambuSleepOrWake(uint32_t delayMs) {
 
 class BambuCloudExternalTlsPause {
  public:
-  BambuCloudExternalTlsPause() { bambuCloud.pauseForExternalTls(); }
+  BambuCloudExternalTlsPause() : acquired_(bambuCloud.pauseForExternalTls()) {}
   ~BambuCloudExternalTlsPause() {
-    bambuCloud.resumeAfterExternalTls();
-    wakeBambuTask();
+    if (acquired_) {
+      bambuCloud.resumeAfterExternalTls();
+      wakeBambuTask();
+    }
   }
+  bool acquired() const { return acquired_; }
+ private:
+  bool acquired_;
 };
 
 // ── Асинхронное подключение к WiFi ──────────────────────────────────────────
@@ -686,73 +670,16 @@ static uint32_t storedStateChecksum(const StoredStateBlob& blob) {
   return fnv1a32(reinterpret_cast<const uint8_t*>(&blob), offsetof(StoredStateBlob, checksum));
 }
 
-static uint32_t securityStateChecksum(const SecurityState& state) {
-  return fnv1a32(reinterpret_cast<const uint8_t*>(&state), offsetof(SecurityState, checksum));
-}
-
 static void secureZero(void* ptr, size_t length) {
   volatile uint8_t* bytes = static_cast<volatile uint8_t*>(ptr);
   while (length--) *bytes++ = 0;
 }
 
-static void fillRandom(uint8_t* output, size_t length) {
-  for (size_t i = 0; i < length; i += sizeof(uint32_t)) {
-    uint32_t value = esp_random();
-    size_t copy = min(sizeof(value), length - i);
-    memcpy(output + i, &value, copy);
-  }
-}
-
-static void hashAdminPassword(const char* password, const uint8_t salt[16], uint8_t output[32]) {
-  mbedtls_sha256_context ctx;
-  mbedtls_sha256_init(&ctx);
-  mbedtls_sha256_starts(&ctx, 0);
-  mbedtls_sha256_update(&ctx, salt, 16);
-  mbedtls_sha256_update(&ctx, reinterpret_cast<const uint8_t*>(password), strlen(password));
-  mbedtls_sha256_finish(&ctx, output);
-  mbedtls_sha256_free(&ctx);
-}
-
-static bool persistSecurityState() {
-  securityState.checksum = securityStateChecksum(securityState);
-  Preferences securityPrefs;
-  if (!securityPrefs.begin("security", false)) return false;
-  bool ok = securityPrefs.putBytes("state", &securityState, sizeof(securityState)) == sizeof(securityState);
-  securityPrefs.end();
-  return ok;
-}
-
-static void initializeSecurityState() {
-  Preferences securityPrefs;
-  bool loaded = false;
-  if (securityPrefs.begin("security", true)) {
-    if (securityPrefs.getBytesLength("state") == sizeof(securityState)) {
-      SecurityState candidate;
-      size_t got = securityPrefs.getBytes("state", &candidate, sizeof(candidate));
-      loaded = got == sizeof(candidate) && candidate.magic == securityState.magic &&
-               candidate.version == securityState.version && candidate.size == sizeof(candidate) &&
-               candidate.checksum == securityStateChecksum(candidate) &&
-               strnlen(candidate.apPassword, sizeof(candidate.apPassword)) == 12;
-      if (loaded) securityState = candidate;
-      secureZero(&candidate, sizeof(candidate));
-    }
-    securityPrefs.end();
-  }
-  if (!loaded) {
-    SecurityState fresh;
-    for (size_t i = 0; i < 12; ++i) fresh.apPassword[i] = '0' + (esp_random() % 10);
-    fresh.apPassword[12] = '\0';
-    securityState = fresh;
-    if (!persistSecurityState()) fatalHalt("Failed to persist security bootstrap state");
-    secureZero(&fresh, sizeof(fresh));
-    Serial.println("[Security] Created unique onboarding credentials");
-  }
-
+static void initializeLocalIdentity() {
   uint64_t mac = ESP.getEfuseMac();
   snprintf(AP_NAME, sizeof(AP_NAME), "ESP32-Matrix-%06llX",
            static_cast<unsigned long long>(mac & 0xFFFFFFULL));
-  Serial.printf("[Security] Web auth: %s; AP credentials are shown only on the matrix\n",
-                securityState.adminProvisioned ? "provisioned" : "onboarding required");
+  Serial.println("[Security] Local access level 0: open AP and WebUI/API");
 }
 
 static bool loadStoredStateBlob(StoredStateBlob& blob) {
@@ -971,7 +898,45 @@ class RelayHttpSource : public PrinterStatusSource {
 };
 
 static RelayHttpSource relayHttpSource;
-static PrinterStatusSource& printerStatusSource = relayHttpSource;
+static portMUX_TYPE shadowDiagnosticsMux = portMUX_INITIALIZER_UNLOCKED;
+static PrinterShadowDiagnostics shadowDiagnostics;
+static std::atomic<bool> shadowComparisonActive{false};
+static std::atomic<bool> directSourceReady{false};
+
+static PrinterStateSnapshot selectedPrinterSnapshot() {
+  const PrinterStateSnapshot direct = bambuCloud.source().snapshot();
+  directSourceReady.store(updateDirectSourceReadiness(
+      directSourceReady.load(), direct.configured,
+      bambuCloud.source().firstValidReport()));
+  const PrinterSourceMode effectiveSource = effectivePrinterSourceMode(
+      printerSourceMode.load(), directSourceReady.load());
+  PrinterStateSnapshot snapshot =
+      effectiveSource == PRINTER_SOURCE_CLOUD_DIRECT
+          ? direct
+          : relayHttpSource.snapshot();
+  xSemaphoreTake(bambuCfgMtx, portMAX_DELAY);
+  snapshot.enabled = bambuCfg.enabled;
+  xSemaphoreGive(bambuCfgMtx);
+  return snapshot;
+}
+
+static void observePrinterShadow() {
+  PrinterStateSnapshot relay = relayHttpSource.snapshot();
+  PrinterStateSnapshot direct = bambuCloud.source().snapshot();
+  if (!shadowComparisonActive.load()) {
+    const bool bothValidated = relay.configured && direct.configured &&
+                               relay.transportConnected &&
+                               direct.transportConnected &&
+                               relay.printerOnline && direct.printerOnline;
+    if (!bothValidated) return;
+    shadowComparisonActive.store(true);
+  }
+  // Once both sources produced a usable sample, compare every normalized
+  // field, including later source-quality/offline transitions.
+  taskENTER_CRITICAL(&shadowDiagnosticsMux);
+  shadowDiagnostics.observe(relay, direct);
+  taskEXIT_CRITICAL(&shadowDiagnosticsMux);
+}
 
 class BoundedInputStream : public Stream {
  public:
@@ -1440,7 +1405,7 @@ void showClockTemp() {
     tempColorKey = (int16_t)lroundf(t * 10.0f);
   }
 
-  PrinterStateSnapshot printer = printerStatusSource.snapshot();
+  PrinterStateSnapshot printer = selectedPrinterSnapshot();
   uint8_t overlayPhase = 0;
   if (printer.visibleLifecycle == PRINTER_FINISHED ||
       printer.visibleLifecycle == PRINTER_PAUSED ||
@@ -1823,16 +1788,21 @@ void fetchWeather() {
     }
     if (!owmOk) {
       BambuCloudExternalTlsPause cloudPause;
-      SecureNetworkLease tlsLease(secureNetworkCoordinator, SECURE_NETWORK_WEATHER);
-      if (!tlsLease.acquired()) {
-        setWeatherDiag(0, "owm https deferred: tls busy", keyLen, "owm");
+      if (!cloudPause.acquired()) {
+        setWeatherDiag(0, "owm https deferred: active print", keyLen, "owm");
+        if (provider == 1) return;
       } else {
-        WiFiClientSecure client;
-        client.setInsecure(); // CA не проверяем ради RAM.
-        // Ядро ESP32 Arduino 3.x: setTimeout() — миллисекунды, setHandshakeTimeout() — секунды.
-        client.setTimeout(8000);
-        client.setHandshakeTimeout(8);
-        owmOk = runOwmRequest(client, true, &client);
+        SecureNetworkLease tlsLease(secureNetworkCoordinator, SECURE_NETWORK_WEATHER);
+        if (!tlsLease.acquired()) {
+          setWeatherDiag(0, "owm https deferred: tls busy", keyLen, "owm");
+        } else {
+          WiFiClientSecure client;
+          client.setInsecure(); // CA не проверяем ради RAM.
+          // Ядро ESP32 Arduino 3.x: setTimeout() — миллисекунды, setHandshakeTimeout() — секунды.
+          client.setTimeout(8000);
+          client.setHandshakeTimeout(8);
+          owmOk = runOwmRequest(client, true, &client);
+        }
       }
     }
   }
@@ -1970,6 +1940,11 @@ void fetchWeather() {
   }
   if (!meteoOk) {
     BambuCloudExternalTlsPause cloudPause;
+    if (!cloudPause.acquired()) {
+      setWeatherDiag(0, "open-meteo https deferred: active print", keyLen,
+                     "open-meteo");
+      return;
+    }
     SecureNetworkLease tlsLease(secureNetworkCoordinator, SECURE_NETWORK_WEATHER);
     if (!tlsLease.acquired()) {
       setWeatherDiag(0, "open-meteo https deferred: tls busy", keyLen, "open-meteo");
@@ -1989,6 +1964,10 @@ void fetchWeather() {
 void fetchSunriseSunset() {
   if (!wifiConnected) return;
   BambuCloudExternalTlsPause cloudPause;
+  if (!cloudPause.acquired()) {
+    Serial.println("[Sun] Direct Cloud печатает — запрос отложен");
+    return;
+  }
   SecureNetworkLease tlsLease(secureNetworkCoordinator, SECURE_NETWORK_SUNRISE);
   if (!tlsLease.acquired()) {
     Serial.println("[Sun] TLS занят — запрос отложен");
@@ -2110,6 +2089,10 @@ bool saveConfig() {
   bool ok = prefs.begin("matrix", false);
   if (ok) {
     ok = prefs.putBytes("state", &blob, sizeof(blob)) == sizeof(blob);
+    if (ok) {
+      ok = prefs.putUChar(PREF_PRINTER_SOURCE,
+                          static_cast<uint8_t>(printerSourceMode.load())) == 1;
+    }
     // Remove legacy split keys, including obsolete account credential buffers.
     prefs.remove("bcfg");
     prefs.remove("bver");
@@ -2177,6 +2160,11 @@ void loadConfig() {
     } else {
       lastAutoBrightnessValid.store(false);
     }
+    uint8_t storedSource = prefs.getUChar(
+        PREF_PRINTER_SOURCE, PRINTER_SOURCE_RELAY);
+    printerSourceMode.store(storedSource == PRINTER_SOURCE_CLOUD_DIRECT
+                                ? PRINTER_SOURCE_CLOUD_DIRECT
+                                : PRINTER_SOURCE_RELAY);
     bambuCfg.relayEnabled = true;
     prefs.end();
   } else {
@@ -2208,77 +2196,6 @@ void loadConfig() {
 // ════════════════════════════════════════════════════════════
 //  ВЕБ-СЕРВЕР: обработчики
 // ════════════════════════════════════════════════════════════
-static void bytesToHex(const uint8_t* bytes, size_t length, char* output, size_t outputSize) {
-  static const char HEX_DIGITS[] = "0123456789abcdef";
-  if (outputSize < length * 2 + 1) {
-    if (outputSize) output[0] = '\0';
-    return;
-  }
-  for (size_t i = 0; i < length; ++i) {
-    output[i * 2] = HEX_DIGITS[bytes[i] >> 4];
-    output[i * 2 + 1] = HEX_DIGITS[bytes[i] & 0x0F];
-  }
-  output[length * 2] = '\0';
-}
-
-static bool hexToBytes(const char* input, uint8_t* output, size_t outputLength) {
-  if (!input || strlen(input) != outputLength * 2) return false;
-  for (size_t i = 0; i < outputLength; ++i) {
-    char hi = input[i * 2], lo = input[i * 2 + 1];
-    auto nibble = [](char value) -> int {
-      if (value >= '0' && value <= '9') return value - '0';
-      if (value >= 'a' && value <= 'f') return value - 'a' + 10;
-      if (value >= 'A' && value <= 'F') return value - 'A' + 10;
-      return -1;
-    };
-    int a = nibble(hi), b = nibble(lo);
-    if (a < 0 || b < 0) return false;
-    output[i] = static_cast<uint8_t>((a << 4) | b);
-  }
-  return true;
-}
-
-static void clearSession() {
-  secureZero(sessionToken, sizeof(sessionToken));
-  secureZero(csrfToken, sizeof(csrfToken));
-  sessionActive = false;
-  sessionLastSeenMs = 0;
-}
-
-static void createSession() {
-  fillRandom(sessionToken, sizeof(sessionToken));
-  fillRandom(csrfToken, sizeof(csrfToken));
-  sessionActive = true;
-  sessionLastSeenMs = millis();
-}
-
-bool checkAuth() {
-  if (!securityState.adminProvisioned || !sessionActive) return false;
-  if (millis() - sessionLastSeenMs > SESSION_IDLE_TIMEOUT_MS) {
-    clearSession();
-    return false;
-  }
-  char encoded[65] = {};
-  if (!extractCookieValue(server.header("Cookie").c_str(), "matrix_session",
-                          encoded, sizeof(encoded))) return false;
-  uint8_t candidate[sizeof(sessionToken)] = {};
-  bool decoded = hexToBytes(encoded, candidate, sizeof(candidate));
-  bool valid = decoded && secureBytesEqual(candidate, sessionToken, sizeof(sessionToken));
-  secureZero(candidate, sizeof(candidate));
-  secureZero(encoded, sizeof(encoded));
-  if (valid) sessionLastSeenMs = millis();
-  return valid;
-}
-
-static bool checkMutationAuth() {
-  if (!checkAuth()) return false;
-  uint8_t candidate[sizeof(csrfToken)] = {};
-  bool decoded = hexToBytes(server.header("X-CSRF-Token").c_str(), candidate, sizeof(candidate));
-  bool valid = decoded && secureBytesEqual(candidate, csrfToken, sizeof(csrfToken));
-  secureZero(candidate, sizeof(candidate));
-  return valid;
-}
-
 static void sendJsonDocument(int code, JsonDocument& doc) {
   if (doc.overflowed()) {
     server.send(500, "application/json", "{\"error\":\"json_no_memory\"}");
@@ -2307,101 +2224,6 @@ static bool parseBoundedBody(JsonDocument& doc, size_t maximumBytes) {
     return false;
   }
   return true;
-}
-
-static void sendSessionResponse(bool sessionJustCreated = false) {
-  JsonDocument doc;
-  char csrf[65] = {};
-  doc["provisioned"] = securityState.adminProvisioned;
-  bool authenticated = sessionJustCreated || checkAuth();
-  doc["authenticated"] = authenticated;
-  if (authenticated) {
-    bytesToHex(csrfToken, sizeof(csrfToken), csrf, sizeof(csrf));
-    doc["csrf"] = csrf;
-  }
-  sendJsonDocument(200, doc);
-  secureZero(csrf, sizeof(csrf));
-}
-
-static void completeSuccessfulAuthentication() {
-  createSession();
-  char encoded[65];
-  bytesToHex(sessionToken, sizeof(sessionToken), encoded, sizeof(encoded));
-  server.sendHeader("Set-Cookie", String("matrix_session=") + encoded +
-                    "; Path=/; HttpOnly; SameSite=Strict");
-  secureZero(encoded, sizeof(encoded));
-  sendSessionResponse(true);
-}
-
-void handleSessionStatus() {
-  sendSessionResponse();
-}
-
-static bool requestArrivedViaOnboardingAp() {
-  wifi_mode_t mode = WiFi.getMode();
-  if (mode != WIFI_MODE_AP && mode != WIFI_MODE_APSTA) return false;
-  IPAddress apAddress = WiFi.softAPIP();
-  IPAddress localAddress = server.client().localIP();
-  return apAddress != IPAddress(0, 0, 0, 0) && localAddress == apAddress;
-}
-
-void handleSessionBootstrap() {
-  if (securityState.adminProvisioned) {
-    server.send(409, "application/json", "{\"error\":\"already_provisioned\"}");
-    return;
-  }
-  if (!requestArrivedViaOnboardingAp()) {
-    server.send(403, "application/json", "{\"error\":\"onboarding_ap_required\"}");
-    return;
-  }
-  JsonDocument doc;
-  if (!parseBoundedBody(doc, MAX_SESSION_BODY_BYTES)) return;
-  const char* password = doc["password"] | "";
-  if (!isValidAdminPassword(password)) {
-    server.send(400, "application/json", "{\"error\":\"weak_password\"}");
-    return;
-  }
-  SecurityState previous = securityState;
-  fillRandom(securityState.adminSalt, sizeof(securityState.adminSalt));
-  hashAdminPassword(password, securityState.adminSalt, securityState.adminHash);
-  securityState.adminProvisioned = true;
-  if (!persistSecurityState()) {
-    securityState = previous;
-    secureZero(&previous, sizeof(previous));
-    server.send(500, "application/json", "{\"error\":\"save_failed\"}");
-    return;
-  }
-  secureZero(&previous, sizeof(previous));
-  completeSuccessfulAuthentication();
-}
-
-void handleSessionLogin() {
-  if (!securityState.adminProvisioned) {
-    server.send(409, "application/json", "{\"error\":\"onboarding_required\"}");
-    return;
-  }
-  JsonDocument doc;
-  if (!parseBoundedBody(doc, MAX_SESSION_BODY_BYTES)) return;
-  const char* password = doc["password"] | "";
-  uint8_t candidate[32];
-  hashAdminPassword(password, securityState.adminSalt, candidate);
-  bool valid = secureBytesEqual(candidate, securityState.adminHash, sizeof(candidate));
-  secureZero(candidate, sizeof(candidate));
-  if (!valid) {
-    server.send(401, "application/json", "{\"error\":\"invalid_credentials\"}");
-    return;
-  }
-  completeSuccessfulAuthentication();
-}
-
-void handleSessionLogout() {
-  if (!checkMutationAuth()) {
-    server.send(403, "application/json", "{\"error\":\"forbidden\"}");
-    return;
-  }
-  clearSession();
-  server.sendHeader("Set-Cookie", "matrix_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict");
-  server.send(200, "application/json", "{\"ok\":true}");
 }
 
 static const char* bambuAuthPhaseName(BambuAuthPhase phase) {
@@ -2448,14 +2270,12 @@ static void appendBambuCloudStatus(JsonDocument& doc,
 }
 
 void handleBambuAuthStatus() {
-  if (!checkAuth()) { server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
   JsonDocument doc;
   appendBambuCloudStatus(doc, bambuCloud.publicStatus(), true);
   sendJsonDocument(200, doc);
 }
 
 void handleBambuAuthLogin() {
-  if (!checkMutationAuth()) { server.send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
   JsonDocument doc;
   if (!parseBoundedBody(doc, 512)) return;
   const char* emailValue = doc["email"] | "";
@@ -2485,7 +2305,6 @@ void handleBambuAuthLogin() {
 }
 
 void handleBambuAuthVerify() {
-  if (!checkMutationAuth()) { server.send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
   JsonDocument doc;
   if (!parseBoundedBody(doc, 256)) return;
   char operationId[17] = "";
@@ -2507,7 +2326,6 @@ void handleBambuAuthVerify() {
 }
 
 void handleBambuPrinters() {
-  if (!checkAuth()) { server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
   BambuCloudPublicStatus status = bambuCloud.publicStatus();
   JsonDocument doc;
   appendBambuCloudStatus(doc, status, true);
@@ -2515,7 +2333,6 @@ void handleBambuPrinters() {
 }
 
 void handleBambuPrinterSelect() {
-  if (!checkMutationAuth()) { server.send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
   JsonDocument doc;
   if (!parseBoundedBody(doc, 256)) return;
   const bool accepted = bambuCloud.selectPrinter(
@@ -2530,7 +2347,6 @@ void handleBambuPrinterSelect() {
 }
 
 void handleBambuLogout() {
-  if (!checkMutationAuth()) { server.send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
   if (!bambuCloud.logout()) {
     server.send(409, "application/json", "{\"error\":\"cloud_busy\"}");
     return;
@@ -2568,7 +2384,6 @@ static void appendPrinterStatus(JsonDocument& doc,
 }
 
 void handleGetSettings() {
-  if (!checkAuth()) { server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
   JsonDocument doc;
   xSemaphoreTake(cfgMtx, portMAX_DELAY);
   doc["brightness"]   = cfg.brightness;
@@ -2607,7 +2422,8 @@ void handleGetSettings() {
   doc["bambuRelayUrl"]     = bambuCfg.relayUrl;
   doc["bambuRelayKeySet"]  = bambuCfg.relayKey[0] != '\0';
   xSemaphoreGive(bambuCfgMtx);
-  appendPrinterStatus(doc, printerStatusSource.snapshot());
+  doc["bambuSource"] = printerSourceModeName(printerSourceMode.load());
+  appendPrinterStatus(doc, selectedPrinterSnapshot());
   // Данные восхода/заката хранятся в RAM (не в cfg) — читаем вне мьютекса
   doc["sunTimeValid"]  = sunTimeValid.load();
   { uint32_t st = sunTimes.load();
@@ -2619,9 +2435,23 @@ void handleGetSettings() {
 }
 
 void handlePostSettings() {
-  if (!checkMutationAuth()) { server.send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
   JsonDocument doc;
   if (!parseBoundedBody(doc, MAX_SETTINGS_BODY_BYTES)) return;
+
+  PrinterSourceMode requestedSource = printerSourceMode.load();
+  const bool hasRequestedSource = doc["bambuSource"].is<const char*>();
+  if (hasRequestedSource &&
+      !parsePrinterSourceMode(doc["bambuSource"].as<const char*>(), requestedSource)) {
+    server.send(400, "application/json", "{\"error\":\"invalid_bambu_source\"}");
+    return;
+  }
+  if (hasRequestedSource && requestedSource == PRINTER_SOURCE_CLOUD_DIRECT &&
+      printerSourceMode.load() != PRINTER_SOURCE_CLOUD_DIRECT &&
+      (!bambuCloud.publicStatus().hasActiveCredential ||
+       !directSourceReady.load())) {
+    server.send(409, "application/json", "{\"error\":\"cloud_direct_not_configured\"}");
+    return;
+  }
 
   auto setStr = [&](const char* key, char* dst, size_t sz) {
     if (doc[key].is<const char*>()) strlcpy(dst, doc[key].as<const char*>(), sz);
@@ -2701,6 +2531,11 @@ void handlePostSettings() {
   setKey("bambuRelayKey", bambuCfg.relayKey, sizeof(bambuCfg.relayKey));
   bool bambuChanged = !bambuConfigEquals(prevBambuCfg, bambuCfg);
   xSemaphoreGive(bambuCfgMtx);
+  bool sourceChanged = false;
+  if (hasRequestedSource) {
+    PrinterSourceMode previous = printerSourceMode.exchange(requestedSource);
+    sourceChanged = previous != requestedSource;
+  }
 
   // Применяем яркость немедленно; если включили sun-режим — запрашиваем данные
   if (snapAutoB) {
@@ -2717,7 +2552,7 @@ void handlePostSettings() {
     Serial.printf("[BambuRelay] Settings updated: changed=%d\n", (int)bambuChanged);
     wakeBambuTask();
   }
-  bool persistPending = cfgChanged || bambuChanged;
+  bool persistPending = cfgChanged || bambuChanged || sourceChanged;
   if (persistPending) scheduleDeferredSave(1500);
   JsonDocument resp;
   resp["ok"] = true;
@@ -2726,7 +2561,6 @@ void handlePostSettings() {
 }
 
 void handleStatus() {
-  if (!checkAuth()) { server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
   JsonDocument doc;
   doc["wifi"]   = wifiConnected.load();
   doc["ap"]     = apMode.load();
@@ -2770,6 +2604,7 @@ void handleStatus() {
   }
   doc["uptime"]     = String(millis() / 1000 / 3600, DEC) + "ч " +
                       String((millis() / 1000 % 3600) / 60, DEC) + "м";
+  doc["uptimeSeconds"] = millis() / 1000UL;
   doc["fwVersion"]  = FW_VERSION;
   doc["fwPartition"] = esp_ota_get_running_partition()->label; // app0/app1 — виден фактический слот
   uint32_t currentInternalHeap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -2799,7 +2634,7 @@ void handleStatus() {
   }
   doc["savePending"] = savePending.load();
   doc["saveError"]   = saveError.load();
-  { PrinterStateSnapshot printer = printerStatusSource.snapshot();
+  { PrinterStateSnapshot printer = selectedPrinterSnapshot();
     doc["bambuEnabled"] = printer.enabled;
     appendPrinterStatus(doc, printer); }
   {
@@ -2817,20 +2652,26 @@ void handleStatus() {
     cloud["automaticRefreshPending"] = cloudStatus.automaticRefreshPending;
     cloud["automaticRefreshFailures"] = cloudStatus.automaticRefreshFailures;
     cloud["nextRefreshAttemptIn"] = cloudStatus.nextRefreshAttemptIn;
-    PrinterStateSnapshot direct = bambuCloud.source().snapshot();
-    JsonObject snapshot = cloud["snapshot"].to<JsonObject>();
-    snapshot["configured"] = direct.configured;
-    snapshot["transportConnected"] = direct.transportConnected;
-    snapshot["printerOnline"] = direct.printerOnline;
-    snapshot["lifecycle"] = direct.lifecycle;
-    snapshot["visibleLifecycle"] = direct.visibleLifecycle;
-    snapshot["progress"] = direct.progress;
-    snapshot["currentLayer"] = direct.currentLayer;
-    snapshot["totalLayers"] = direct.totalLayers;
-    snapshot["remainingSeconds"] = direct.remainingSeconds;
-    snapshot["jobName"] = direct.jobName;
-    snapshot["stage"] = direct.stage;
-    snapshot["detail"] = direct.detail;
+    cloud["recoveryReason"] = cloudStatus.recoveryReason;
+    cloud["recoveryFailures"] = cloudStatus.recoveryFailures;
+    cloud["nextRecoveryAttemptIn"] = cloudStatus.nextRecoveryAttemptIn;
+    stacks["mqtt"] = cloudStatus.mqttTaskStackReserve;
+    cloud["source"] = printerSourceModeName(printerSourceMode.load());
+    cloud["effectiveSource"] = printerSourceModeName(
+        effectivePrinterSourceMode(printerSourceMode.load(),
+                                   directSourceReady.load()));
+    PrinterShadowDiagnostics shadow;
+    taskENTER_CRITICAL(&shadowDiagnosticsMux);
+    shadow = shadowDiagnostics;
+    taskEXIT_CRITICAL(&shadowDiagnosticsMux);
+    JsonObject comparison = cloud["shadow"].to<JsonObject>();
+    comparison["comparisons"] = shadow.comparisons;
+    comparison["matches"] = shadow.matches;
+    comparison["mismatches"] = shadow.mismatches;
+    comparison["lastReasonMask"] = shadow.lastReasonMask;
+    JsonArray reasons = comparison["reasonCounts"].to<JsonArray>();
+    for (uint8_t i = 0; i < SHADOW_REASON_COUNT; ++i)
+      reasons.add(shadow.reasonCounts[i]);
   }
   // Данные восхода/заката — нужны для авто-обновления sunStatusTxt каждые 3 сек
   doc["sunTimeValid"] = sunTimeValid.load();
@@ -2847,7 +2688,6 @@ void handleStatus() {
 // Первый вызов: запускает сканирование, возвращает {"scanning":true}.
 // Второй вызов: возвращает результаты (браузер повторяет запрос каждые 1 сек).
 void handleScanWifi() {
-  if (!checkAuth()) { server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
   // Нельзя запускать сканирование во время попытки подключения — конфликт WiFi-драйвера
   if (wifiConnInProgress.load()) {
     server.send(503, "application/json", "{\"error\":\"connection in progress\"}");
@@ -2887,7 +2727,6 @@ void handleScanWifi() {
 // Фактическое подключение выполняет неблокирующая loop state machine.
 // Браузер получает результат через /api/status polling.
 void handleConnectWifi() {
-  if (!checkMutationAuth()) { server.send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
   if (wifiConnPending.load() || wifiConnInProgress.load()) {
     server.send(409, "application/json", "{\"error\":\"connection in progress\"}");
     return;
@@ -2912,7 +2751,6 @@ void handleConnectWifi() {
 
 
 void handleDisconnectWifi() {
-  if (!checkMutationAuth()) { server.send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
   char prevSsid[sizeof(cfg.ssid)];
   char prevPass[sizeof(cfg.wifiPass)];
   bool prevConnected = wifiConnected.load();
@@ -2943,7 +2781,6 @@ void handleDisconnectWifi() {
 
 
 void handleReboot() {
-  if (!checkMutationAuth()) { server.send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
   if (!flushDeferredSave(true)) {
     server.send(500, "application/json", "{\"error\":\"save_failed\"}");
     return;
@@ -2953,7 +2790,6 @@ void handleReboot() {
 }
 
 void handleWeatherRefresh() {
-  if (!checkMutationAuth()) { server.send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
   weatherRequested = true;
   wakeBambuTask();
   server.send(200, "application/json", "{\"ok\":true}");
@@ -3062,8 +2898,10 @@ static void showOtaError() {
 
 static bool otaEnterUpdateMode() {
   otaInProgress.store(true);
+  secureNetworkCoordinator.requestOta();
   bambuCloud.stopForOta();
-  if (!secureNetworkCoordinator.acquire(SECURE_NETWORK_OTA)) {
+  if (!secureNetworkCoordinator.acquireOta()) {
+    secureNetworkCoordinator.cancelOtaRequest();
     otaInProgress.store(false);
     return false;
   }
@@ -3092,10 +2930,6 @@ void handleUpdateUpload() {
     case UPLOAD_FILE_START: {
       otaResetVerification();
       otaUploadError[0] = '\0';
-      if (!checkMutationAuth()) {
-        strlcpy(otaUploadError, "forbidden", sizeof(otaUploadError));
-        break;
-      }
       if (!otaReadSignatureHeader()) {
         strlcpy(otaUploadError, "missing_or_invalid_signature", sizeof(otaUploadError));
         break;
@@ -3127,6 +2961,7 @@ void handleUpdateUpload() {
     }
     case UPLOAD_FILE_WRITE: {
       if (!otaUploadAuthorized || !Update.isRunning()) break;
+      sampleMemoryMetrics();
       if (up.totalSize == 0 && up.currentSize >= 0x24) {
         // Первый чанк: отличаем app-образ от bootloader/merged.bin — оба
         // начинаются с 0xE9, но esp_app_desc_t (magic 0xABCD5432 по смещению
@@ -3180,7 +3015,7 @@ void handleUpdateUpload() {
 }
 
 void handleUpdateFinal() {
-  if (!checkMutationAuth() || !otaUploadAuthorized) {
+  if (!otaUploadAuthorized) {
     otaResetVerification();
     if (otaInProgress.load() || otaTlsLeaseHeld) otaAbortUpdateMode();
     server.send(403, "application/json", "{\"error\":\"forbidden\"}");
@@ -3274,39 +3109,17 @@ static void configureAccessPoint(bool keepStaConnected) {
   WiFi.mode(keepStaConnected ? WIFI_AP_STA : WIFI_AP);
   IPAddress apIP(192, 168, 4, 1);
   WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
-  WiFi.softAP(AP_NAME, securityState.apPassword, 6, 0, 4);
+  WiFi.softAP(AP_NAME, nullptr, 6, 0, 4);
   // В AP fallback не нужен постоянно бодрствующий радиомодуль: это только греет кристалл.
   esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
   apMode.store(true);
-  PrinterStateSnapshot printer = printerStatusSource.snapshot();
-  if (!printerHasVisibleOverlay(printer.visibleLifecycle))
-    apCredentialDisplayStartedMs = millis() | 1u;
-  Serial.printf("[AP] Запущена: %s → %s  (unique password, ch6, %s, ps=min)\n",
+  Serial.printf("[AP] Запущена: %s → %s  (open, ch6, %s, ps=min)\n",
     AP_NAME, WiFi.softAPIP().toString().c_str(), keepStaConnected ? "AP+STA" : "AP");
 }
 
 // Старт fallback AP — вызывать только когда WiFi уже в WIFI_OFF или WIFI_AP.
 static void startAP() {
   configureAccessPoint(false);
-}
-
-static bool showApCredentialFrame() {
-  if (!apCredentialDisplayStartedMs) return false;
-  uint32_t elapsed = millis() - apCredentialDisplayStartedMs;
-  if (elapsed >= 11200UL) {
-    apCredentialDisplayStartedMs = 0;
-    return false;
-  }
-  uint8_t group = static_cast<uint8_t>((elapsed / 1400UL) % 4UL);
-  char digits[4] = {
-    securityState.apPassword[group * 3], securityState.apPassword[group * 3 + 1],
-    securityState.apPassword[group * 3 + 2], '\0'
-  };
-  clearMatrix();
-  for (uint8_t i = 0; i <= group; ++i) px(6 + i, 1, CRGB(255, 120, 0));
-  drawStr3((MW - strW3(digits)) / 2, 6, digits, CRGB(255, 150, 20));
-  matrixShow();
-  return true;
 }
 
 // ════════════════════════════════════════════════════════════
@@ -3341,7 +3154,7 @@ static void serviceWifiConnectStateMachine() {
       static_cast<int32_t>(now - wifiConnectDeadlineMs) >= 0) {
     IPAddress apIP(192, 168, 4, 1);
     WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
-    WiFi.softAP(AP_NAME, securityState.apPassword, 6, 0, 4);
+    WiFi.softAP(AP_NAME, nullptr, 6, 0, 4);
     apMode.store(true);
     dnsServer.start(53, "*", apIP);
     configureStaNetworkPolicy();
@@ -3446,7 +3259,9 @@ void bambuTask(void* param) {
       continue;
     }
 
-    bambuSleepOrWake(relayHttpSource.poll(relayUrl, relayKey));
+    uint32_t nextPollMs = relayHttpSource.poll(relayUrl, relayKey);
+    observePrinterShadow();
+    bambuSleepOrWake(nextPollMs);
   }
 }
 
@@ -3504,7 +3319,7 @@ void setup() {
   if (!cfgMtx || !prefsMtx || !bambuCfgMtx) fatalHalt("Failed to create mutexes");
 
   loadConfig();
-  initializeSecurityState();
+  initializeLocalIdentity();
   if (!bambuCloud.begin()) fatalHalt("Failed to initialize Bambu Cloud");
   hasSsid.store(cfg.ssid[0] != '\0'); // синхронизируем с загруженным конфигом
   // Яркость при старте: если авто-режим уже успел сохранить последнее вычисленное
@@ -3571,9 +3386,6 @@ void setup() {
         weatherRequested = true;  // погода через task, не блокируя
         { bool sunMode; xSemaphoreTake(cfgMtx, portMAX_DELAY); sunMode = cfg.autoBrSunMode; xSemaphoreGive(cfgMtx);
           if (sunMode) sunFetchRequested.store(true); }
-        // Existing installations already know the STA network, but still need
-        // an AP-gated path to establish the first admin password after T01.
-        if (!securityState.adminProvisioned) configureAccessPoint(true);
       } else {
         Serial.printf("[WiFi] ✗ Попытка %d: статус=%d\n", attempt, st);
         WiFi.disconnect(false);
@@ -3613,10 +3425,6 @@ void setup() {
   server.on("/redirect",                  HTTP_GET, [](){ server.sendHeader("Location","/"); server.send(302); });
 
   server.on("/",              HTTP_GET,  handleRoot);
-  server.on("/api/session",              HTTP_GET,  handleSessionStatus);
-  server.on("/api/session/bootstrap",    HTTP_POST, handleSessionBootstrap);
-  server.on("/api/session/login",        HTTP_POST, handleSessionLogin);
-  server.on("/api/session/logout",       HTTP_POST, handleSessionLogout);
   server.on("/api/bambu/auth/status",    HTTP_GET,  handleBambuAuthStatus);
   server.on("/api/bambu/auth/login",     HTTP_POST, handleBambuAuthLogin);
   server.on("/api/bambu/auth/verify",    HTTP_POST, handleBambuAuthVerify);
@@ -3634,12 +3442,12 @@ void setup() {
   server.on("/api/weather/refresh", HTTP_POST, handleWeatherRefresh);
   server.on("/api/update",    HTTP_POST, handleUpdateFinal, handleUpdateUpload);
   server.onNotFound([](){ server.sendHeader("Location","/"); server.send(302); });
-  const char* collectedHeaders[] = {"Cookie", "X-CSRF-Token", "X-OTA-Signature"};
-  server.collectHeaders(collectedHeaders, 3);
+  const char* collectedHeaders[] = {"X-OTA-Signature"};
+  server.collectHeaders(collectedHeaders, 1);
   server.begin();
   Serial.println("Server started");
 
-  Serial.println("[OTA] ArduinoOTA disabled; signed authenticated web OTA only");
+  Serial.println("[OTA] ArduinoOTA disabled; signed web OTA only");
 
   // ESP32-C3 одноядерный: фоновые задачи time-slice на том же ядре, WebServer остаётся в loop task.
   BaseType_t weatherTaskOk = xTaskCreatePinnedToCore(
@@ -3669,6 +3477,7 @@ void setup() {
 //  LOOP
 // ════════════════════════════════════════════════════════════
 void loop() {
+  sampleMemoryMetrics();
   // Отложенная перезагрузка: ждём 500 мс после ответа браузеру, чтобы TCP успел сброситься
   if (rebootPending.load() && millis() - rebootMs.load() > 1000) ESP.restart();
 
@@ -3676,12 +3485,6 @@ void loop() {
   dnsServer.processNextRequest();
   server.handleClient();
   serviceWifiConnectStateMachine();
-  { static uint32_t lastMemorySampleMs = 0;
-    if (millis() - lastMemorySampleMs >= 1000UL) {
-      lastMemorySampleMs = millis();
-      sampleMemoryMetrics();
-    }
-  }
 
   // Boot-guard: 60 с аптайма без краша = загрузка успешна. Критерий — только
   // millis(): прошивка в AP-режиме без Wi-Fi тоже валидна, привязка к Wi-Fi
@@ -3727,9 +3530,9 @@ void loop() {
     }
   }
 
-  // До первичного provisioning onboarding AP остаётся доступным даже при
-  // рабочем STA. После создания admin-пароля действует обычный 60-с таймаут.
-  if (wifiConnected && apMode.load() && securityState.adminProvisioned) {
+  // Open onboarding/fallback AP remains available for 60 seconds after STA
+  // recovery, then the radio returns to STA-only steady state.
+  if (wifiConnected && apMode.load()) {
     uint32_t apOff = apOffMs.load();
     if (apOff == 0) { apOff = millis(); apOffMs.store(apOff); }
     if (millis() - apOff > 60000) {
@@ -3839,16 +3642,13 @@ void loop() {
   // 4 FPS нужны только мигающим/пульсирующим состояниям Bambu. Статичный экран
   // проверяем раз в секунду; showClockTemp() дополнительно пропускает FastLED.show(),
   // если минута, температура, настройки и состояние принтера не изменились.
-  PrinterStateSnapshot printer = printerStatusSource.snapshot();
+  PrinterStateSnapshot printer = selectedPrinterSnapshot();
   bool animatedOverlay = printer.visibleLifecycle == PRINTER_PREPARING ||
                          printer.visibleLifecycle == PRINTER_PAUSED ||
                          printer.visibleLifecycle == PRINTER_FINISHED ||
                          printer.visibleLifecycle == PRINTER_ERROR;
   uint32_t drawIntervalMs = animatedOverlay ? 250UL : 1000UL;
-  if (apCredentialDisplayStartedMs && millis() - lastDrawMs >= 200UL) {
-    lastDrawMs = millis();
-    showApCredentialFrame();
-  } else if (!apCredentialDisplayStartedMs && millis() - lastDrawMs >= drawIntervalMs) {
+  if (millis() - lastDrawMs >= drawIntervalMs) {
     lastDrawMs = millis();
     showClockTemp();
   }

@@ -11,6 +11,7 @@
 #include "bambu_report_parser.hpp"
 #include "printer_status_source.hpp"
 #include "secure_network_coordinator.hpp"
+#include "t05_resilience.hpp"
 
 enum BambuAuthPhase : uint8_t {
   BAMBU_AUTH_SIGNED_OUT = 0,
@@ -47,6 +48,10 @@ struct BambuCloudPublicStatus {
   uint8_t automaticRefreshFailures;
   uint32_t nextRefreshAttemptIn;
   bool automaticRefreshPending;
+  uint8_t recoveryReason;
+  uint8_t recoveryFailures;
+  uint32_t nextRecoveryAttemptIn;
+  uint32_t mqttTaskStackReserve;
 };
 
 class DirectCloudSource : public PrinterStatusSource {
@@ -80,7 +85,7 @@ class BambuCloud {
   bool begin();
   void service(bool wifiConnected, bool otaInProgress);
   void stopForOta();
-  void pauseForExternalTls();
+  bool pauseForExternalTls();
   void resumeAfterExternalTls();
 
   bool submitLogin(const char* email, const char* password, bool chinaRegion,
@@ -181,7 +186,12 @@ class BambuCloud {
   std::atomic<bool> mqttUsingCandidate_{false};
   std::atomic<bool> candidateTransportFailed_{false};
   std::atomic<bool> activeCredentialRejected_{false};
+  std::atomic<bool> activeTransportFailed_{false};
+  std::atomic<uint8_t> activeTransportFailureReason_{RECOVERY_MQTT};
   std::atomic<bool> mqttStopping_{false};
   std::atomic<bool> externalTlsPaused_{false};
   bool initialized_;
+  BoundedRecoveryBackoff mqttRecovery_;
+  bool wifiWasAvailable_;
+  std::atomic<uint32_t> mqttTaskMinimumReserve_{UINT32_MAX};
 };

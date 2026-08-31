@@ -15,14 +15,33 @@ enum SecureNetworkOwner : uint8_t {
 class SecureNetworkCoordinator {
  public:
   bool acquire(SecureNetworkOwner owner) {
+    if (owner == SECURE_NETWORK_OTA) return acquireOta();
+    if (otaPending_.load()) return false;
     uint8_t expected = SECURE_NETWORK_NONE;
     return owner != SECURE_NETWORK_NONE &&
            owner_.compare_exchange_strong(expected, owner);
   }
 
+  // OTA announces intent before MQTT is stopped. From that instant no new
+  // TLS owner may enter; flash writing starts only after OTA owns the lease.
+  void requestOta() { otaPending_.store(true); }
+
+  bool acquireOta() {
+    otaPending_.store(true);
+    uint8_t expected = SECURE_NETWORK_NONE;
+    return owner_.compare_exchange_strong(expected, SECURE_NETWORK_OTA);
+  }
+
+  void cancelOtaRequest() {
+    if (owner() != SECURE_NETWORK_OTA) otaPending_.store(false);
+  }
+
   void release(SecureNetworkOwner owner) {
     uint8_t expected = owner;
-    owner_.compare_exchange_strong(expected, SECURE_NETWORK_NONE);
+    if (owner_.compare_exchange_strong(expected, SECURE_NETWORK_NONE) &&
+        owner == SECURE_NETWORK_OTA) {
+      otaPending_.store(false);
+    }
   }
 
   SecureNetworkOwner owner() const {
@@ -30,9 +49,11 @@ class SecureNetworkCoordinator {
   }
 
   bool available() const { return owner() == SECURE_NETWORK_NONE; }
+  bool otaPending() const { return otaPending_.load(); }
 
  private:
   std::atomic<uint8_t> owner_{SECURE_NETWORK_NONE};
+  std::atomic<bool> otaPending_{false};
 };
 
 class SecureNetworkLease {
