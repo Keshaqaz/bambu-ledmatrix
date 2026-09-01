@@ -100,11 +100,29 @@ static void test_missing_refresh_fails_closed() {
   assert(refreshLifetime == 0);
 }
 
+static void test_classifies_bounded_http_403_without_exposing_body() {
+  char error[32] = {};
+  bambuAuthHttpFailureCode(
+      403,
+      "{\"error\":\"CSRF error: missing_cookie\","
+      "\"reason\":\"missing_cookie\"}", error, sizeof(error));
+  assert(strcmp(error, "csrf_missing_cookie") == 0);
+  bambuAuthHttpFailureCode(
+      403, "<html><title>Attention Required | Cloudflare</title>", error,
+      sizeof(error));
+  assert(strcmp(error, "cloudflare_blocked") == 0);
+  bambuAuthHttpFailureCode(403, "opaque refusal", error, sizeof(error));
+  assert(strcmp(error, "http_403") == 0);
+  bambuAuthHttpFailureCode(429, "cloudflare", error, sizeof(error));
+  assert(strcmp(error, "http_429") == 0);
+}
+
 int main() {
   test_extracts_only_cookie_pair();
   test_rejects_unbounded_or_injectable_cookie();
   test_selects_session_cookie_independently_of_header_order();
   test_accepts_portal_token_envelope();
   test_missing_refresh_fails_closed();
+  test_classifies_bounded_http_403_without_exposing_body();
   return 0;
 }

@@ -518,7 +518,30 @@ static bool cloudJsonRequest(SecureNetworkCoordinator& coordinator,
              http.POST(reinterpret_cast<uint8_t*>(const_cast<char*>(body ? body : "{}")),
                        body ? strlen(body) : 2);
   if (code != 200) {
-    snprintf(error, errorSize, "http_%d", code);
+    static constexpr size_t kMaximumErrorBodyBytes = 512;
+    char errorBody[kMaximumErrorBodyBytes + 1] = {};
+    NetworkClient& errorStream = http.getStream();
+    size_t received = 0;
+    uint32_t lastDataMs = millis();
+    while (received < kMaximumErrorBodyBytes &&
+           (errorStream.connected() || errorStream.available())) {
+      const int available = errorStream.available();
+      if (available <= 0) {
+        if (millis() - lastDataMs >= 2000) break;
+        delay(1);
+        continue;
+      }
+      const size_t wanted = min(static_cast<size_t>(available),
+                                kMaximumErrorBodyBytes - received);
+      const int count = errorStream.read(
+          reinterpret_cast<uint8_t*>(errorBody + received), wanted);
+      if (count <= 0) break;
+      received += static_cast<size_t>(count);
+      lastDataMs = millis();
+    }
+    errorBody[received] = '\0';
+    bambuAuthHttpFailureCode(code, errorBody, error, errorSize);
+    bambuSecureZero(errorBody, sizeof(errorBody));
     http.end();
     return false;
   }

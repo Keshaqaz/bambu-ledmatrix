@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 struct BambuAuthEnvelopeInput {
@@ -24,6 +25,41 @@ inline const char* bambuFirstNonEmpty(const char* first, const char* second,
   if (first && first[0]) return first;
   if (second && second[0]) return second;
   return third && third[0] ? third : "";
+}
+
+inline bool bambuAsciiContainsCaseInsensitive(const char* haystack,
+                                              const char* needle) {
+  if (!haystack || !needle || !needle[0]) return false;
+  const size_t needleLength = strlen(needle);
+  for (const char* start = haystack; *start; ++start) {
+    size_t index = 0;
+    while (index < needleLength && start[index]) {
+      char left = start[index];
+      char right = needle[index];
+      if (left >= 'A' && left <= 'Z') left = left - 'A' + 'a';
+      if (right >= 'A' && right <= 'Z') right = right - 'A' + 'a';
+      if (left != right) break;
+      ++index;
+    }
+    if (index == needleLength) return true;
+  }
+  return false;
+}
+
+// Convert a bounded server response into a stable, non-secret diagnostic code.
+// Never expose the response body through WebUI/API or logs.
+inline void bambuAuthHttpFailureCode(int statusCode, const char* boundedBody,
+                                    char* output, size_t outputSize) {
+  if (!output || outputSize == 0) return;
+  if (statusCode == 403 &&
+      bambuAsciiContainsCaseInsensitive(boundedBody, "missing_cookie")) {
+    snprintf(output, outputSize, "csrf_missing_cookie");
+  } else if (statusCode == 403 &&
+             bambuAsciiContainsCaseInsensitive(boundedBody, "cloudflare")) {
+    snprintf(output, outputSize, "cloudflare_blocked");
+  } else {
+    snprintf(output, outputSize, "http_%d", statusCode);
+  }
 }
 
 // Keep only the RFC cookie-pair needed for the next portal request. Attributes

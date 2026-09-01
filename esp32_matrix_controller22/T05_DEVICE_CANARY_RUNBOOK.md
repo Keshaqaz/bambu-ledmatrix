@@ -5,9 +5,25 @@ OTA, Bambu authorization, shadow/canary, fault recovery, rollback и запус�
 72-часового soak в одно присутствие владельца. Пароль, verification/TOTP codes,
 tokens и print payload не записываются.
 
-Локально подготовленный `4.3.1-2026.09.01`: linked image `1 385 249` байт,
-экспортированный `.ino.bin` `1 385 392` байта, globals `49 780` байт; SHA-256
-image `a1a63e56e8fbe0919c165eedc9bcc9b2b0b5e00ec64b1ca02b038913bdb49c2f`.
+Локально подготовленный `4.3.3-2026.09.01`: linked image `1 385 857` байт,
+экспортированный `.ino.bin` `1 386 000` байт, globals `49 780` байт; SHA-256
+image `59834aa4102695c20e5d4fab3a8d819de9153fb9e6c0508e12419042eef8983e`.
+
+## Canary evidence — 2026-09-01
+
+- USB-переход с T04 на `4.3.1` и следующий passwordless signed Web OTA прошли;
+  слот сменился `app0 -> app1`, неподписанный запрос отклонён `403`.
+- После boot guard: minimum internal heap `114 388`, minimum largest block
+  `114 676`, reserve loop `3 024`, weather `17 236`, printer `7 488` байт.
+  Эти доступные C3 gates проходят; MQTT reserve ожидает рабочую Cloud session.
+- Реальный initial password login на `4.3.3` классифицирован как
+  `cloudflare_blocked` до email/SMS/TOTP state. Обезличенный differential probe
+  с Mac, тем же endpoint, HTTP/1.0 и header set дошёл до Bambu API и получил
+  ожидаемый `400` для фиктивного аккаунта. Значит Cloudflare отклоняет сетевой
+  fingerprint ESP32 до проверки credentials.
+- Это не C3 memory/CPU failure: перенос того же firmware/TLS stack на S3 не
+  устранит блокировку. Direct Cloud canary и 72-часовой soak не запускаются до
+  отдельного решения для поддерживаемого Cloud login transport.
 
 ## До окна владельца
 
