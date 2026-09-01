@@ -130,6 +130,7 @@ class TransportOracleTest(unittest.TestCase):
                     "state": "recoverable_error",
                     "operationId": "",
                     "error": "cloudflare_blocked",
+                    "transportProfile": 0,
                 },
             )
         )
@@ -141,6 +142,34 @@ class TransportOracleTest(unittest.TestCase):
                 "TRANSPORT_BLOCKED",
             )
 
+    def test_esp_profile_is_sent_and_terminal_status_must_match(self):
+        calls = []
+        responses = iter(
+            (
+                clean_esp_status(),
+                {"accepted": True, "operationId": "expected-operation"},
+                {
+                    "state": "recoverable_error",
+                    "operationId": "",
+                    "error": "cloudflare_blocked",
+                    "transportProfile": 1,
+                },
+            )
+        )
+
+        def read_json(*args, **kwargs):
+            calls.append((args, kwargs))
+            return next(responses)
+
+        with mock.patch.object(self.probe, "read_json", side_effect=read_json):
+            self.assertEqual(
+                self.probe.esp_request("http://device.invalid", 2, profile=2),
+                "TRANSPORT_ERROR",
+            )
+
+        login_body = calls[1][1]["body"]
+        self.assertIn(b'"transportProfile":2', login_body)
+
     def test_esp_fast_terminal_status_is_correlated_by_clean_baseline(self):
         responses = iter(
             (
@@ -150,6 +179,7 @@ class TransportOracleTest(unittest.TestCase):
                     "state": "recoverable_error",
                     "operationId": "",
                     "error": "cloudflare_blocked",
+                    "transportProfile": 0,
                 },
             )
         )

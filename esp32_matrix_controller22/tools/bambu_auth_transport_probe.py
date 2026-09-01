@@ -275,7 +275,7 @@ def prepare_esp_baseline(base_url, timeout_seconds):
     return False
 
 
-def esp_request(base_url, timeout_seconds):
+def esp_request(base_url, timeout_seconds, profile=0):
     if not prepare_esp_baseline(base_url, min(timeout_seconds, 5)):
         return VERDICT_ERROR
     login_body = json.dumps(
@@ -283,6 +283,7 @@ def esp_request(base_url, timeout_seconds):
             "email": SYNTHETIC_ACCOUNT,
             "password": SYNTHETIC_PASSWORD,
             "region": "global",
+            "transportProfile": profile,
         },
         separators=(",", ":"),
     ).encode("utf-8")
@@ -309,6 +310,8 @@ def esp_request(base_url, timeout_seconds):
                 return VERDICT_ERROR
             verdict = classify_esp_status(status)
             if verdict:
+                if status.get("transportProfile") != profile:
+                    return VERDICT_ERROR
                 return verdict
         time.sleep(0.25)
     return VERDICT_ERROR
@@ -322,11 +325,12 @@ def main():
     esp = subparsers.add_parser("esp")
     esp.add_argument("--url", required=True)
     esp.add_argument("--timeout", type=float, default=25.0)
+    esp.add_argument("--profile", type=int, choices=range(5), default=0)
     args = parser.parse_args()
     if args.target == "desktop":
         verdict = desktop_request(args.timeout)
     else:
-        verdict = esp_request(args.url, args.timeout)
+        verdict = esp_request(args.url, args.timeout, args.profile)
     print(verdict)
     return {VERDICT_PASS: 0, VERDICT_BLOCKED: 2, VERDICT_ERROR: 3}[verdict]
 

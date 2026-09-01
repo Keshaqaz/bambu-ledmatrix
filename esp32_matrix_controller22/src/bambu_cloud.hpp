@@ -54,6 +54,7 @@ struct BambuCloudPublicStatus {
   uint32_t mqttTaskStackReserve;
 #ifdef BAMBU_AUTH_TRANSPORT_PROBE
   bool authTransportApplicationJson;
+  uint8_t authTransportProfile;
 #endif
 };
 
@@ -92,7 +93,7 @@ class BambuCloud {
   void resumeAfterExternalTls();
 
   bool submitLogin(const char* email, const char* password, bool chinaRegion,
-                   char operationId[17]);
+                   char operationId[17], uint8_t transportProfile = 0);
   bool submitVerification(const char* operationId, const char* code);
   bool selectPrinter(const char* operationId, const char* serial);
   bool logout();
@@ -117,6 +118,9 @@ class BambuCloud {
     char password[96];
     char code[16];
     char serial[BAMBU_CLOUD_SERIAL_CAPACITY];
+#ifdef BAMBU_AUTH_TRANSPORT_PROBE
+    uint8_t transportProfile;
+#endif
   };
   struct PendingAuth {
     char account[96];

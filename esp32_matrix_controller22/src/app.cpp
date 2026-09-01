@@ -105,7 +105,7 @@ void loop();
 static constexpr uint16_t CONFIG_VERSION = 332;
 // Версия прошивки: поднимать при каждой OTA-итерации — по смене значения в
 // /api/status видно, что обновление реально применилось.
-static constexpr const char* FW_VERSION = "4.3.3-2026.09.01";
+static constexpr const char* FW_VERSION = "4.3.4-2026.09.02";
 static constexpr uint32_t STORED_STATE_MAGIC = 0x4D415458UL; // MATX
 static constexpr uint16_t STORED_STATE_VERSION = 2;
 static constexpr size_t BAMBU_TOKEN_CAPACITY = 384;
@@ -2254,6 +2254,7 @@ static void appendBambuCloudStatus(JsonDocument& doc,
   doc["candidatePending"] = status.candidatePending;
 #ifdef BAMBU_AUTH_TRANSPORT_PROBE
   doc["transportApplicationJson"] = status.authTransportApplicationJson;
+  doc["transportProfile"] = status.authTransportProfile;
 #endif
   doc["mqttConnected"] = status.mqttConnected;
   doc["firstValidReport"] = status.firstValidReport;
@@ -2289,8 +2290,18 @@ void handleBambuAuthLogin() {
   strlcpy(email, emailValue, sizeof(email));
   strlcpy(password, passwordValue, sizeof(password));
   const bool china = strcmp(doc["region"] | "global", "china") == 0;
+#ifdef BAMBU_AUTH_TRANSPORT_PROBE
+  const int transportProfileValue = doc["transportProfile"] | 0;
+  const uint8_t transportProfile =
+      transportProfileValue >= 0 && transportProfileValue <= 4
+          ? static_cast<uint8_t>(transportProfileValue)
+          : UINT8_MAX;
+#else
+  const uint8_t transportProfile = 0;
+#endif
   char operationId[17] = "";
-  const bool accepted = bambuCloud.submitLogin(email, password, china, operationId);
+  const bool accepted = bambuCloud.submitLogin(email, password, china,
+                                                operationId, transportProfile);
   char* storedPassword = const_cast<char*>(passwordValue);
   if (storedPassword && storedPassword[0]) secureZero(storedPassword, strlen(storedPassword));
   secureZero(password, sizeof(password));
