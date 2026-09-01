@@ -386,6 +386,7 @@ details .dbody{padding:2px 13px 13px}
     <div class="ch"><h2>Устройство</h2></div>
     <div class="sg">
       <div class="si"><div class="sl2">Прошивка</div><div class="sv ac" id="sFw">—</div></div>
+      <div class="si"><div class="sl2">Локальный доступ</div><div class="sv" id="sSecurity">—</div></div>
       <div class="si"><div class="sl2">Аптайм</div><div class="sv" id="sUp">—</div></div>
       <div class="si"><div class="sl2">Память</div><div class="sv" id="sHeap">—</div></div>
       <div class="si"><div class="sl2">CPU</div><div class="sv" id="sCpu">—</div></div>
@@ -416,6 +417,7 @@ details .dbody{padding:2px 13px 13px}
 
   <div class="card">
     <div class="ch"><h2>Обновление прошивки</h2></div>
+    <div class="note" style="margin-bottom:10px">Security level 0: пароль не требуется. Устанавливаются только образы с корректной ECDSA-подписью.</div>
     <label class="drop" id="drop">
       <input type="file" accept=".bin" id="fwFile" onchange="fwPick(this)">
       <span class="dico">⬆</span>
@@ -470,7 +472,7 @@ let appStarted=false;
 /* ── preview mode: моки для file:// ── */
 let mockConnResult=0,mockBambuAuth={state:'signed_out',operationId:'',operationExpiresIn:0,error:'',configured:false,candidatePending:false,printers:[]},mockSettings={brightness:80,autoColor:true,use24h:true,ntpServer:'pool.ntp.org',tzOffset:3,tzFromWeather:true,updateMin:10,weatherProvider:0,apiKeySet:true,city:'Moscow',owmLat:55.7558,owmLon:37.6173,owmUseCoords:false,rotation:0,flipH:false,flipV:false,autoBrightness:false,brightnessDay:80,brightnessNight:20,dayStartHour:7,nightStartHour:22,autoBrSunMode:false,ct6ClockX:0,ct6ClockY:2,ct6TempX:-1,ct6TempY:9,ct6ClockR:255,ct6ClockG:128,ct6ClockB:0,ct6TempR:0,ct6TempG:200,ct6TempB:255,bambuEnabled:true,bambuSource:'relay',bambuRelayUrl:'http://192.168.1.1:8787/status',bambuRelayKeySet:true,bambuConnected:true,bambuPrinterOnline:true,bambuLifecycle:3,bambuProgress:42,bambuDetail:'Preview: печать 42%',sunTimeValid:true,sunriseH:6,sunriseM:12,sunsetH:20,sunsetM:4};
 function mockJson(payload,status=200){return new Response(JSON.stringify(payload),{status,headers:{'Content-Type':'application/json'}});}
-function mockStatus(){return {wifi:true,ap:false,ssid:'Home WiFi',ip:'192.168.1.65',temp:23.4,cpuTemp:41.2,uptime:'3ч 14м',heap:'214 KB',heapInternalMinimum:128000,heapInternalLargest:92000,taskStackFree:{loop:6200,weather:4100,printer:3600,wifi:0},fwVersion:'preview',fwPartition:'app0',rssi:'-58 dBm',weatherSource:'owm',weatherError:'',weatherAgeSec:240,connResult:mockConnResult,connIp:mockConnResult===2?'192.168.1.88':'',connStatus:0,connStatusText:'',savePending:false,saveError:false,bambuEnabled:mockSettings.bambuEnabled,bambuConfigured:true,bambuConnected:true,bambuPrinterOnline:true,bambuLifecycle:3,bambuProgress:42,bambuDetail:mockSettings.bambuDetail,sunTimeValid:true,sunriseH:6,sunriseM:12,sunsetH:20,sunsetM:4};}
+function mockStatus(){return {wifi:true,ap:false,ssid:'Home WiFi',ip:'192.168.1.65',temp:23.4,cpuTemp:41.2,uptime:'3ч 14м',heap:'214 KB',heapInternalMinimum:128000,heapInternalLargest:92000,taskStackFree:{loop:6200,weather:4100,printer:3600,wifi:0},fwVersion:'preview',fwPartition:'app0',localSecurityLevel:0,otaPasswordRequired:false,otaSignatureRequired:true,rssi:'-58 dBm',weatherSource:'owm',weatherError:'',weatherAgeSec:240,connResult:mockConnResult,connIp:mockConnResult===2?'192.168.1.88':'',connStatus:0,connStatusText:'',savePending:false,saveError:false,bambuEnabled:mockSettings.bambuEnabled,bambuConfigured:true,bambuConnected:true,bambuPrinterOnline:true,bambuLifecycle:3,bambuProgress:42,bambuDetail:mockSettings.bambuDetail,sunTimeValid:true,sunriseH:6,sunriseM:12,sunsetH:20,sunsetM:4};}
 async function apiFetch(url,opts={}){const headers=new Headers(opts.headers||{});if(opts.body!==undefined&&!headers.has('Content-Type'))headers.set('Content-Type','application/json');const method=(opts.method||'GET').toUpperCase();
   if(PREVIEW_MODE){
     if(url==='/api/settings'&&method==='GET')return mockJson(mockSettings);
@@ -762,6 +764,7 @@ async function fetchStatus(){
     fetchBambuAuth();
     /* система */
     if(d.fwVersion)g('sFw').textContent=d.fwVersion+' · '+(d.fwPartition||'?');
+    g('sSecurity').textContent=d.localSecurityLevel===0&&!d.otaPasswordRequired&&d.otaSignatureRequired?'Level 0 · без пароля · signed OTA':'—';
     g('sUp').textContent=d.uptime||'—';
     g('sHeap').textContent=d.heap||'—';
     g('sHeapMin').textContent=fmtBytes(d.heapInternalMinimum);

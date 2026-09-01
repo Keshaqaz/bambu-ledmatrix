@@ -5,9 +5,9 @@ OTA, Bambu authorization, shadow/canary, fault recovery, rollback и запус�
 72-часового soak в одно присутствие владельца. Пароль, verification/TOTP codes,
 tokens и print payload не записываются.
 
-Локально подготовленный `4.3.0-2026.08.31`: linked image `1 384 919` байт,
-экспортированный `.ino.bin` `1 385 072` байта, globals `49 780` байт; SHA-256
-image `6c96aaf37956b3aa74493d00cc7f1306ec98450773944be655c6378db587a019`.
+Локально подготовленный `4.3.1-2026.09.01`: linked image `1 385 249` байт,
+экспортированный `.ino.bin` `1 385 392` байта, globals `49 780` байт; SHA-256
+image `a1a63e56e8fbe0919c165eedc9bcc9b2b0b5e00ec64b1ca02b038913bdb49c2f`.
 
 ## До окна владельца
 

@@ -2,6 +2,7 @@
 #include <string.h>
 
 #include "../src/secure_network_coordinator.hpp"
+#include "../src/local_access_policy.hpp"
 #include "../src/t05_resilience.hpp"
 
 static PrinterStateSnapshot representativeSnapshot() {
@@ -20,6 +21,14 @@ static PrinterStateSnapshot representativeSnapshot() {
   strcpy(value.stage, "printing");
   strcpy(value.detail, "printing");
   return value;
+}
+
+static void test_local_ota_policy_is_open_but_signed() {
+  static_assert(LOCAL_SECURITY_LEVEL == 0, "local WebUI/API must stay open");
+  static_assert(!OTA_PASSWORD_REQUIRED, "OTA must not require a user password");
+  static_assert(OTA_SIGNATURE_REQUIRED, "unsigned OTA must remain forbidden");
+  assert(authorizeLocalOtaUpload(true));
+  assert(!authorizeLocalOtaUpload(false));
 }
 
 static void test_ota_blocks_new_tls_owners() {
@@ -105,6 +114,7 @@ static void test_source_mode_contract() {
 }
 
 int main() {
+  test_local_ota_policy_is_open_but_signed();
   test_ota_blocks_new_tls_owners();
   test_recovery_is_bounded_and_wrap_safe();
   test_shadow_compares_every_normalized_field_without_storing_values();

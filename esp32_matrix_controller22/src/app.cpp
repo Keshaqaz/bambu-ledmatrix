@@ -47,6 +47,7 @@
 #include "security_policy.hpp"
 #include "secure_network_coordinator.hpp"
 #include "t05_resilience.hpp"
+#include "local_access_policy.hpp"
 #include "wifi_reconnect_policy.hpp"
 
 // PlatformIO compiles sources as plain C++ and does not apply Arduino's .ino
@@ -104,7 +105,7 @@ void loop();
 static constexpr uint16_t CONFIG_VERSION = 332;
 // Версия прошивки: поднимать при каждой OTA-итерации — по смене значения в
 // /api/status видно, что обновление реально применилось.
-static constexpr const char* FW_VERSION = "4.3.0-2026.08.31";
+static constexpr const char* FW_VERSION = "4.3.1-2026.09.01";
 static constexpr uint32_t STORED_STATE_MAGIC = 0x4D415458UL; // MATX
 static constexpr uint16_t STORED_STATE_VERSION = 2;
 static constexpr size_t BAMBU_TOKEN_CAPACITY = 384;
@@ -2607,6 +2608,9 @@ void handleStatus() {
   doc["uptimeSeconds"] = millis() / 1000UL;
   doc["fwVersion"]  = FW_VERSION;
   doc["fwPartition"] = esp_ota_get_running_partition()->label; // app0/app1 — виден фактический слот
+  doc["localSecurityLevel"] = LOCAL_SECURITY_LEVEL;
+  doc["otaPasswordRequired"] = OTA_PASSWORD_REQUIRED;
+  doc["otaSignatureRequired"] = OTA_SIGNATURE_REQUIRED;
   uint32_t currentInternalHeap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   uint32_t minimumInternalHeap = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   uint32_t largestInternalBlock = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -2796,7 +2800,8 @@ void handleWeatherRefresh() {
 }
 
 // ════════════════════════════════════════════════════════════
-//  OTA: подписанная аутентифицированная веб-загрузка /api/update
+//  OTA: открытая локальная веб-загрузка /api/update без password/session gate.
+//  Авторизуется сам image: корректная ECDSA-P256 подпись обязательна.
 //  Образ пишется в неактивный слот; otadata переключается атомарно
 //  в Update.end() — до этого момента обрыв безвреден.
 // ════════════════════════════════════════════════════════════
@@ -2930,7 +2935,7 @@ void handleUpdateUpload() {
     case UPLOAD_FILE_START: {
       otaResetVerification();
       otaUploadError[0] = '\0';
-      if (!otaReadSignatureHeader()) {
+      if (!authorizeLocalOtaUpload(otaReadSignatureHeader())) {
         strlcpy(otaUploadError, "missing_or_invalid_signature", sizeof(otaUploadError));
         break;
       }
