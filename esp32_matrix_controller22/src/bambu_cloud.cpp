@@ -4,14 +4,6 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <esp_tls_errors.h>
-#ifdef BAMBU_AUTH_TRANSPORT_PROBE
-#include <esp_transport.h>
-#include <esp_transport_ssl.h>
-#if !CONFIG_MBEDTLS_SSL_PROTO_TLS1_2 || \
-    !CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS
-#error "AT02 profiles require the stock TLS 1.2 and client ticket support"
-#endif
-#endif
 #include <stdlib.h>
 #include <strings.h>
 #include <time.h>
@@ -113,105 +105,6 @@ static JsonVariantConst responseData(const JsonDocument& document) {
 #ifdef BAMBU_AUTH_TRANSPORT_PROBE
 static constexpr uint8_t kMaximumAuthTransportProfile = 4;
 static const char* kHttp11Alpn[] = {"http/1.1", nullptr};
-static const int kDesktopTls12CipherOrder[] = {
-    0xC02C, 0xC030, 0x009F, 0xCCA9, 0xCCA8, 0xCCAA, 0xC02B,
-    0xC02F, 0x009E, 0xC024, 0xC028, 0x006B, 0xC023, 0xC027,
-    0x0067, 0xC00A, 0xC014, 0x0039, 0xC009, 0xC013, 0x0033,
-    0x009D, 0x009C, 0x003D, 0x003C, 0x0035, 0x002F, 0,
-};
-
-class EspTlsProfileClient final : public NetworkClient {
- public:
-  EspTlsProfileClient(uint8_t profile, const char* ca, const char* hostname)
-      : transport_(esp_transport_ssl_init()), profile_(profile), ca_(ca),
-        hostname_(hostname), connected_(false), peeked_(-1) {
-    if (!transport_) return;
-    esp_transport_ssl_set_cert_data(transport_, ca_, strlen(ca_) + 1);
-    if (profile_ == 2 || profile_ == 4) {
-      esp_transport_ssl_set_tls_version(transport_, ESP_TLS_VER_TLS_1_2);
-      esp_transport_ssl_set_ciphersuites_list(
-          transport_, kDesktopTls12CipherOrder);
-    }
-    if (profile_ == 4)
-      esp_transport_ssl_set_common_name(transport_, hostname_);
-  }
-
-  ~EspTlsProfileClient() override {
-    stop();
-    if (transport_) esp_transport_destroy(transport_);
-  }
-
-  int connect(IPAddress, uint16_t) override { return 0; }
-  int connect(IPAddress, uint16_t, int32_t) override { return 0; }
-  int connect(const char* host, uint16_t port) override {
-    return connect(host, port, 12000);
-  }
-  int connect(const char* host, uint16_t port, int32_t timeoutMs) override {
-    if (!transport_ || !host || strcmp(host, hostname_) != 0) return 0;
-    connected_ = esp_transport_connect(transport_, host, port, timeoutMs) == 0;
-    return connected_ ? 1 : 0;
-  }
-  size_t write(uint8_t value) override { return write(&value, 1); }
-  size_t write(const uint8_t* buffer, size_t size) override {
-    if (!connected_ || !buffer || size == 0) return 0;
-    const int written = esp_transport_write(
-        transport_, reinterpret_cast<const char*>(buffer), size, 12000);
-    if (written < 0) connected_ = false;
-    return written > 0 ? static_cast<size_t>(written) : 0;
-  }
-  int available() override {
-    if (peeked_ >= 0) return 1;
-    if (!connected_) return 0;
-    const int ready = esp_transport_poll_read(transport_, 0);
-    if (ready < 0) connected_ = false;
-    return ready > 0 ? ready : 0;
-  }
-  int read() override {
-    uint8_t value = 0;
-    return read(&value, 1) == 1 ? value : -1;
-  }
-  int read(uint8_t* buffer, size_t size) override {
-    if (!buffer || size == 0) return 0;
-    size_t offset = 0;
-    if (peeked_ >= 0) {
-      buffer[offset++] = static_cast<uint8_t>(peeked_);
-      peeked_ = -1;
-      if (offset == size) return offset;
-    }
-    if (!connected_) return offset ? static_cast<int>(offset) : -1;
-    const int received = esp_transport_read(
-        transport_, reinterpret_cast<char*>(buffer + offset), size - offset,
-        12000);
-    if (received < 0) connected_ = false;
-    return received > 0 ? static_cast<int>(offset) + received
-                        : (offset ? static_cast<int>(offset) : -1);
-  }
-  int peek() override {
-    if (peeked_ >= 0) return peeked_;
-    uint8_t value = 0;
-    const int received = read(&value, 1);
-    if (received != 1) return -1;
-    peeked_ = value;
-    return peeked_;
-  }
-  void flush() override {}
-  void stop() override {
-    if (transport_ && connected_) esp_transport_close(transport_);
-    connected_ = false;
-    peeked_ = -1;
-  }
-  uint8_t connected() override { return connected_ ? 1 : 0; }
-  void setConnectionTimeout(uint32_t) override {}
-  int fd() const override { return -1; }
-
- private:
-  esp_transport_handle_t transport_;
-  uint8_t profile_;
-  const char* ca_;
-  const char* hostname_;
-  bool connected_;
-  int peeked_;
-};
 #endif
 
 static const char* firstString(JsonVariantConst object, const char* a,
@@ -714,12 +607,9 @@ static bool cloudJsonRequest(SecureNetworkCoordinator& coordinator,
     copyCode(error, errorSize, "transport_profile_invalid");
     return false;
   }
-  if (transportProfile >= 2) {
-    EspTlsProfileClient client(transportProfile, kBambuCloudCa,
-                               "api.bambulab.com");
-    return cloudJsonRequestWithClient(client, url, method, body, bearer,
-                                      response, error, errorSize,
-                                      applicationJson);
+  if (transportProfile == 2 || transportProfile == 4) {
+    copyCode(error, errorSize, "transport_profile_unsupported");
+    return false;
   }
 #else
   (void)transportProfile;

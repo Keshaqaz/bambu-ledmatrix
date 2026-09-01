@@ -2,10 +2,12 @@
 
 Date: 2026-09-02
 
-Status: complete. Ни один штатный профиль не получил Bambu application JSON.
-Два профиля воспроизвели Cloudflare block, а три профиля на узком штатном
-`esp_transport` adapter завершились локальной ошибкой до HTTP response. Это не
-считается доказательством изменения Cloudflare fingerprint.
+Status: complete with one documented toolchain infeasibility. Ни один допустимый
+штатный профиль не получил Bambu application JSON. Baseline и единственный
+реализуемый independent variant воспроизвели Cloudflare block; explicit
+TLS/cipher/ticket profile невозможно выразить публичным API установленного core
+без его миграции/rebuild. Неуспешный adapter experiment не считается verdict
+TLS profile и удалён из итогового кода.
 
 ## Oracle и фиксированный input
 
@@ -39,17 +41,27 @@ URL и обязательной hostname validation.
 |---|---|---|
 | 0 | AT01 production baseline: `WiFiClientSecure`, штатный Mbed TLS default | CA через `setCACert`; `api.bambulab.com` передан в `HTTPClient::begin` |
 | 1 | Profile 0 плюс ALPN `http/1.1`; SNI и hostname остаются явным hostname подключения | То же, validation не отключалась |
-| 2 | Штатный `esp_transport_ssl`: TLS 1.2, client-ticket support из core config и TLS 1.2 cipher IDs в порядке desktop control | Тот же CA; hostname передан в `esp_transport_connect`, `skip_common_name` не используется |
-| 3 | Штатный актуальный ESP-IDF/ESP-TLS default core 3.3.8: version `ANY`, default cipher list, без project migration | Тот же CA и hostname; `skip_common_name` не используется |
-| 4 | Bounded combination: profile 2 плюс явный `common_name=api.bambulab.com`; ALPN исключён, потому что profile 1 не изменил verdict, а desktop control не имел ALPN | Тот же CA, hostname подключения и дополнительный explicit common name |
+| 2 | Infeasible в установленном core: требуется одновременно задать TLS 1.2, desktop cipher order и session tickets | Не запускается; validation не ослабляется |
+| 3 | Актуальный поддерживаемый default — тот же Arduino core 3.3.8 / `WiFiClientSecure` default, уже проверенный profile 0; migration не требуется | Та же CA/hostname validation, что в profile 0 |
+| 4 | Not eligible: ни один независимый новый параметр не изменил oracle и не приблизил wire profile к desktop control | Не запускается; недопустимая комбинация не создаётся |
 
 Arduino ESP32 core 3.3.8 собран с
 `CONFIG_MBEDTLS_SSL_PROTO_TLS1_2=1`,
 `CONFIG_MBEDTLS_SSL_ALPN=1` и
 `CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS=1`. TLS 1.3 в C3 core profile не
-включён. Probe build fail-fast проверяет наличие TLS 1.2 и client ticket
-support. Отдельный saved-session API ESP-TLS в этой сборке не включён; AT02 не
-утверждает, что выполнял resumption второго соединения.
+включён. Однако публичный `WiFiClientSecure` предоставляет ALPN, CA и timeout,
+но не TLS-version/cipher/ticket setters. `esp_transport_ssl` предоставляет
+version и cipher list, но его session-ticket operation полностью исключён,
+поскольку `CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS` в core не определён. Поэтому
+profile 2 нельзя реализовать как заданную атомарную группу без rebuild/migration
+core; наличие внутреннего Mbed TLS feature macro не подменяет явную настройку и
+не является handshake evidence.
+
+В device image был диагностически проверен узкий `esp_transport`/Arduino
+`HTTPClient` adapter. Он вернул одинаковый `http_-1` даже на default settings,
+не изолировал TLS parameters и потому был отвергнут review. Итоговый код fail
+closed возвращает `transport_profile_unsupported` для IDs 2/4, отображает ID 3
+на unchanged baseline transport и не содержит этот adapter.
 
 ## Матрица verdict
 
@@ -61,9 +73,9 @@ signed OTA deploy. До него live baseline AT01 был `4.3.3-2026.09.01` н
 |---|---|---|
 | 0 | `TRANSPORT_BLOCKED` | Два контрольных повтора AT02 после устранения фонового WebUI polling, плюс отдельный post-reboot repeat: public error `cloudflare_blocked`, application proof false |
 | 1 | `TRANSPORT_BLOCKED` | public error `cloudflare_blocked`, application proof false; ALPN не приблизил outcome к desktop control |
-| 2 | `TRANSPORT_ERROR` | public error `http_-1`, application proof false; соединение через probe-only `esp_transport` adapter не дошло до классифицируемого HTTP response |
-| 3 | `TRANSPORT_ERROR` | тот же `http_-1` на штатном ESP-TLS default; это локализует ошибку в узком adapter path, а не в заданном cipher order |
-| 4 | `TRANSPORT_ERROR` | тот же `http_-1`; bounded combination не дал application response |
+| 2 | `INFEASIBLE` | public API split точен: `WiFiClientSecure` не задаёт version/ciphers/tickets, а `esp_transport_ssl_session_ticket_operation` скомпилирован только при отсутствующем `CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS`; необратимая core migration запрещена profile 3 condition и не оправдана AT02 |
+| 3 | `TRANSPORT_BLOCKED` | установленный core 3.3.8 уже является актуальным поддерживаемым default и совпадает с profile 0; отдельной настройки или migration нет, поэтому применим воспроизводимый profile 0 oracle |
+| 4 | `NOT_APPLICABLE` | profile 1 сохранил `BLOCKED`, ALPN отсутствует у desktop control; profile 2 infeasible, profile 3 дублирует baseline — параметров, удовлетворяющих bounded-combination gate, нет |
 
 Первый profile 0 invocation сразу после OTA вернул `TRANSPORT_ERROR`, потому
 что оставленная открытой WebUI вкладка продолжала polling однопоточного
@@ -71,24 +83,26 @@ WebServer. Login operation при этом не была принята, status 
 `signed_out`. После закрытия вкладки profile 0 воспроизводимо дал
 `TRANSPORT_BLOCKED`; инфраструктурный запуск не включён в matrix verdict.
 
-Profiles 2–4 не имеют fingerprint verdict: `TRANSPORT_ERROR` не переименован в
-`BLOCKED`. Их одинаковая ошибка на default и configured ESP-TLS profiles
-документирует несовместимость узкого `esp_transport`/Arduino `HTTPClient`
-adapter в этой probe-сборке. HTTP headers не перебирались, validation не
-ослаблялась, workaround не добавлялся.
+Диагностические `http_-1` runs IDs 2–4 не включены как profile verdicts:
+`TRANSPORT_ERROR` не переименован в `BLOCKED`, а invalid profile 4 не объявлен
+bounded combination. Они лишь отвергли промежуточный adapter. HTTP headers не
+перебирались, validation не ослаблялась, workaround не добавлялся.
 
 ## Image и RAM
 
 | Build | Flash | Globals | Delta к AT01 соответствующему build |
 |---|---:|---:|---:|
 | Production `4.3.4` | 1,386,023 B | 49,780 B | +172 B flash, +0 B globals |
-| AT02 probe, profiles 0–4 | 1,388,689 B | 49,788 B | +2,040 B flash, +8 B globals |
+| Final AT02 probe | 1,387,221 B | 49,788 B | +572 B flash, +8 B globals |
 
 Production app slot — 1,966,080 bytes; обе сборки занимают 70%. Production
 source selector, Cloud transport default, MQTT, weather и OTA backend не
 переключались.
 
-После отдельного reboot и единственного isolated profile 0 run:
+Device resource run выполнялся на первоначальном probe image размером
+1,388,689 B до удаления отвергнутого adapter. Его static RAM совпадает с
+финальным probe image. После отдельного reboot и единственного isolated profile
+0 run:
 
 - current internal heap: 141,356 B;
 - minimum internal heap: 52,416 B;
@@ -118,10 +132,11 @@ Python 3.14. В sandbox loopback bind потребовал разрешённы�
 ## Бинарный вывод
 
 `NO PASS`. Штатные `WiFiClientSecure` profiles 0/1 достигают Cloudflare, но
-остаются `TRANSPORT_BLOCKED`. Profiles 2–4 не квалифицированы по fingerprint,
-потому что probe-only ESP-TLS adapter возвращает локальный `http_-1` до HTTP
-response. Production integration diff не подготовлен и production default не
-изменён.
+остаются `TRANSPORT_BLOCKED`; актуальный default profile 3 эквивалентен profile
+0. Profile 2 точно infeasible через публичный API установленного core, поэтому
+не имеет fingerprint verdict. Profile 4 не имеет eligible parameters и не
+формируется. Production integration diff не подготовлен и production default
+не изменён.
 
 По short-circuit policy следующий обязательный шаг — AT03 auth-only wolfSSL.
 AT02 не разрешает переход прямо к AT04: сначала AT03 должен получить собственный
