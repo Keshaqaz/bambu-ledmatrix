@@ -33,6 +33,13 @@ The classifier inspects at most the first 2,048 body bytes. The OpenSSL process
 accepts at most 65,536 response bytes. Neither response body nor request body,
 credentials, cookies, operation ID, or tokens are printed or persisted.
 
+Before the ESP request, the probe requires an unconfigured `signed_out` state.
+It refuses to run if active/candidate credentials or another operation exist.
+It may reset a prior `recoverable_error` through `/api/bambu/logout` only after
+confirming that no active/candidate credential exists. The accepted operation
+ID stays in memory and every non-empty polled operation ID must match it; a
+foreign operation produces `TRANSPORT_ERROR`.
+
 ## Versions and production build
 
 | Item | Baseline |
@@ -55,7 +62,7 @@ Result: PASS. The linked sketch is 1,385,857 bytes (70% of the app slot), with
 49,780 bytes of globals and 277,900 bytes left for local allocations. No
 production firmware source or production build flags were changed by AT01.
 
-Host verification also passed: all C++ seam tests, 5 AT01 Python oracle tests,
+Host verification also passed: all C++ seam tests, 10 AT01 Python oracle tests,
 22 existing relay Python tests under Python 3.14, Python compilation, shell
 syntax checks, and the deterministic WebUI export check.
 
@@ -102,7 +109,7 @@ not part of the application payload and is not printed.
 
 | Target | Result | Bounded evidence |
 |---|---|---|
-| Desktop OpenSSL control | `TRANSPORT_PASS` | Bambu application JSON content type/status classification; body discarded |
+| Desktop OpenSSL control | `TRANSPORT_PASS` | parsed JSON, HTTP 400, observed Bambu top-level coordinates `code` + `error`; values/body discarded |
 | Live ESP32-C3 production path | `TRANSPORT_BLOCKED` | public auth state `recoverable_error`, code `cloudflare_blocked`; body discarded |
 
 The live post-run diagnostic confirmed firmware `4.3.3-2026.09.01` on `app1`.
@@ -114,11 +121,21 @@ same `BambuCloud::postLogin` / `cloudJsonRequest` path used by WebUI login.
 | Input | Output |
 |---|---|
 | HTTP 403 and `cloudflare` in the bounded, case-insensitive prefix | `TRANSPORT_BLOCKED` |
-| JSON content type or JSON-shaped bounded prefix | `TRANSPORT_PASS` |
+| Parsed JSON, HTTP 400/401, observed Bambu top-level coordinates `code` + `error` | `TRANSPORT_PASS` |
+| Parsed HTTP 200 JSON with Bambu auth `data` coordinates (`loginType` or token-envelope key) | `TRANSPORT_PASS` |
+| Generic, empty, malformed, proxy-status, or unrecognized JSON | `TRANSPORT_ERROR` |
 | ESP public error `cloudflare_blocked` | `TRANSPORT_BLOCKED` |
-| ESP public error `invalid_credentials` or `csrf_missing_cookie` | `TRANSPORT_PASS` |
+| ESP public error `invalid_credentials` | `TRANSPORT_PASS` |
+| ESP public error `csrf_missing_cookie` | `TRANSPORT_ERROR` |
 | ESP verification/fetch/select/connect/ready state | `TRANSPORT_PASS` |
 | ESP recoverable transport error, timeout, malformed/oversized response | `TRANSPORT_ERROR` |
+
+The ESP result is accepted only after the clean, credential-free baseline above.
+The operation ID returned by the login POST is never printed; any non-empty
+status operation ID must equal it. This prevents a concurrent/recent auth
+operation from supplying the verdict. A fast failure may clear the ID before the
+first status poll; it remains correlated by the immediately preceding clean
+`signed_out` baseline and rejection of any observed foreign ID.
 
 The production C++ classifier remains covered by
 `tests/bambu_auth_contract_test.cpp`; AT01 adds agent-level coverage in

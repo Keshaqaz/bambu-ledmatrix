@@ -44,8 +44,30 @@ def classify_http_response(status_code, content_type, bounded_body_prefix):
     if status_code == 403 and b"cloudflare" in prefix:
         return VERDICT_BLOCKED
     media_type = (content_type or "").split(";", 1)[0].strip().lower()
-    stripped = prefix.lstrip()
-    if media_type == "application/json" or stripped.startswith((b"{", b"[")):
+    if media_type != "application/json":
+        return VERDICT_ERROR
+    try:
+        payload = json.loads(bounded_body_prefix[:CLASSIFIER_PREFIX_BYTES])
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return VERDICT_ERROR
+    if (
+        status_code in (400, 401)
+        and isinstance(payload, dict)
+        and "code" in payload
+        and "error" in payload
+    ):
+        return VERDICT_PASS
+    data = payload.get("data", payload) if isinstance(payload, dict) else {}
+    if status_code == 200 and isinstance(data, dict) and any(
+        key in data
+        for key in (
+            "loginType",
+            "accessToken",
+            "access_token",
+            "refreshToken",
+            "refresh_token",
+        )
+    ):
         return VERDICT_PASS
     return VERDICT_ERROR
 
@@ -55,7 +77,7 @@ def classify_esp_status(status):
     state = status.get("state", "")
     if error == "cloudflare_blocked":
         return VERDICT_BLOCKED
-    if error in {"invalid_credentials", "csrf_missing_cookie"}:
+    if error == "invalid_credentials":
         return VERDICT_PASS
     if state in {
         "verification_required",
@@ -207,7 +229,51 @@ def read_json(url, method="GET", body=None, timeout_seconds=5):
         return None
 
 
+def esp_status_is_clean(status):
+    return bool(
+        status
+        and status.get("state") == "signed_out"
+        and not status.get("configured")
+        and not status.get("candidatePending")
+        and not status.get("operationId")
+    )
+
+
+def prepare_esp_baseline(base_url, timeout_seconds):
+    status_url = base_url.rstrip("/") + "/api/bambu/auth/status"
+    status = read_json(status_url, timeout_seconds=min(timeout_seconds, 5))
+    if esp_status_is_clean(status):
+        return True
+    if (
+        not status
+        or status.get("configured")
+        or status.get("candidatePending")
+        or status.get("operationId")
+        or status.get("state") != "recoverable_error"
+    ):
+        return False
+    accepted = read_json(
+        base_url.rstrip("/") + "/api/bambu/logout",
+        method="POST",
+        body=b"{}",
+        timeout_seconds=min(timeout_seconds, 5),
+    )
+    if not accepted or not accepted.get("accepted"):
+        return False
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        status = read_json(status_url, timeout_seconds=min(timeout_seconds, 5))
+        if esp_status_is_clean(status):
+            return True
+        if status and (status.get("configured") or status.get("candidatePending")):
+            return False
+        time.sleep(0.25)
+    return False
+
+
 def esp_request(base_url, timeout_seconds):
+    if not prepare_esp_baseline(base_url, min(timeout_seconds, 5)):
+        return VERDICT_ERROR
     login_body = json.dumps(
         {
             "email": SYNTHETIC_ACCOUNT,
@@ -224,6 +290,9 @@ def esp_request(base_url, timeout_seconds):
     )
     if not accepted or not accepted.get("accepted"):
         return VERDICT_ERROR
+    operation_id = accepted.get("operationId")
+    if not isinstance(operation_id, str) or not operation_id:
+        return VERDICT_ERROR
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         status = read_json(
@@ -231,6 +300,9 @@ def esp_request(base_url, timeout_seconds):
             timeout_seconds=min(5, max(1, deadline - time.monotonic())),
         )
         if status:
+            status_operation_id = status.get("operationId", "")
+            if status_operation_id and status_operation_id != operation_id:
+                return VERDICT_ERROR
             verdict = classify_esp_status(status)
             if verdict:
                 return verdict
