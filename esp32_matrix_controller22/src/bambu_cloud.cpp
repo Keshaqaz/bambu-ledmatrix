@@ -484,7 +484,9 @@ static bool cloudJsonRequest(SecureNetworkCoordinator& coordinator,
                              const char* url, const char* method,
                              const char* body, const char* bearer,
                              JsonDocument& response, char* error,
-                             size_t errorSize) {
+                             size_t errorSize,
+                             bool* applicationJson = nullptr) {
+  if (applicationJson) *applicationJson = false;
   SecureNetworkLease lease(coordinator, SECURE_NETWORK_CLOUD_HTTP);
   if (!lease.acquired()) { copyCode(error, errorSize, "tls_busy"); return false; }
   WiFiClientSecure client;
@@ -540,6 +542,20 @@ static bool cloudJsonRequest(SecureNetworkCoordinator& coordinator,
       lastDataMs = millis();
     }
     errorBody[received] = '\0';
+    if (applicationJson) {
+      JsonDocument errorDocument;
+      const DeserializationError parseError = deserializeJson(
+          errorDocument, errorBody, received,
+          DeserializationOption::NestingLimit(4));
+      JsonVariantConst root = errorDocument.as<JsonVariantConst>();
+      const bool parsedObject = !parseError && root.is<JsonObjectConst>();
+      const bool hasTypedCode = parsedObject &&
+          (root["code"].is<int>() || root["code"].is<const char*>());
+      const bool hasTypedError = parsedObject && root["error"].is<const char*>();
+      *applicationJson = bambuAuthApplicationJsonCoordinates(
+          code, parsedObject, hasTypedCode, hasTypedError, false);
+      errorDocument.clear();
+    }
     bambuAuthHttpFailureCode(code, errorBody, error, errorSize);
     bambuSecureZero(errorBody, sizeof(errorBody));
     http.end();
@@ -559,6 +575,17 @@ static bool cloudJsonRequest(SecureNetworkCoordinator& coordinator,
              jsonError == DeserializationError::NoMemory ? "json_no_memory" : "bad_response");
     http.end();
     return false;
+  }
+  if (applicationJson) {
+    JsonVariantConst data = responseData(response);
+    const bool hasAuthData = data.is<JsonObjectConst>() &&
+        (data["loginType"].is<const char*>() ||
+         data["accessToken"].is<const char*>() ||
+         data["access_token"].is<const char*>() ||
+         data["refreshToken"].is<const char*>() ||
+         data["refresh_token"].is<const char*>());
+    *applicationJson = bambuAuthApplicationJsonCoordinates(
+        code, true, false, false, hasAuthData);
   }
   http.end();
   return true;
@@ -736,6 +763,9 @@ bool BambuCloud::submitLogin(const char* email, const char* password,
   strlcpy(status_.operationId, request_.operationId, sizeof(status_.operationId));
   strlcpy(operationId, request_.operationId, 17);
   status_.error[0] = '\0';
+#ifdef BAMBU_AUTH_TRANSPORT_PROBE
+  status_.authTransportApplicationJson = false;
+#endif
   status_.phase = BAMBU_AUTH_SUBMITTING_CREDENTIALS;
   operationDeadlineMs_ = millis() + kOperationTtlMs;
   xSemaphoreGive(mutex_);
@@ -1078,8 +1108,17 @@ bool BambuCloud::postLogin(const PendingRequest& request, bool verification,
   char url[128];
   snprintf(url, sizeof(url), "%s/v1/user-service/user/login", host);
   JsonDocument response;
+#ifdef BAMBU_AUTH_TRANSPORT_PROBE
+  bool applicationJson = false;
+  bool ok = cloudJsonRequest(coordinator_, url, "POST", body, nullptr,
+                             response, error, errorSize, &applicationJson);
+  xSemaphoreTake(mutex_, portMAX_DELAY);
+  status_.authTransportApplicationJson = applicationJson;
+  xSemaphoreGive(mutex_);
+#else
   bool ok = cloudJsonRequest(coordinator_, url, "POST", body, nullptr,
                              response, error, errorSize);
+#endif
   bambuSecureZero(body, sizeof(body));
   if (!ok) {
     if (!verification &&

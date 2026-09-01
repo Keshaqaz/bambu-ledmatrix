@@ -62,6 +62,17 @@ inline void bambuAuthHttpFailureCode(int statusCode, const char* boundedBody,
   }
 }
 
+inline bool bambuAuthApplicationJsonCoordinates(
+    int statusCode, bool parsedObject, bool hasTypedCode,
+    bool hasTypedError, bool hasAuthData) {
+  if (!parsedObject) return false;
+  if ((statusCode == 400 || statusCode == 401) &&
+      hasTypedCode && hasTypedError) {
+    return true;
+  }
+  return statusCode == 200 && hasAuthData;
+}
+
 // Keep only the RFC cookie-pair needed for the next portal request. Attributes
 // such as Path, SameSite and HttpOnly must never be reflected into Cookie.
 inline bool bambuExtractSessionCookie(const char* setCookie, char* output,

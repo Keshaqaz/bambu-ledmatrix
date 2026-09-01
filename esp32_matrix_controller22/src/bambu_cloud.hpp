@@ -52,6 +52,9 @@ struct BambuCloudPublicStatus {
   uint8_t recoveryFailures;
   uint32_t nextRecoveryAttemptIn;
   uint32_t mqttTaskStackReserve;
+#ifdef BAMBU_AUTH_TRANSPORT_PROBE
+  bool authTransportApplicationJson;
+#endif
 };
 
 class DirectCloudSource : public PrinterStatusSource {

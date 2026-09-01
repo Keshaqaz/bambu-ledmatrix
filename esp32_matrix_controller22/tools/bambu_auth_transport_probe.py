@@ -53,8 +53,8 @@ def classify_http_response(status_code, content_type, bounded_body_prefix):
     if (
         status_code in (400, 401)
         and isinstance(payload, dict)
-        and "code" in payload
-        and "error" in payload
+        and isinstance(payload.get("code"), (int, str))
+        and isinstance(payload.get("error"), str)
     ):
         return VERDICT_PASS
     data = payload.get("data", payload) if isinstance(payload, dict) else {}
@@ -78,7 +78,11 @@ def classify_esp_status(status):
     if error == "cloudflare_blocked":
         return VERDICT_BLOCKED
     if error == "invalid_credentials":
-        return VERDICT_PASS
+        return (
+            VERDICT_PASS
+            if status.get("transportApplicationJson") is True
+            else VERDICT_ERROR
+        )
     if state in {
         "verification_required",
         "verification_required_email",

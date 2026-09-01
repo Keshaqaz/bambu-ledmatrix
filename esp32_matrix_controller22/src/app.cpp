@@ -2252,6 +2252,9 @@ static void appendBambuCloudStatus(JsonDocument& doc,
   doc["error"] = status.error;
   doc["configured"] = status.hasActiveCredential;
   doc["candidatePending"] = status.candidatePending;
+#ifdef BAMBU_AUTH_TRANSPORT_PROBE
+  doc["transportApplicationJson"] = status.authTransportApplicationJson;
+#endif
   doc["mqttConnected"] = status.mqttConnected;
   doc["firstValidReport"] = status.firstValidReport;
   doc["mqttReconnectCount"] = status.mqttReconnectCount;

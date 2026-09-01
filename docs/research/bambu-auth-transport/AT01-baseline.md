@@ -58,9 +58,26 @@ arduino-cli compile \
   --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs .
 ```
 
-Result: PASS. The linked sketch is 1,385,857 bytes (70% of the app slot), with
-49,780 bytes of globals and 277,900 bytes left for local allocations. No
-production firmware source or production build flags were changed by AT01.
+Initial result: PASS, 1,385,857 bytes. The final build after adding compile-time
+probe isolation is also PASS: 1,385,851 bytes (70% of the app slot), 49,780
+bytes of globals, and 277,900 bytes left for local allocations. Default
+production flags and runtime/API behavior are unchanged by AT01.
+
+The diagnostic proof that an ESP 400/401 actually contained parsed Bambu JSON
+is isolated behind `BAMBU_AUTH_TRANSPORT_PROBE`; it is absent from the default
+production API. Build the reusable AT02/AT03 probe profile with:
+
+```sh
+arduino-cli compile \
+  --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs \
+  --build-property compiler.cpp.extra_flags=-DBAMBU_AUTH_TRANSPORT_PROBE=1 .
+```
+
+Probe-profile result: PASS, 1,386,649 bytes and 49,780 bytes of globals. The
+isolated diagnostic costs 798 bytes flash and 0 bytes static RAM relative to the
+final production build. Using `build.extra_flags` is invalid because it replaces
+mandatory ESP32 platform defines; downstream sessions must use the additive
+`compiler.cpp.extra_flags` command above.
 
 Host verification also passed: all C++ seam tests, 10 AT01 Python oracle tests,
 22 existing relay Python tests under Python 3.14, Python compilation, shell
@@ -125,7 +142,8 @@ same `BambuCloud::postLogin` / `cloudJsonRequest` path used by WebUI login.
 | Parsed HTTP 200 JSON with Bambu auth `data` coordinates (`loginType` or token-envelope key) | `TRANSPORT_PASS` |
 | Generic, empty, malformed, proxy-status, or unrecognized JSON | `TRANSPORT_ERROR` |
 | ESP public error `cloudflare_blocked` | `TRANSPORT_BLOCKED` |
-| ESP public error `invalid_credentials` | `TRANSPORT_PASS` |
+| ESP public error `invalid_credentials` plus probe-only `transportApplicationJson: true` | `TRANSPORT_PASS` |
+| ESP `invalid_credentials` without the probe-only parsed-JSON proof | `TRANSPORT_ERROR` |
 | ESP public error `csrf_missing_cookie` | `TRANSPORT_ERROR` |
 | ESP verification/fetch/select/connect/ready state | `TRANSPORT_PASS` |
 | ESP recoverable transport error, timeout, malformed/oversized response | `TRANSPORT_ERROR` |
@@ -140,6 +158,12 @@ first status poll; it remains correlated by the immediately preceding clean
 The production C++ classifier remains covered by
 `tests/bambu_auth_contract_test.cpp`; AT01 adds agent-level coverage in
 `tools/test_bambu_auth_transport_probe.py`.
+
+In the probe profile, the firmware parses the bounded non-200 body and sets
+`transportApplicationJson` only for HTTP 400/401 objects with typed `code` and
+`error` coordinates. The flag resets at the start of every login. Generic,
+malformed, unparsed, proxy-status, or stale responses cannot turn the oracle
+green. The default production build omits both the public field and its state.
 
 ## Wire metadata
 
@@ -206,6 +230,8 @@ AT02 must start from the unchanged production ESP transport:
 - HTTP/1.0, connection reuse disabled;
 - endpoint, payload hash/length/schema, header names/order, classifier, and
   oracle commands above;
+- the additive `BAMBU_AUTH_TRANSPORT_PROBE` build command and its parsed-JSON
+  boolean proof; do not infer PASS from `invalid_credentials` alone;
 - baseline verdict `TRANSPORT_BLOCKED`.
 
 AT03, if reached by the short-circuit policy, must reuse the same endpoint,

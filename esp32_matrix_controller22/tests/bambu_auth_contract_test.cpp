@@ -117,6 +117,16 @@ static void test_classifies_bounded_http_403_without_exposing_body() {
   assert(strcmp(error, "http_429") == 0);
 }
 
+static void test_requires_parsed_bambu_coordinates_for_application_json() {
+  assert(bambuAuthApplicationJsonCoordinates(400, true, true, true, false));
+  assert(bambuAuthApplicationJsonCoordinates(401, true, true, true, false));
+  assert(bambuAuthApplicationJsonCoordinates(200, true, false, false, true));
+  assert(!bambuAuthApplicationJsonCoordinates(400, false, true, true, false));
+  assert(!bambuAuthApplicationJsonCoordinates(400, true, true, false, false));
+  assert(!bambuAuthApplicationJsonCoordinates(502, true, true, true, false));
+  assert(!bambuAuthApplicationJsonCoordinates(200, true, false, false, false));
+}
+
 int main() {
   test_extracts_only_cookie_pair();
   test_rejects_unbounded_or_injectable_cookie();
@@ -124,5 +134,6 @@ int main() {
   test_accepts_portal_token_envelope();
   test_missing_refresh_fails_closed();
   test_classifies_bounded_http_403_without_exposing_body();
+  test_requires_parsed_bambu_coordinates_for_application_json();
   return 0;
 }

@@ -1,6 +1,7 @@
 import importlib.util
 import pathlib
 import unittest
+from unittest import mock
 
 
 MODULE_PATH = pathlib.Path(__file__).with_name("bambu_auth_transport_probe.py")
@@ -11,6 +12,15 @@ def load_probe_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def clean_esp_status():
+    return {
+        "state": "signed_out",
+        "configured": False,
+        "candidatePending": False,
+        "operationId": "",
+    }
 
 
 class TransportOracleTest(unittest.TestCase):
@@ -32,6 +42,7 @@ class TransportOracleTest(unittest.TestCase):
         for status, body in (
             (502, b'{"code":-1,"error":"proxy"}'),
             (400, b'{"message":"generic refusal"}'),
+            (400, b'{"code":{},"error":[]}'),
             (400, b'{"code":'),
             (400, b""),
         ):
@@ -66,9 +77,19 @@ class TransportOracleTest(unittest.TestCase):
         )
         self.assertEqual(
             self.probe.classify_esp_status(
-                {"state": "recoverable_error", "error": "invalid_credentials"}
+                {
+                    "state": "recoverable_error",
+                    "error": "invalid_credentials",
+                    "transportApplicationJson": True,
+                }
             ),
             "TRANSPORT_PASS",
+        )
+        self.assertEqual(
+            self.probe.classify_esp_status(
+                {"state": "recoverable_error", "error": "invalid_credentials"}
+            ),
+            "TRANSPORT_ERROR",
         )
         self.assertEqual(
             self.probe.classify_esp_status(
@@ -98,12 +119,7 @@ class TransportOracleTest(unittest.TestCase):
     def test_esp_result_is_correlated_to_accepted_operation(self):
         responses = iter(
             (
-                {
-                    "state": "signed_out",
-                    "configured": False,
-                    "candidatePending": False,
-                    "operationId": "",
-                },
+                clean_esp_status(),
                 {"accepted": True, "operationId": "expected-operation"},
                 {
                     "state": "submitting_credentials",
@@ -117,28 +133,18 @@ class TransportOracleTest(unittest.TestCase):
                 },
             )
         )
-        original_read_json = self.probe.read_json
-        original_sleep = self.probe.time.sleep
-        self.probe.read_json = lambda *args, **kwargs: next(responses)
-        self.probe.time.sleep = lambda _: None
-        try:
+        with mock.patch.object(
+            self.probe, "read_json", side_effect=lambda *args, **kwargs: next(responses)
+        ), mock.patch.object(self.probe.time, "sleep", return_value=None):
             self.assertEqual(
                 self.probe.esp_request("http://device.invalid", 2),
                 "TRANSPORT_BLOCKED",
             )
-        finally:
-            self.probe.read_json = original_read_json
-            self.probe.time.sleep = original_sleep
 
     def test_esp_fast_terminal_status_is_correlated_by_clean_baseline(self):
         responses = iter(
             (
-                {
-                    "state": "signed_out",
-                    "configured": False,
-                    "candidatePending": False,
-                    "operationId": "",
-                },
+                clean_esp_status(),
                 {"accepted": True, "operationId": "expected-operation"},
                 {
                     "state": "recoverable_error",
@@ -147,32 +153,25 @@ class TransportOracleTest(unittest.TestCase):
                 },
             )
         )
-        original_read_json = self.probe.read_json
-        original_sleep = self.probe.time.sleep
-        original_monotonic = self.probe.time.monotonic
         ticks = iter((0, 0, 3))
-        self.probe.read_json = lambda *args, **kwargs: next(responses, None)
-        self.probe.time.sleep = lambda _: None
-        self.probe.time.monotonic = lambda: next(ticks, 3)
-        try:
+        with mock.patch.object(
+            self.probe,
+            "read_json",
+            side_effect=lambda *args, **kwargs: next(responses, None),
+        ), mock.patch.object(
+            self.probe.time, "sleep", return_value=None
+        ), mock.patch.object(
+            self.probe.time, "monotonic", side_effect=lambda: next(ticks, 3)
+        ):
             self.assertEqual(
                 self.probe.esp_request("http://device.invalid", 2),
                 "TRANSPORT_BLOCKED",
             )
-        finally:
-            self.probe.read_json = original_read_json
-            self.probe.time.sleep = original_sleep
-            self.probe.time.monotonic = original_monotonic
 
     def test_esp_foreign_operation_after_clean_baseline_is_error(self):
         responses = iter(
             (
-                {
-                    "state": "signed_out",
-                    "configured": False,
-                    "candidatePending": False,
-                    "operationId": "",
-                },
+                clean_esp_status(),
                 {"accepted": True, "operationId": "expected-operation"},
                 {
                     "state": "recoverable_error",
@@ -181,15 +180,13 @@ class TransportOracleTest(unittest.TestCase):
                 },
             )
         )
-        original_read_json = self.probe.read_json
-        self.probe.read_json = lambda *args, **kwargs: next(responses)
-        try:
+        with mock.patch.object(
+            self.probe, "read_json", side_effect=lambda *args, **kwargs: next(responses)
+        ):
             self.assertEqual(
                 self.probe.esp_request("http://device.invalid", 2),
                 "TRANSPORT_ERROR",
             )
-        finally:
-            self.probe.read_json = original_read_json
 
     def test_esp_recoverable_state_is_reset_only_without_credentials(self):
         responses = iter(
@@ -201,25 +198,15 @@ class TransportOracleTest(unittest.TestCase):
                     "operationId": "",
                 },
                 {"accepted": True},
-                {
-                    "state": "signed_out",
-                    "configured": False,
-                    "candidatePending": False,
-                    "operationId": "",
-                },
+                clean_esp_status(),
             )
         )
-        original_read_json = self.probe.read_json
-        original_sleep = self.probe.time.sleep
-        self.probe.read_json = lambda *args, **kwargs: next(responses)
-        self.probe.time.sleep = lambda _: None
-        try:
+        with mock.patch.object(
+            self.probe, "read_json", side_effect=lambda *args, **kwargs: next(responses)
+        ), mock.patch.object(self.probe.time, "sleep", return_value=None):
             self.assertTrue(
                 self.probe.prepare_esp_baseline("http://device.invalid", 2)
             )
-        finally:
-            self.probe.read_json = original_read_json
-            self.probe.time.sleep = original_sleep
 
 
 if __name__ == "__main__":
