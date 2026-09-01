@@ -62,15 +62,16 @@ inline void bambuAuthHttpFailureCode(int statusCode, const char* boundedBody,
   }
 }
 
-inline bool bambuAuthApplicationJsonCoordinates(
+inline bool bambuAuthRejectedApplicationJsonCoordinates(
     int statusCode, bool parsedObject, bool hasTypedCode,
-    bool hasTypedError, bool hasAuthData) {
-  if (!parsedObject) return false;
-  if ((statusCode == 400 || statusCode == 401) &&
-      hasTypedCode && hasTypedError) {
-    return true;
-  }
-  return statusCode == 200 && hasAuthData;
+    bool hasTypedError) {
+  return parsedObject && (statusCode == 400 || statusCode == 401) &&
+         hasTypedCode && hasTypedError;
+}
+
+inline bool bambuAuthSuccessfulApplicationJsonCoordinates(
+    bool parsedObject, bool hasAuthData) {
+  return parsedObject && hasAuthData;
 }
 
 // Keep only the RFC cookie-pair needed for the next portal request. Attributes

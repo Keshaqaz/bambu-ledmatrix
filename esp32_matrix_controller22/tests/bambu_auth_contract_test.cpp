@@ -118,13 +118,14 @@ static void test_classifies_bounded_http_403_without_exposing_body() {
 }
 
 static void test_requires_parsed_bambu_coordinates_for_application_json() {
-  assert(bambuAuthApplicationJsonCoordinates(400, true, true, true, false));
-  assert(bambuAuthApplicationJsonCoordinates(401, true, true, true, false));
-  assert(bambuAuthApplicationJsonCoordinates(200, true, false, false, true));
-  assert(!bambuAuthApplicationJsonCoordinates(400, false, true, true, false));
-  assert(!bambuAuthApplicationJsonCoordinates(400, true, true, false, false));
-  assert(!bambuAuthApplicationJsonCoordinates(502, true, true, true, false));
-  assert(!bambuAuthApplicationJsonCoordinates(200, true, false, false, false));
+  assert(bambuAuthRejectedApplicationJsonCoordinates(400, true, true, true));
+  assert(bambuAuthRejectedApplicationJsonCoordinates(401, true, true, true));
+  assert(!bambuAuthRejectedApplicationJsonCoordinates(400, false, true, true));
+  assert(!bambuAuthRejectedApplicationJsonCoordinates(400, true, true, false));
+  assert(!bambuAuthRejectedApplicationJsonCoordinates(502, true, true, true));
+  assert(bambuAuthSuccessfulApplicationJsonCoordinates(true, true));
+  assert(!bambuAuthSuccessfulApplicationJsonCoordinates(false, true));
+  assert(!bambuAuthSuccessfulApplicationJsonCoordinates(true, false));
 }
 
 int main() {

@@ -552,8 +552,8 @@ static bool cloudJsonRequest(SecureNetworkCoordinator& coordinator,
       const bool hasTypedCode = parsedObject &&
           (root["code"].is<int>() || root["code"].is<const char*>());
       const bool hasTypedError = parsedObject && root["error"].is<const char*>();
-      *applicationJson = bambuAuthApplicationJsonCoordinates(
-          code, parsedObject, hasTypedCode, hasTypedError, false);
+      *applicationJson = bambuAuthRejectedApplicationJsonCoordinates(
+          code, parsedObject, hasTypedCode, hasTypedError);
       errorDocument.clear();
     }
     bambuAuthHttpFailureCode(code, errorBody, error, errorSize);
@@ -584,8 +584,8 @@ static bool cloudJsonRequest(SecureNetworkCoordinator& coordinator,
          data["access_token"].is<const char*>() ||
          data["refreshToken"].is<const char*>() ||
          data["refresh_token"].is<const char*>());
-    *applicationJson = bambuAuthApplicationJsonCoordinates(
-        code, true, false, false, hasAuthData);
+    *applicationJson = code == 200 &&
+        bambuAuthSuccessfulApplicationJsonCoordinates(true, hasAuthData);
   }
   http.end();
   return true;
