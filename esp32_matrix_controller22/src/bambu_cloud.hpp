@@ -55,6 +55,17 @@ struct BambuCloudPublicStatus {
 #ifdef BAMBU_AUTH_TRANSPORT_PROBE
   bool authTransportApplicationJson;
   uint8_t authTransportProfile;
+  int32_t authTransport200Length;
+  int32_t authTransport200Read;
+  int32_t authTransport200First;
+  uint8_t authTransport200Error;
+  int32_t authTransport200Code;
+  uint16_t authTransportShape;
+  uint8_t authTransportCall;
+  uint8_t authTransportKeyCount;
+  char authTransportKeys[12][20];
+  uint8_t authTransportTailLen;
+  uint8_t authTransportTail[16];
 #endif
 };
 
@@ -161,6 +172,9 @@ class BambuCloud {
   void maybeScheduleAutomaticRefresh();
   void noteRefreshFailure();
   void noteRefreshSuccess(bool refreshed);
+#ifdef BAMBU_AUTH_TRANSPORT_PROBE
+  void persistProbeTransport(uint8_t callTag);
+#endif
 
   bool loadCredentials();
   bool persistCandidate();

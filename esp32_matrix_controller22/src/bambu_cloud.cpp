@@ -8,6 +8,21 @@
 #include <esp_transport.h>
 #include <esp_transport_ssl.h>
 #endif
+#ifdef BAMBU_AUTH_TRANSPORT_PROBE
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/ssl.h>
+#include <mbedtls/x509_crt.h>
+#include <psa/crypto.h>
+#endif
+#ifdef BAMBU_AUTH_WOLFSSL_PROBE
+#include <errno.h>
+#include <fcntl.h>
+#include <lwip/netdb.h>
+#include <lwip/sockets.h>
+#include <sys/ioctl.h>
+#include <wolfssl.h>
+#endif
 #include <stdlib.h>
 #include <strings.h>
 #include <time.h>
@@ -62,6 +77,109 @@ axRvrSgEorju1kJM7M65z2RUZrfzQYW/1rs8mRUXin6iEtad/Rv1ZI1WGYmWPyBm
 pbo=
 -----END CERTIFICATE-----
 )PEM";
+// The production anchor above is the server-sent cross-signed "DigiCert
+// Global Root G2" (issuer: DigiCert Global Root CA). Mbed TLS accepts a
+// non-self-signed trusted anchor, but wolfSSL keeps resolving the chain to a
+// self-signed root and failed with ASN_NO_SIGNER_E on exactly that lookup.
+// The probe therefore trusts the two self-signed public roots, which cover
+// both the received intermediate and the received cross certificate without
+// weakening validation.
+#ifdef BAMBU_AUTH_WOLFSSL_PROBE
+static const char kWolfSslProbeCa[] PROGMEM = R"PEM(-----BEGIN CERTIFICATE-----
+MIIDjjCCAnagAwIBAgIQAzrx5qcRqaC7KGSxHQn65TANBgkqhkiG9w0BAQsFADBhMQswCQYDVQQG
+EwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3d3cuZGlnaWNlcnQuY29tMSAw
+HgYDVQQDExdEaWdpQ2VydCBHbG9iYWwgUm9vdCBHMjAeFw0xMzA4MDExMjAwMDBaFw0zODAxMTUx
+MjAwMDBaMGExCzAJBgNVBAYTAlVTMRUwEwYDVQQKEwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3
+dy5kaWdpY2VydC5jb20xIDAeBgNVBAMTF0RpZ2lDZXJ0IEdsb2JhbCBSb290IEcyMIIBIjANBgkq
+hkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuzfNNNx7a8myaJCtSnX/RrohCgiN9RlUyfuI2/Ou8jqJ
+kTx65qsGGmvPrC3oXgkkRLpimn7Wo6h+4FR1IAWsULecYxpsMNzaHxmx1x7e/dfgy5SDN67sH0NO
+3Xss0r0upS/kqbitOtSZpLYl6ZtrAGCSYP9PIUkY92eQq2EGnI/yuum06ZIya7XzV+hdG82MHauV
+BJVJ8zUtluNJbd134/tJS7SsVQepj5WztCO7TG1F8PapspUwtP1MVYwnSlcUfIKdzXOS0xZKBgyM
+UNGPHgm+F6HmIcr9g+UQvIOlCsRnKPZzFBQ9RnbDhxSJITRNrw9FDKZJobq7nMWxM4MphQIDAQAB
+o0IwQDAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBhjAdBgNVHQ4EFgQUTiJUIBiV5uNu
+5g/6+rkS7QYXjzkwDQYJKoZIhvcNAQELBQADggEBAGBnKJRvDkhj6zHd6mcY1Yl9PMWLSn/pvtsr
+F9+wX3N3KjITOYFnQoQj8kVnNeyIv/iPsGEMNKSuIEyExtv4NeF22d+mQrvHRAiGfzZ0JFrabA0U
+WTW98kndth/Jsw1HKj2ZL7tcu7XUIOGZX1NGFdtom/DzMNU+MeKNhJ7jitralj41E6Vf8PlwUHBH
+QRFXGU7Aj64GxJUTFy8bJZ918rGOmaFvE7FBcf6IKshPECBV1/MUReXgRPTqh5Uykw7+U0b6LJ3/
+iyK5S9kJRaTepLiaWN0bfVKfjllDiIGknibVb63dDcY3fe0Dkhvld1927jyNxF1WW6LZZm6zNTfl
+MrY=
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+MIIDrzCCApegAwIBAgIQCDvgVpBCRrGhdWrJWZHHSjANBgkqhkiG9w0BAQUFADBh
+MQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3
+d3cuZGlnaWNlcnQuY29tMSAwHgYDVQQDExdEaWdpQ2VydCBHbG9iYWwgUm9vdCBD
+QTAeFw0wNjExMTAwMDAwMDBaFw0zMTExMTAwMDAwMDBaMGExCzAJBgNVBAYTAlVT
+MRUwEwYDVQQKEwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5j
+b20xIDAeBgNVBAMTF0RpZ2lDZXJ0IEdsb2JhbCBSb290IENBMIIBIjANBgkqhkiG
+9w0BAQEFAAOCAQ8AMIIBCgKCAQEA4jvhEXLeqKTTo1eqUKKPC3eQyaKl7hLOllsB
+CSDMAZOnTjC3U/dDxGkAV53ijSLdhwZAAIEJzs4bg7/fzTtxRuLWZscFs3YnFo97
+nh6Vfe63SKMI2tavegw5BmV/Sl0fvBf4q77uKNd0f3p4mVmFaG5cIzJLv07A6Fpt
+43C/dxC//AH2hdmoRBBYMql1GNXRor5H4idq9Joz+EkIYIvUX7Q6hL+hqkpMfT7P
+T19sdl6gSzeRntwi5m3OFBqOasv+zbMUZBfHWymeMr/y7vrTC0LUq7dBMtoM1O/4
+gdW7jVg/tRvoSSiicNoxBN33shbyTApOB6jtSj1etX+jkMOvJwIDAQABo2MwYTAO
+BgNVHQ8BAf8EBAMCAYYwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQUA95QNVbR
+TLtm8KPiGxvDl7I90VUwHwYDVR0jBBgwFoAUA95QNVbRTLtm8KPiGxvDl7I90VUw
+DQYJKoZIhvcNAQEFBQADggEBAMucN6pIExIK+t1EnE9SsPTfrgT1eXkIoyQY/Esr
+hMAtudXH/vTBH1jLuG2cenTnmCmrEbXjcKChzUyImZOMkXDiqw8cvpOp/2PV5Adg
+06O/nVsJ8dWO41P0jmP6P6fbtGbfYmbW0W5BjfIttep3Sp+dWOIrWcBAI+0tKIJF
+PnlUkiaY4IBIqDfv8NZ5YBberOgOzW6sRBc4L0na4UU+Krk2U886UAb3LujEV0ls
+YSEY1QSteDwsOoBrp+uvFRTp2InBuThs4pFsiv9kuXclVzDAGySj4dzp30d8tbQk
+CAUw7C29C79Fv1C5qfPrmAESrciIxpg0X40KPMbp1ZWVbd4=
+-----END CERTIFICATE-----)PEM";
+#endif
+#ifdef BAMBU_AUTH_TRANSPORT_CAPTURE
+// Capture-only observation trust anchor (self-signed, local throwaway key).
+// Both capture paths verify the observation endpoint's certificate against
+// this CA - validation stays on, merely anchored to the local endpoint.
+static const char kCaptureObservationCa[] PROGMEM = R"PEM(-----BEGIN CERTIFICATE-----
+MIIDFzCCAf+gAwIBAgIUAs900otT1hqWT5hpv9EDVDeoR4YwDQYJKoZIhvcNAQEL
+BQAwGzEZMBcGA1UEAwwQYXBpLmJhbWJ1bGFiLmNvbTAeFw0yNjA5MDIxMjU3MTha
+Fw0yNjA5MDQxMjU3MThaMBsxGTAXBgNVBAMMEGFwaS5iYW1idWxhYi5jb20wggEi
+MA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDyedffJ/Edipi0IQ+l7RtRrgYY
+mKsGJn9+PCNNW+s4kR9Yz6DKeByhq8N0eeNuiD/BB+zoLpGq91MZmY7/Mta4IkSD
+ICP1E60Y85oDUphY5eYMwxE8HCUVqKAQiJTbJYxdnIPAThblYCLAb9fgD0fmbQ8J
+oRw6DBwHyGMfc+VG0O67CK28KzPwhV37ml5b844jjllCXpIgfUKOYRGy6o+ACnQi
+dLGuBNkR/OUGOCVfdBvdsdDf0njAQfJB/hg4OCN7EPuFkqSZvIB0n57M6+O+rI6q
+tnZnEtWKM5mAyRKKguj8sE+vdOUda8lgTm4qup9bkjrEHlUdVCIRdW8Fr3pTAgMB
+AAGjUzBRMB0GA1UdDgQWBBR9+7JEdNArnMWnbS4YHwAaDEDWOjAfBgNVHSMEGDAW
+gBR9+7JEdNArnMWnbS4YHwAaDEDWOjAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3
+DQEBCwUAA4IBAQAe+8ZY5fSTXCeUPbFKSz+H8bnCfRO6mYMNXOXjr58LH1niqqCv
+38LKVsg884ljgXU394dFpRKnYeLutKDTzn/kFdr1RtLJMRPWJs0uPHRYEO++j2RM
+K4lCMeGxev2uixYnL0K+69URgrVlISs2paltXh3JTM4pZV5DPkohK/s6jio/2TWh
+6uFP2YAD9JxmqZA2m0zlh9ONJLkrTwVdeP5jZesXwlDLoI5t3sH0rhzjEnkPi3cG
+qmiRSvgIBCuK4TcdvdrpAO6fKGC6P7PqHGiy7hArZsOxOWY9CsQ2FifnjP49EqaC
+65ft7qW0PwX9m5wteFj+AQDm6stB8Zmzd8Oq
+-----END CERTIFICATE-----)PEM";
+#endif
+
+#ifdef BAMBU_AUTH_TRANSPORT_CAPTURE
+// Capture-only observation build (AT04 step 1): diverts the transport connect
+// to the local openssl s_server observation endpoint while keeping the
+// production SNI, cipher configuration and extension set byte-identical. The
+// ClientHello is recorded before the handshake is rejected locally against the
+// observation certificate; this build never contacts Bambu Cloud and carries
+// no other wire changes. Never define for production images.
+class CaptureObservationClient : public NetworkClientSecure {
+ public:
+  using NetworkClientSecure::connect;
+  int connect(const char*, uint16_t) override { return connectObservation(); }
+  int connect(const char*, uint16_t, int32_t) override {
+    return connectObservation();
+  }
+
+ private:
+  int connectObservation() {
+    IPAddress observationIp;
+    if (!observationIp.fromString("192.168.1.166")) return 0;
+    return connect(observationIp, 8443, "api.bambulab.com",
+                   kCaptureObservationCa, nullptr, nullptr);
+  }
+};
+#endif
+
+#ifdef BAMBU_AUTH_TRANSPORT_PROBE
+void bambuProbeNoteTail(uint8_t value);
+#endif
 
 class CloudBoundedStream : public Stream {
  public:
@@ -76,6 +194,9 @@ class CloudBoundedStream : public Stream {
     if (read_ >= maximum_) { overflow_ = upstream_.available() > 0; return -1; }
     int value = upstream_.read();
     if (value >= 0) ++read_;
+#ifdef BAMBU_AUTH_TRANSPORT_PROBE
+    bambuProbeNoteTail(static_cast<uint8_t>(value));
+#endif
     return value;
   }
   int peek() override {
@@ -85,6 +206,7 @@ class CloudBoundedStream : public Stream {
   void flush() override { upstream_.flush(); }
   size_t write(uint8_t) override { return 0; }
   bool overflowed() const { return overflow_ || (read_ >= maximum_ && upstream_.available() > 0); }
+  size_t readCount() const { return read_; }
 
  private:
   Stream& upstream_;
@@ -98,6 +220,83 @@ static void copyCode(char* destination, size_t size, const char* source) {
   strlcpy(destination, source ? source : "cloud_error", size);
 }
 
+#ifdef BAMBU_AUTH_TRANSPORT_PROBE
+// Probe-only bounded diagnostic of the HTTP-200 body path: numeric metadata
+// only (sizes, first byte class, JSON error enum, key-presence bitmask).
+// Never body content, never values.
+static volatile int32_t gProbe200Length = -2;  // -2 = no attempt yet
+static volatile int32_t gProbe200Read = 0;
+static volatile int32_t gProbe200First = -1;
+static volatile uint8_t gProbe200Error = 255;  // 255 = no attempt yet
+static volatile int32_t gProbe200Code = -2;
+static volatile uint16_t gProbe200Shape = 0;
+// Bounded key-name capture: root-level (up to 8) then data-level (up to 12
+// total). Names only, truncated to 19 chars; values are never stored.
+static char gProbeKeys[12][20];
+static volatile uint8_t gProbeKeyCount = 0;
+// Char-class fingerprint of the last 16 consumed bytes (syntax context of a
+// parse failure; classes only, no byte values):
+// 0=control,1=space,2=digit,3=alpha,4={}[]:,,5=quote,6=backslash,7=other
+static uint8_t gProbeTail[16];
+static volatile uint8_t gProbeTailLen = 0;
+void bambuProbeNoteTail(uint8_t value) {
+  uint8_t cls;
+  if (value < 0x20 || value == 0x7f) cls = 0;
+  else if (value == ' ') cls = 1;
+  else if (value >= '0' && value <= '9') cls = 2;
+  else if ((value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z')) cls = 3;
+  else if (value == '{' || value == '}' || value == '[' || value == ']' ||
+           value == ':' || value == ',') cls = 4;
+  else if (value == '"') cls = 5;
+  else if (value == '\\') cls = 6;
+  else cls = 7;
+  if (gProbeTailLen < sizeof(gProbeTail)) gProbeTail[gProbeTailLen++] = cls;
+}
+void bambuProbeCaptureKeys(JsonVariantConst root) {
+  gProbeKeyCount = 0;
+  memset(gProbeKeys, 0, sizeof(gProbeKeys));
+  if (JsonObjectConst obj = root.as<JsonObjectConst>()) {
+    for (JsonPairConst p : obj) {
+      if (gProbeKeyCount >= 8) break;
+      strlcpy(gProbeKeys[gProbeKeyCount++], p.key().c_str(),
+              sizeof(gProbeKeys[0]));
+    }
+  }
+  if (JsonObjectConst data = root["data"].as<JsonObjectConst>()) {
+    for (JsonPairConst p : data) {
+      if (gProbeKeyCount >= 12) break;
+      strlcpy(gProbeKeys[gProbeKeyCount++], p.key().c_str(),
+              sizeof(gProbeKeys[0]));
+    }
+  }
+}
+// Key-presence coordinates (structural metadata only; AT01 precedent).
+// bit0 root object; bit1 root.data object; bit2..6 root uid/userId/user_id/
+//   accountId/account_id strings; bit7..11 same under data;
+// bit12 data.devices array; bit13 root.devices array;
+// bit14 root.error string; bit15 root.code present.
+uint16_t bambuProbeShapeMask(JsonVariantConst root) {
+  uint16_t mask = 0;
+  const bool rootObject = root.is<JsonObjectConst>();
+  if (rootObject) mask |= 1 << 0;
+  JsonVariantConst data = root["data"];
+  const bool dataObject = data.is<JsonObjectConst>();
+  if (dataObject) mask |= 1 << 1;
+  static constexpr const char* kRootKeys[] = {"uid", "userId", "user_id",
+                                              "accountId", "account_id"};
+  for (unsigned i = 0; i < 5; ++i) {
+    if (root[kRootKeys[i]].is<const char*>()) mask |= 1 << (2 + i);
+    if (dataObject && data[kRootKeys[i]].is<const char*>())
+      mask |= 1 << (7 + i);
+  }
+  if (data["devices"].is<JsonArrayConst>()) mask |= 1 << 12;
+  if (root["devices"].is<JsonArrayConst>()) mask |= 1 << 13;
+  if (root["error"].is<const char*>()) mask |= 1 << 14;
+  if (!root["code"].isNull()) mask |= 1 << 15;
+  return mask;
+}
+#endif
+
 static void makeCloudDeviceId(char output[37]) {
   const uint64_t chipId = ESP.getEfuseMac() & 0x0000ffffffffffffULL;
   snprintf(output, 37, "00000000-0000-4000-8000-%012llx",
@@ -110,7 +309,7 @@ static JsonVariantConst responseData(const JsonDocument& document) {
 }
 
 #ifdef BAMBU_AUTH_TRANSPORT_PROBE
-static constexpr uint8_t kMaximumAuthTransportProfile = 4;
+static constexpr uint8_t kMaximumAuthTransportProfile = 12;
 static const char* kHttp11Alpn[] = {"http/1.1", nullptr};
 static const int kDesktopTls12CipherOrder[] = {
     0xC02C, 0xC030, 0x009F, 0xCCA9, 0xCCA8, 0xCCAA, 0xC02B,
@@ -118,6 +317,14 @@ static const int kDesktopTls12CipherOrder[] = {
     0x0067, 0xC00A, 0xC014, 0x0039, 0xC009, 0xC013, 0x0033,
     0x009D, 0x009C, 0x003D, 0x003C, 0x0035, 0x002F, 0,
 };
+// AT04 wire variants: profile 6 keeps only modern AEAD suites in the ESP
+// order; profile 7 offers a single suite so the resulting JA3 differs
+// maximally from the default mbed TLS fingerprint.
+static const int kStrongTls12CipherOrder[] = {
+    0xC02C, 0xC030, 0xCCA9, 0xCCA8, 0xC02B, 0xC02F,
+    0xC024, 0xC028, 0xC00A, 0xC014, 0x009D, 0x009C, 0,
+};
+static const int kSingleTls12CipherOrder[] = {0xC030, 0};
 #endif
 
 static const char* firstString(JsonVariantConst object, const char* a,
@@ -580,14 +787,33 @@ static bool cloudJsonRequestWithClient(NetworkClient& client,
     return false;
   }
   CloudBoundedStream input(http.getStream(), kMaximumCloudJsonBytes);
+#ifdef BAMBU_AUTH_TRANSPORT_PROBE
+  const int probe200FirstByte = input.peek();
+  gProbeTailLen = 0;
+#endif
   DeserializationError jsonError = deserializeJson(
       response, input, DeserializationOption::NestingLimit(8));
   if (jsonError || input.overflowed()) {
+#ifdef BAMBU_AUTH_TRANSPORT_PROBE
+    gProbe200Length = contentLength;
+    gProbe200Read = static_cast<int32_t>(input.readCount());
+    gProbe200First = probe200FirstByte;
+    gProbe200Error = jsonError.code() == DeserializationError::Ok && input.overflowed()
+        ? static_cast<uint8_t>(DeserializationError::NoMemory)
+        : static_cast<uint8_t>(jsonError.code());
+    gProbe200Code = code;
+    gProbe200Shape = 0;
+#endif
     copyCode(error, errorSize,
              jsonError == DeserializationError::NoMemory ? "json_no_memory" : "bad_response");
     http.end();
     return false;
   }
+#ifdef BAMBU_AUTH_TRANSPORT_PROBE
+  gProbe200Code = code;
+  gProbe200Shape = bambuProbeShapeMask(response.as<JsonVariantConst>());
+  bambuProbeCaptureKeys(response.as<JsonVariantConst>());
+#endif
   if (applicationJson) {
     JsonVariantConst data = responseData(response);
     const bool hasAuthData = data.is<JsonObjectConst>() &&
@@ -603,10 +829,262 @@ static bool cloudJsonRequestWithClient(NetworkClient& client,
   return true;
 }
 
+#ifdef BAMBU_AUTH_WOLFSSL_PROBE
+class WolfSslAuthClient : public NetworkClient {
+ public:
+  WolfSslAuthClient() = default;
+  ~WolfSslAuthClient() override { stop(); }
+
+  int connect(IPAddress, uint16_t) override { return 0; }
+  int connect(IPAddress, uint16_t, int32_t) override { return 0; }
+  int connect(const char* host, uint16_t port) override {
+    return connect(host, port, connectionTimeoutMs_);
+  }
+  int connect(const char* host, uint16_t port, int32_t timeoutMs) override {
+    stop();
+    lastError_ = 0;
+    lastStage_ = 1;
+    if (!host || !host[0] || timeoutMs <= 0 || time(nullptr) < 1609459200) {
+      lastError_ = BAD_FUNC_ARG;
+      return 0;
+    }
+
+    struct addrinfo hints = {};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    char portText[6] = {};
+    snprintf(portText, sizeof(portText), "%u", static_cast<unsigned>(port));
+    struct addrinfo* addresses = nullptr;
+    if (getaddrinfo(host, portText, &hints, &addresses) != 0 || !addresses) {
+      lastError_ = SOCKET_ERROR_E;
+      return 0;
+    }
+
+    const uint32_t startedMs = millis();
+    for (struct addrinfo* address = addresses; address; address = address->ai_next) {
+      socket_ = socket(address->ai_family, address->ai_socktype,
+                       address->ai_protocol);
+      if (socket_ < 0) continue;
+      const int originalFlags = fcntl(socket_, F_GETFL, 0);
+      if (originalFlags < 0 ||
+          fcntl(socket_, F_SETFL, originalFlags | O_NONBLOCK) < 0) {
+        close(socket_);
+        socket_ = -1;
+        continue;
+      }
+      int connected = ::connect(socket_, address->ai_addr, address->ai_addrlen);
+      if (connected != 0 && errno == EINPROGRESS) {
+        fd_set writeSet;
+        FD_ZERO(&writeSet);
+        FD_SET(socket_, &writeSet);
+        const uint32_t elapsedMs = millis() - startedMs;
+        const uint32_t remainingMs = elapsedMs < static_cast<uint32_t>(timeoutMs)
+            ? static_cast<uint32_t>(timeoutMs) - elapsedMs
+            : 0;
+        struct timeval timeout = {
+            static_cast<time_t>(remainingMs / 1000),
+            static_cast<suseconds_t>((remainingMs % 1000) * 1000)};
+        connected = remainingMs &&
+                    select(socket_ + 1, nullptr, &writeSet, nullptr, &timeout) > 0
+                        ? 0
+                        : -1;
+        int socketError = 0;
+        socklen_t socketErrorSize = sizeof(socketError);
+        if (connected == 0 &&
+            (getsockopt(socket_, SOL_SOCKET, SO_ERROR, &socketError,
+                        &socketErrorSize) != 0 || socketError != 0)) {
+          connected = -1;
+        }
+      }
+      fcntl(socket_, F_SETFL, originalFlags);
+      if (connected == 0) break;
+      close(socket_);
+      socket_ = -1;
+    }
+    freeaddrinfo(addresses);
+    if (socket_ < 0) {
+      lastError_ = SOCKET_ERROR_E;
+      return 0;
+    }
+
+    struct timeval socketTimeout = {
+        static_cast<time_t>(timeoutMs / 1000),
+        static_cast<suseconds_t>((timeoutMs % 1000) * 1000)};
+    setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO, &socketTimeout,
+               sizeof(socketTimeout));
+    setsockopt(socket_, SOL_SOCKET, SO_SNDTIMEO, &socketTimeout,
+               sizeof(socketTimeout));
+
+    if (wolfSSL_Init() != WOLFSSL_SUCCESS) {
+      lastError_ = MEMORY_E;
+      stop();
+      return 0;
+    }
+    initialized_ = true;
+    context_ = wolfSSL_CTX_new(wolfTLS_client_method());
+    if (!context_ ||
+        wolfSSL_CTX_load_verify_buffer(
+            context_, reinterpret_cast<const unsigned char*>(kWolfSslProbeCa),
+            strlen(kWolfSslProbeCa), WOLFSSL_FILETYPE_PEM) != WOLFSSL_SUCCESS) {
+      lastError_ = ASN_INPUT_E;
+      stop();
+      return 0;
+    }
+    wolfSSL_CTX_set_verify(context_, WOLFSSL_VERIFY_PEER, nullptr);
+    ssl_ = wolfSSL_new(context_);
+    if (!ssl_ || wolfSSL_set_fd(ssl_, socket_) != WOLFSSL_SUCCESS ||
+        wolfSSL_check_domain_name(ssl_, host) != WOLFSSL_SUCCESS ||
+        wolfSSL_UseSNI(ssl_, WOLFSSL_SNI_HOST_NAME, host,
+                       static_cast<unsigned short>(strlen(host))) !=
+            WOLFSSL_SUCCESS) {
+      lastError_ = BAD_FUNC_ARG;
+      stop();
+      return 0;
+    }
+    if (wolfSSL_connect(ssl_) != WOLFSSL_SUCCESS) {
+      lastError_ = wolfSSL_get_error(ssl_, 0);
+      stop();
+      return 0;
+    }
+    connected_ = true;
+    lastStage_ = 0;
+    return 1;
+  }
+
+  size_t write(uint8_t data) override { return write(&data, 1); }
+  size_t write(const uint8_t* buffer, size_t size) override {
+    if (!ssl_ || !connected_ || !buffer || size == 0) return 0;
+    const int written = wolfSSL_write(ssl_, buffer, static_cast<int>(size));
+    if (written <= 0) {
+      lastStage_ = 2;
+      lastError_ = wolfSSL_get_error(ssl_, written);
+      connected_ = false;
+      return 0;
+    }
+    return static_cast<size_t>(written);
+  }
+  int available() override {
+    if (peeked_ >= 0) return 1;
+    if (!ssl_ || !connected_) return 0;
+    const int pending = wolfSSL_pending(ssl_);
+    if (pending > 0) return pending;
+    int encryptedBytes = 0;
+    return ioctl(socket_, FIONREAD, &encryptedBytes) == 0 && encryptedBytes > 0
+               ? 1
+               : 0;
+  }
+  int read() override {
+    uint8_t value = 0;
+    return read(&value, 1) == 1 ? value : -1;
+  }
+  int read(uint8_t* buffer, size_t size) override {
+    if (!buffer || size == 0) return 0;
+    size_t offset = 0;
+    if (peeked_ >= 0) {
+      buffer[offset++] = static_cast<uint8_t>(peeked_);
+      peeked_ = -1;
+      if (offset == size) return static_cast<int>(offset);
+    }
+    if (!ssl_ || !connected_) return offset ? static_cast<int>(offset) : -1;
+    const int received = wolfSSL_read(
+        ssl_, buffer + offset, static_cast<int>(size - offset));
+    if (received > 0) return static_cast<int>(offset) + received;
+    lastStage_ = 3;
+    lastError_ = wolfSSL_get_error(ssl_, received);
+    if (lastError_ != WOLFSSL_ERROR_WANT_READ &&
+        lastError_ != WOLFSSL_ERROR_WANT_WRITE) {
+      connected_ = false;
+    }
+    return offset ? static_cast<int>(offset) : -1;
+  }
+  int peek() override {
+    if (peeked_ >= 0) return peeked_;
+    uint8_t value = 0;
+    const int received = read(&value, 1);
+    if (received != 1) return -1;
+    peeked_ = value;
+    return peeked_;
+  }
+  void flush() override {}
+  void stop() override {
+    connected_ = false;
+    peeked_ = -1;
+    if (ssl_) {
+      wolfSSL_shutdown(ssl_);
+      wolfSSL_free(ssl_);
+      ssl_ = nullptr;
+    }
+    if (socket_ >= 0) {
+      close(socket_);
+      socket_ = -1;
+    }
+    if (context_) {
+      wolfSSL_CTX_free(context_);
+      context_ = nullptr;
+    }
+    if (initialized_) {
+      wolfSSL_Cleanup();
+      initialized_ = false;
+    }
+  }
+  uint8_t connected() override {
+    if (!ssl_ || !connected_) return 0;
+    if (peeked_ >= 0 || wolfSSL_pending(ssl_) > 0) return 1;
+    uint8_t value = 0;
+    const int result = recv(socket_, &value, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (result == 0) {
+      lastStage_ = 4;
+      connected_ = false;
+    }
+    else if (result < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+      connected_ = false;
+    return connected_ ? 1 : 0;
+  }
+  operator bool() override { return connected(); }
+  void setConnectionTimeout(uint32_t milliseconds) override {
+    connectionTimeoutMs_ = milliseconds;
+  }
+  int lastError() const { return lastError_; }
+  int lastStage() const { return lastStage_; }
+
+ private:
+  int socket_ = -1;
+  WOLFSSL_CTX* context_ = nullptr;
+  WOLFSSL* ssl_ = nullptr;
+  int peeked_ = -1;
+  int lastError_ = 0;
+  int lastStage_ = 0;
+  uint32_t connectionTimeoutMs_ = 12000;
+  bool initialized_ = false;
+  bool connected_ = false;
+};
+
+static bool wolfSslProfileLoginRequest(const char* url, const char* body,
+                                       JsonDocument& response, char* error,
+                                       size_t errorSize,
+                                       bool* applicationJson) {
+  WolfSslAuthClient client;
+  client.setTimeout(12000);
+  const bool ok = cloudJsonRequestWithClient(
+      client, url, "POST", body, nullptr, response, error, errorSize,
+      applicationJson);
+  if (!ok && (strcmp(error, "https_begin_failed") == 0 ||
+              strncmp(error, "http_-", strlen("http_-")) == 0)) {
+    snprintf(error, errorSize, "wolfssl_io_%d_%d", client.lastStage(),
+             client.lastError());
+  }
+  return ok;
+}
+#endif
+
 #ifdef BAMBU_AUTH_TRANSPORT_PROBE
+static bool classifyProbeHttpResponse(char* raw, size_t received,
+                                      JsonDocument& response, char* error,
+                                      size_t errorSize, bool* applicationJson);
 static bool espTlsProfileLoginRequest(const char* body, JsonDocument& response,
                                       char* error, size_t errorSize,
-                                      bool* applicationJson) {
+                                      bool* applicationJson,
+                                      const int* cipherOrder) {
   if (applicationJson) *applicationJson = false;
   esp_transport_handle_t transport = esp_transport_ssl_init();
   if (!transport) {
@@ -616,13 +1094,13 @@ static bool espTlsProfileLoginRequest(const char* body, JsonDocument& response,
   esp_transport_ssl_set_cert_data(transport, kBambuCloudCa,
                                   strlen(kBambuCloudCa) + 1);
   esp_transport_ssl_set_tls_version(transport, ESP_TLS_VER_TLS_1_2);
-  int supportedDesktopOrder[sizeof(kDesktopTls12CipherOrder) / sizeof(int)] = {};
+  int supportedOrder[32] = {};
   const int* supported = esp_tls_get_ciphersuites_list();
   size_t supportedCount = 0;
-  for (const int* candidate = kDesktopTls12CipherOrder; *candidate; ++candidate) {
+  for (const int* candidate = cipherOrder; *candidate; ++candidate) {
     for (const int* available = supported; available && *available; ++available) {
       if (*candidate == *available) {
-        supportedDesktopOrder[supportedCount++] = *candidate;
+        supportedOrder[supportedCount++] = *candidate;
         break;
       }
     }
@@ -632,19 +1110,28 @@ static bool espTlsProfileLoginRequest(const char* body, JsonDocument& response,
     esp_transport_destroy(transport);
     return false;
   }
-  esp_transport_ssl_set_ciphersuites_list(transport, supportedDesktopOrder);
-  if (esp_transport_connect(transport, "api.bambulab.com", 443, 12000) != 0) {
+  esp_transport_ssl_set_ciphersuites_list(transport, supportedOrder);
+#ifdef BAMBU_AUTH_TRANSPORT_CAPTURE
+  const int connectResult =
+      esp_transport_connect(transport, "192.168.1.166", 8443, 12000);
+#else
+  const int connectResult =
+      esp_transport_connect(transport, "api.bambulab.com", 443, 12000);
+#endif
+  if (connectResult != 0) {
     int tlsCode = 0;
     int tlsFlags = 0;
     esp_tls_error_handle_t errorHandle = esp_transport_get_error_handle(transport);
     if (errorHandle &&
         esp_tls_get_and_clear_last_error(errorHandle, &tlsCode, &tlsFlags) ==
             ESP_OK) {
-      snprintf(error, errorSize, "esp_tls_connect_%x_%x",
+      snprintf(error, errorSize, "esp_tls_connect_%x_%x_errno_%d",
                static_cast<unsigned>(-tlsCode),
-               static_cast<unsigned>(tlsFlags));
+               static_cast<unsigned>(tlsFlags),
+               esp_transport_get_errno(transport));
     } else {
-      copyCode(error, errorSize, "esp_tls_connect_failed");
+      snprintf(error, errorSize, "esp_tls_connect_failed_errno_%d",
+               esp_transport_get_errno(transport));
     }
     esp_transport_destroy(transport);
     return false;
@@ -743,6 +1230,13 @@ static bool espTlsProfileLoginRequest(const char* body, JsonDocument& response,
     free(raw);
     return false;
   }
+  return classifyProbeHttpResponse(raw, received, response, error, errorSize,
+                                   applicationJson);
+}
+
+static bool classifyProbeHttpResponse(char* raw, size_t received,
+                                      JsonDocument& response, char* error,
+                                      size_t errorSize, bool* applicationJson) {
   raw[received] = '\0';
   char* headerEnd = strstr(raw, "\r\n\r\n");
   int statusCode = 0;
@@ -811,6 +1305,262 @@ static bool espTlsProfileLoginRequest(const char* body, JsonDocument& response,
   free(raw);
   return true;
 }
+
+// AT04 adapter: stock Mbed TLS driven directly so the auth probe can control
+// ClientHello wire groups (cipher suite list) that the Arduino TLS wrappers do
+// not expose. Certificate and hostname validation stay enabled; the wire
+// profile otherwise matches the production Mbed TLS ClientHello captured in
+// AT04 step 1.
+static int mbedtlsProbeBioSend(void* ctx, const unsigned char* buf, size_t len) {
+  NetworkClient* client = static_cast<NetworkClient*>(ctx);
+  const int written = static_cast<int>(client->write(buf, len));
+  return written > 0 ? written : MBEDTLS_ERR_SSL_WANT_WRITE;
+}
+
+static int mbedtlsProbeBioRecv(void* ctx, unsigned char* buf, size_t len) {
+  NetworkClient* client = static_cast<NetworkClient*>(ctx);
+  if (!client->connected()) return MBEDTLS_ERR_NET_CONN_RESET;
+  if (client->available() <= 0) return MBEDTLS_ERR_SSL_WANT_READ;
+  const int received = client->read(buf, len);
+  return received > 0 ? received : MBEDTLS_ERR_SSL_WANT_READ;
+}
+
+static bool mbedtlsCipherProfileLoginRequest(const char* body,
+                                             JsonDocument& response,
+                                             char* error, size_t errorSize,
+                                             bool* applicationJson,
+                                             const int* cipherOrder,
+                                             const char* userAgentOverride,
+                                             bool emulateWrapperShape) {
+  if (applicationJson) *applicationJson = false;
+  NetworkClient tcp;
+  tcp.setTimeout(12000);
+#ifdef BAMBU_AUTH_TRANSPORT_CAPTURE
+  const char* observationHost = "192.168.1.166";
+  if (!tcp.connect(observationHost, 8443)) {
+#else
+  const char* observationHost = "api.bambulab.com";
+  if (!tcp.connect(observationHost, 443)) {
+#endif
+    copyCode(error, errorSize, "mbedtls_tcp_failed");
+    return false;
+  }
+
+  int ret = psa_crypto_init();
+  if (ret != PSA_SUCCESS) {
+    snprintf(error, errorSize, "mbedtls_psa_%d", static_cast<int>(ret));
+    return false;
+  }
+
+  mbedtls_entropy_context entropy;
+  mbedtls_ctr_drbg_context drbg;
+  mbedtls_ssl_context ssl;
+  mbedtls_ssl_config conf;
+  mbedtls_x509_crt ca;
+  mbedtls_entropy_init(&entropy);
+  mbedtls_ctr_drbg_init(&drbg);
+  mbedtls_ssl_init(&ssl);
+  mbedtls_ssl_config_init(&conf);
+  mbedtls_x509_crt_init(&ca);
+
+  bool result = false;
+  do {
+    ret = mbedtls_ctr_drbg_seed(&drbg, mbedtls_entropy_func, &entropy, nullptr, 0);
+    if (ret != 0) {
+      snprintf(error, errorSize, "mbedtls_seed_%d", ret);
+      break;
+    }
+#ifdef BAMBU_AUTH_TRANSPORT_CAPTURE
+    ret = mbedtls_x509_crt_parse(&ca, (const unsigned char*)kCaptureObservationCa,
+                                 strlen(kCaptureObservationCa) + 1);
+#else
+    ret = mbedtls_x509_crt_parse(&ca, (const unsigned char*)kBambuCloudCa,
+                                 strlen(kBambuCloudCa) + 1);
+#endif
+    if (ret != 0) {
+      snprintf(error, errorSize, "mbedtls_ca_%d", ret);
+      break;
+    }
+    ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT,
+                                      MBEDTLS_SSL_TRANSPORT_STREAM,
+                                      MBEDTLS_SSL_PRESET_DEFAULT);
+    if (ret != 0) {
+      snprintf(error, errorSize, "mbedtls_defaults_%d", ret);
+      break;
+    }
+    mbedtls_ssl_conf_min_tls_version(&conf, MBEDTLS_SSL_VERSION_TLS1_2);
+    mbedtls_ssl_conf_max_tls_version(&conf, MBEDTLS_SSL_VERSION_TLS1_2);
+    mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+    mbedtls_ssl_conf_ca_chain(&conf, &ca, nullptr);
+    if (cipherOrder) mbedtls_ssl_conf_ciphersuites(&conf, cipherOrder);
+    mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &drbg);
+    ret = mbedtls_ssl_setup(&ssl, &conf);
+    if (ret != 0) {
+      snprintf(error, errorSize, "mbedtls_setup_%d", ret);
+      break;
+    }
+    ret = mbedtls_ssl_set_hostname(&ssl, "api.bambulab.com");
+    if (ret != 0) {
+      snprintf(error, errorSize, "mbedtls_hostname_%d", ret);
+      break;
+    }
+    mbedtls_ssl_set_bio(&ssl, &tcp, mbedtlsProbeBioSend, mbedtlsProbeBioRecv,
+                        nullptr);
+
+    const uint32_t handshakeDeadline = millis() + 12000;
+    while ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
+      if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
+          ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+        snprintf(error, errorSize, "mbedtls_hs_%d", ret);
+        break;
+      }
+      if (static_cast<int32_t>(millis() - handshakeDeadline) >= 0) {
+        copyCode(error, errorSize, "mbedtls_hs_timeout");
+        break;
+      }
+      delay(2);
+    }
+    if (ret != 0) break;
+    if (mbedtls_ssl_get_verify_result(&ssl) != 0) {
+      copyCode(error, errorSize, "mbedtls_verify_failed");
+      break;
+    }
+
+    char deviceId[37] = {};
+    makeCloudDeviceId(deviceId);
+    static constexpr size_t kMaximumAuthProbeRequestBytes = 1536;
+    char* request = static_cast<char*>(calloc(kMaximumAuthProbeRequestBytes, 1));
+    if (!request) {
+      copyCode(error, errorSize, "json_no_memory");
+      bambuSecureZero(deviceId, sizeof(deviceId));
+      break;
+    }
+    const char* userAgent =
+        userAgentOverride ? userAgentOverride : "bambu_network_agent/02.07.01.51";
+    int requestLength;
+    if (emulateWrapperShape) {
+      requestLength = snprintf(
+          request, kMaximumAuthProbeRequestBytes,
+          "POST /v1/user-service/user/login HTTP/1.0\r\n"
+          "Host: api.bambulab.com\r\n"
+          "User-Agent: %s\r\n"
+          "Connection: close\r\n"
+          "X-BBL-Client-Name: BambuStudio\r\n"
+          "X-BBL-Client-Type: slicer\r\n"
+          "X-BBL-Client-Version: 02.07.01.62\r\n"
+          "X-BBL-Device-ID: %s\r\n"
+          "X-BBL-Language: en-US\r\n"
+          "X-BBL-OS-Type: linux\r\n"
+          "X-BBL-OS-Version: esp32\r\n"
+          "X-BBL-Agent-Version: 02.07.01.51\r\n"
+          "X-BBL-Executable-info: {}\r\n"
+          "X-BBL-Agent-OS-Type: linux\r\n"
+          "X-BBL-Executable-Env: false\r\n"
+          "Accept: application/json\r\n"
+          "Content-Type: application/json\r\n"
+          "Content-Length: %u\r\n\r\n",
+          userAgent, deviceId, static_cast<unsigned>(strlen(body)));
+    } else {
+      requestLength = snprintf(
+          request, kMaximumAuthProbeRequestBytes,
+          "POST /v1/user-service/user/login HTTP/1.0\r\n"
+          "Host: api.bambulab.com\r\n"
+          "User-Agent: %s\r\n"
+          "X-BBL-Client-Name: BambuStudio\r\n"
+          "X-BBL-Client-Type: slicer\r\n"
+          "X-BBL-Client-Version: 02.07.01.62\r\n"
+          "X-BBL-Device-ID: %s\r\n"
+          "X-BBL-Language: en-US\r\n"
+          "X-BBL-OS-Type: linux\r\n"
+          "X-BBL-OS-Version: esp32\r\n"
+          "X-BBL-Agent-Version: 02.07.01.51\r\n"
+          "X-BBL-Executable-info: {}\r\n"
+          "X-BBL-Agent-OS-Type: linux\r\n"
+          "X-BBL-Executable-Env: false\r\n"
+          "Accept: application/json\r\n"
+          "Content-Type: application/json\r\n"
+          "Content-Length: %u\r\n"
+          "Connection: close\r\n\r\n%s",
+          userAgent, deviceId, static_cast<unsigned>(strlen(body)), body);
+    }
+    bambuSecureZero(deviceId, sizeof(deviceId));
+    if (requestLength <= 0 ||
+        requestLength >= static_cast<int>(kMaximumAuthProbeRequestBytes)) {
+      copyCode(error, errorSize, "request_oversized");
+      bambuSecureZero(request, kMaximumAuthProbeRequestBytes);
+      free(request);
+      break;
+    }
+    size_t sent = 0;
+    while (sent < static_cast<size_t>(requestLength)) {
+      ret = mbedtls_ssl_write(&ssl, (const unsigned char*)request + sent,
+                              requestLength - sent);
+      if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+        delay(2);
+        continue;
+      }
+      if (ret <= 0) break;
+      sent += static_cast<size_t>(ret);
+    }
+    size_t bodySent = 0;
+    if (emulateWrapperShape && sent == static_cast<size_t>(requestLength)) {
+      while (bodySent < strlen(body)) {
+        ret = mbedtls_ssl_write(&ssl, (const unsigned char*)body + bodySent,
+                                strlen(body) - bodySent);
+        if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
+            ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+          delay(2);
+          continue;
+        }
+        if (ret <= 0) break;
+        bodySent += static_cast<size_t>(ret);
+      }
+    }
+    bambuSecureZero(request, kMaximumAuthProbeRequestBytes);
+    free(request);
+    if (sent != static_cast<size_t>(requestLength) ||
+        (emulateWrapperShape && bodySent != strlen(body))) {
+      copyCode(error, errorSize, "mbedtls_write_failed");
+      break;
+    }
+
+    char* raw = static_cast<char*>(calloc(kMaximumAuthProbeResponseBytes + 1, 1));
+    if (!raw) {
+      copyCode(error, errorSize, "json_no_memory");
+      break;
+    }
+    size_t received = 0;
+    const uint32_t readDeadline = millis() + 12000;
+    while (received < kMaximumAuthProbeResponseBytes) {
+      ret = mbedtls_ssl_read(&ssl, (unsigned char*)raw + received,
+                             kMaximumAuthProbeResponseBytes - received);
+      if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
+          ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+        if (static_cast<int32_t>(millis() - readDeadline) >= 0) break;
+        delay(2);
+        continue;
+      }
+      if (ret <= 0) break;
+      received += static_cast<size_t>(ret);
+    }
+    if (received == 0) {
+      copyCode(error, errorSize, "mbedtls_read_failed");
+      bambuSecureZero(raw, kMaximumAuthProbeResponseBytes + 1);
+      free(raw);
+      break;
+    }
+    result = classifyProbeHttpResponse(raw, received, response, error, errorSize,
+                                       applicationJson);
+  } while (false);
+
+  mbedtls_ssl_free(&ssl);
+  mbedtls_ssl_config_free(&conf);
+  mbedtls_x509_crt_free(&ca);
+  mbedtls_ctr_drbg_free(&drbg);
+  mbedtls_entropy_free(&entropy);
+  tcp.stop();
+  return result;
+}
 #endif
 
 static bool cloudJsonRequest(SecureNetworkCoordinator& coordinator,
@@ -830,17 +1580,52 @@ static bool cloudJsonRequest(SecureNetworkCoordinator& coordinator,
     copyCode(error, errorSize, "transport_profile_invalid");
     return false;
   }
+  if (transportProfile == 6 || transportProfile == 7 || transportProfile == 8 ||
+      transportProfile == 9 || transportProfile == 10 ||
+      transportProfile == 11 || transportProfile == 12) {
+    const int* cipherOrder = transportProfile == 6 ? kStrongTls12CipherOrder
+                             : transportProfile == 7 ? kSingleTls12CipherOrder
+                                                     : nullptr;
+    // Profile 9 reproduces the production wrapper's silently-substituted
+    // default User-Agent over the passing adapter, binding the verdict to the
+    // HTTP header diff rather than the Mbed TLS ClientHello.
+    const char* userAgentOverride = transportProfile == 9
+                                        ? "ESP32 HTTP Client/1.1"
+                                        : transportProfile == 12
+                                              ? "ESP32HTTPClient"
+                                              : nullptr;
+    const bool emulateWrapperShape =
+        transportProfile == 10 || transportProfile == 11;
+    return mbedtlsCipherProfileLoginRequest(body, response, error, errorSize,
+                                            applicationJson, cipherOrder,
+                                            userAgentOverride,
+                                            emulateWrapperShape);
+  }
   if (transportProfile == 2) {
     return espTlsProfileLoginRequest(body, response, error, errorSize,
-                                     applicationJson);
+                                     applicationJson, kDesktopTls12CipherOrder);
   }
-  if (transportProfile == 4) {
+#ifdef BAMBU_AUTH_WOLFSSL_PROBE
+  if (transportProfile == 5) {
+    return wolfSslProfileLoginRequest(url, body, response, error, errorSize,
+                                      applicationJson);
+  }
+#endif
+  if (transportProfile == 4 || transportProfile == 5) {
     copyCode(error, errorSize, "transport_profile_unsupported");
     return false;
   }
 #else
   (void)transportProfile;
 #endif
+#ifdef BAMBU_AUTH_TRANSPORT_CAPTURE
+  CaptureObservationClient client;
+  client.setTimeout(12000);
+  client.setHandshakeTimeout(12);
+  return cloudJsonRequestWithClient(client, url, method, body, bearer,
+                                    response, error, errorSize,
+                                    applicationJson);
+#else
   WiFiClientSecure client;
   client.setCACert(kBambuCloudCa);
   client.setTimeout(12000);
@@ -851,6 +1636,7 @@ static bool cloudJsonRequest(SecureNetworkCoordinator& coordinator,
   return cloudJsonRequestWithClient(client, url, method, body, bearer,
                                     response, error, errorSize,
                                     applicationJson);
+#endif
 }
 
 static uint32_t expiryTimestamp(uint32_t lifetimeSeconds) {
@@ -1037,6 +1823,17 @@ bool BambuCloud::submitLogin(const char* email, const char* password,
 #ifdef BAMBU_AUTH_TRANSPORT_PROBE
   status_.authTransportApplicationJson = false;
   status_.authTransportProfile = transportProfile;
+  status_.authTransport200Length = -2;
+  status_.authTransport200Read = 0;
+  status_.authTransport200First = -1;
+  status_.authTransport200Error = 255;
+  status_.authTransport200Code = -2;
+  status_.authTransportShape = 0;
+  status_.authTransportCall = 0;
+  status_.authTransportKeyCount = 0;
+  memset(status_.authTransportKeys, 0, sizeof(status_.authTransportKeys));
+  status_.authTransportTailLen = 0;
+  memset(status_.authTransportTail, 0, sizeof(status_.authTransportTail));
 #endif
   status_.phase = BAMBU_AUTH_SUBMITTING_CREDENTIALS;
   operationDeadlineMs_ = millis() + kOperationTtlMs;
@@ -1132,6 +1929,24 @@ BambuCloudPublicStatus BambuCloud::publicStatus() const {
   xSemaphoreGive(mutex_);
   return copy;
 }
+
+#ifdef BAMBU_AUTH_TRANSPORT_PROBE
+void BambuCloud::persistProbeTransport(uint8_t callTag) {
+  xSemaphoreTake(mutex_, portMAX_DELAY);
+  status_.authTransport200Length = gProbe200Length;
+  status_.authTransport200Read = gProbe200Read;
+  status_.authTransport200First = gProbe200First;
+  status_.authTransport200Error = gProbe200Error;
+  status_.authTransport200Code = gProbe200Code;
+  status_.authTransportShape = gProbe200Shape;
+  status_.authTransportCall = callTag;
+  status_.authTransportKeyCount = gProbeKeyCount;
+  memcpy(status_.authTransportKeys, gProbeKeys, sizeof(status_.authTransportKeys));
+  status_.authTransportTailLen = gProbeTailLen;
+  memcpy(status_.authTransportTail, gProbeTail, sizeof(status_.authTransportTail));
+  xSemaphoreGive(mutex_);
+}
+#endif
 
 void BambuCloud::noteRefreshFailure() {
   mqttRecovery_.fail(RECOVERY_API, millis());
@@ -1388,6 +2203,7 @@ bool BambuCloud::postLogin(const PendingRequest& request, bool verification,
   xSemaphoreTake(mutex_, portMAX_DELAY);
   status_.authTransportApplicationJson = applicationJson;
   xSemaphoreGive(mutex_);
+  persistProbeTransport(verification ? 6 : 1);
 #else
   bool ok = cloudJsonRequest(coordinator_, url, "POST", body, nullptr,
                              response, error, errorSize);
@@ -1477,6 +2293,9 @@ bool BambuCloud::sendVerificationCode(bool sms, char* error, size_t errorSize) {
                              response, error, errorSize);
   bambuSecureZero(body, sizeof(body));
   requestDoc.clear();
+#ifdef BAMBU_AUTH_TRANSPORT_PROBE
+  persistProbeTransport(2);
+#endif
   return ok;
 }
 
@@ -1543,6 +2362,9 @@ bool BambuCloud::discoverAccountAndPrinters(char* error, size_t errorSize) {
                         pendingAuth_.accessToken, profile, error, errorSize))
     return false;
   JsonVariantConst profileData = responseData(profile);
+#ifdef BAMBU_AUTH_TRANSPORT_PROBE
+  persistProbeTransport(3);
+#endif
   const char* uid = firstString(profileData, "uid", "userId", "user_id");
   if (!uid[0]) uid = firstString(profileData, "accountId", "account_id");
   if (!uid[0] || strlen(uid) >= sizeof(pendingAuth_.uid)) {
@@ -1557,6 +2379,9 @@ bool BambuCloud::discoverAccountAndPrinters(char* error, size_t errorSize) {
                         pendingAuth_.accessToken, directory, error, errorSize))
     return false;
   JsonVariantConst directoryData = responseData(directory);
+#ifdef BAMBU_AUTH_TRANSPORT_PROBE
+  persistProbeTransport(4);
+#endif
   JsonArrayConst devices = directoryData["devices"].as<JsonArrayConst>();
   if (devices.isNull()) devices = directory["devices"].as<JsonArrayConst>();
   uint8_t count = 0;

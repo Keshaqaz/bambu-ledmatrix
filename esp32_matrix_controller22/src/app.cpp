@@ -105,7 +105,13 @@ void loop();
 static constexpr uint16_t CONFIG_VERSION = 332;
 // Версия прошивки: поднимать при каждой OTA-итерации — по смене значения в
 // /api/status видно, что обновление реально применилось.
-static constexpr const char* FW_VERSION = "4.3.7-2026.09.02";
+#ifdef BAMBU_AUTH_TRANSPORT_CAPTURE
+static constexpr const char* FW_VERSION = "4.3.11-cap04-2026.09.02";
+#elif defined(BAMBU_AUTH_TRANSPORT_PROBE)
+static constexpr const char* FW_VERSION = "4.3.12-at04-2026.09.02";
+#else
+static constexpr const char* FW_VERSION = "4.3.11-2026.09.02";
+#endif
 static constexpr uint32_t STORED_STATE_MAGIC = 0x4D415458UL; // MATX
 static constexpr uint16_t STORED_STATE_VERSION = 2;
 static constexpr size_t BAMBU_TOKEN_CAPACITY = 384;
@@ -2255,6 +2261,22 @@ static void appendBambuCloudStatus(JsonDocument& doc,
 #ifdef BAMBU_AUTH_TRANSPORT_PROBE
   doc["transportApplicationJson"] = status.authTransportApplicationJson;
   doc["transportProfile"] = status.authTransportProfile;
+  doc["transport200Length"] = status.authTransport200Length;
+  doc["transport200Read"] = status.authTransport200Read;
+  doc["transport200First"] = status.authTransport200First;
+  doc["transport200Error"] = status.authTransport200Error;
+  doc["transportCode"] = status.authTransport200Code;
+  char shapeText[7];
+  snprintf(shapeText, sizeof(shapeText), "%04x", status.authTransportShape);
+  doc["transportShape"] = shapeText;
+  doc["transportCall"] = status.authTransportCall;
+  JsonArray keys = doc["transportKeys"].to<JsonArray>();
+  for (uint8_t i = 0; i < status.authTransportKeyCount && i < 12; ++i)
+    keys.add(status.authTransportKeys[i]);
+  String tail;
+  for (uint8_t i = 0; i < status.authTransportTailLen && i < 16; ++i)
+    tail += String(status.authTransportTail[i]);
+  doc["transportTail"] = tail;
 #endif
   doc["mqttConnected"] = status.mqttConnected;
   doc["firstValidReport"] = status.firstValidReport;
@@ -2293,7 +2315,7 @@ void handleBambuAuthLogin() {
 #ifdef BAMBU_AUTH_TRANSPORT_PROBE
   const int transportProfileValue = doc["transportProfile"] | 0;
   const uint8_t transportProfile =
-      transportProfileValue >= 0 && transportProfileValue <= 4
+      transportProfileValue >= 0 && transportProfileValue <= 12
           ? static_cast<uint8_t>(transportProfileValue)
           : UINT8_MAX;
 #else

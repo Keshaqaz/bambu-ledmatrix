@@ -170,6 +170,33 @@ class TransportOracleTest(unittest.TestCase):
         login_body = calls[1][1]["body"]
         self.assertIn(b'"transportProfile":2', login_body)
 
+    def test_at03_wolfssl_profile_is_sent(self):
+        calls = []
+        responses = iter(
+            (
+                clean_esp_status(),
+                {"accepted": True, "operationId": "expected-operation"},
+                {
+                    "state": "recoverable_error",
+                    "operationId": "",
+                    "error": "cloudflare_blocked",
+                    "transportProfile": 5,
+                },
+            )
+        )
+
+        def read_json(*args, **kwargs):
+            calls.append((args, kwargs))
+            return next(responses)
+
+        with mock.patch.object(self.probe, "read_json", side_effect=read_json):
+            self.assertEqual(
+                self.probe.esp_request("http://device.invalid", 2, profile=5),
+                "TRANSPORT_BLOCKED",
+            )
+
+        self.assertIn(b'"transportProfile":5', calls[1][1]["body"])
+
     def test_esp_fast_terminal_status_is_correlated_by_clean_baseline(self):
         responses = iter(
             (

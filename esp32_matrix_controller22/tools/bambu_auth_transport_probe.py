@@ -327,7 +327,7 @@ def main():
     esp = subparsers.add_parser("esp")
     esp.add_argument("--url", required=True)
     esp.add_argument("--timeout", type=float, default=25.0)
-    esp.add_argument("--profile", type=int, choices=range(5), default=0)
+    esp.add_argument("--profile", type=int, choices=range(13), default=0)
     args = parser.parse_args()
     if args.target == "desktop":
         verdict = desktop_request(args.timeout)
