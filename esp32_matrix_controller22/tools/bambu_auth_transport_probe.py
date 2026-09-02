@@ -291,7 +291,9 @@ def esp_request(base_url, timeout_seconds, profile=0):
         base_url.rstrip("/") + "/api/bambu/auth/login",
         method="POST",
         body=login_body,
-        timeout_seconds=min(timeout_seconds, 5),
+        # A direct ESP-TLS profile runs synchronously in the device handler and
+        # can legitimately take longer than the normal asynchronous enqueue.
+        timeout_seconds=min(timeout_seconds, 20),
     )
     if not accepted or not accepted.get("accepted"):
         return VERDICT_ERROR

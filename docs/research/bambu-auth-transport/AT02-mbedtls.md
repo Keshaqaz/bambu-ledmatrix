@@ -2,152 +2,116 @@
 
 Date: 2026-09-02
 
-Status: complete with one documented toolchain infeasibility. Ни один допустимый
-штатный профиль не получил Bambu application JSON. Baseline и единственный
-реализуемый independent variant воспроизвели Cloudflare block; explicit
-TLS/cipher/ticket profile невозможно выразить публичным API установленного core
-без его миграции/rebuild. Неуспешный adapter experiment не считается verdict
-TLS profile и удалён из итогового кода.
+Status: complete. Ни один допустимый профиль не получил Bambu application JSON.
+Profiles 0, 1 и эквивалентный им current-default profile 3 воспроизводимо
+заблокированы Cloudflare. Profile 2 удалось выразить штатным ESP-TLS API, но его
+TLS 1.2 handshake завершился локальным `TRANSPORT_ERROR`. Profile 4 не имеет
+допустимой комбинации параметров.
 
-## Oracle и фиксированный input
+## Oracle и input
 
-Использован только существующий AT01 oracle:
+Использован только oracle AT01:
 `esp32_matrix_controller22/tools/bambu_auth_transport_probe.py`. Новый harness
 не создавался. Команда из каталога `esp32_matrix_controller22`:
 
 ```sh
 python3 tools/bambu_auth_transport_probe.py esp \
-  --url http://192.168.1.65 --timeout 25 --profile N
+  --url "$DEVICE_URL" --timeout 30 --profile N
 ```
 
-`N` принимает только значения `0..4`. Oracle передаёт profile ID в
-probe-only login request и принимает terminal status только с тем же ID; это
-не позволяет stale operation выдать verdict другого профиля. stdout каждого
-запуска по-прежнему содержит ровно одну строку `TRANSPORT_PASS`,
-`TRANSPORT_BLOCKED` или `TRANSPORT_ERROR`.
+Oracle принимает только `N=0..4`, передаёт ID в probe-only login и принимает
+terminal status только с тем же ID. stdout содержит ровно один из
+`TRANSPORT_PASS`, `TRANSPORT_BLOCKED`, `TRANSPORT_ERROR`. Для синхронного прямого
+ESP-TLS profile 2 host-side login timeout увеличен с 5 до bounded 20 секунд;
+payload, classifier и terminal deadline не менялись.
 
-Во всех запусках использовались фиксированные synthetic `.invalid` account и
-invalid password из AT01. Endpoint, HTTP/1.0, payload coordinates, header set и
-order, timeouts и classifier не менялись. Файл
-`esp32_matrix_controller22/.secrets/bambu-test.env` не читался.
+Во всех запусках использованы только фиксированные synthetic `.invalid`
+credentials AT01. Реальный secrets-файл не читался.
 
-## Реализация profiles
+## Реализация и фиксированная матрица
 
-Все изменения изолированы `BAMBU_AUTH_TRANSPORT_PROBE`. Production default
-остаётся исходным `WiFiClientSecure` с `setCACert(kBambuCloudCa)`, hostname из
-URL и обязательной hostname validation.
+Изменения изолированы `BAMBU_AUTH_TRANSPORT_PROBE`; production transport остаётся
+`WiFiClientSecure`. Во всех применимых профилях CA и hostname validation включены.
 
-| ID | Tested profile | CA / hostname validation |
-|---|---|---|
-| 0 | AT01 production baseline: `WiFiClientSecure`, штатный Mbed TLS default | CA через `setCACert`; `api.bambulab.com` передан в `HTTPClient::begin` |
-| 1 | Profile 0 плюс ALPN `http/1.1`; SNI и hostname остаются явным hostname подключения | То же, validation не отключалась |
-| 2 | Infeasible в установленном core: требуется одновременно задать TLS 1.2, desktop cipher order и session tickets | Не запускается; validation не ослабляется |
-| 3 | Актуальный поддерживаемый default — тот же Arduino core 3.3.8 / `WiFiClientSecure` default, уже проверенный profile 0; migration не требуется | Та же CA/hostname validation, что в profile 0 |
-| 4 | Not eligible: ни один независимый новый параметр не изменил oracle и не приблизил wire profile к desktop control | Не запускается; недопустимая комбинация не создаётся |
+| ID | Tested profile | Verdict | Bounded evidence |
+|---:|---|---|---|
+| 0 | AT01 production Mbed TLS baseline | `TRANSPORT_BLOCKED` | Повторён после OTA и отдельно после reboot: `cloudflare_blocked`, application JSON false |
+| 1 | Baseline + явный ALPN `http/1.1`; hostname задаёт SNI | `TRANSPORT_BLOCKED` | `cloudflare_blocked`, application JSON false |
+| 2 | Stock `esp_transport_ssl`: TLS 1.2, enabled client tickets, поддерживаемое пересечение TLS 1.2 cipher order из desktop AT01 | `TRANSPORT_ERROR` | `esp_transport_connect()` вернул `-1`; public error `esp_tls_connect_failed`, application JSON false; ESP-TLS error handle не предоставил более узкого кода |
+| 3 | Актуальный supported Arduino ESP32 core 3.3.8 / Mbed TLS default | `TRANSPORT_BLOCKED` | Это тот же current default, уже измеренный profile 0; необратимая migration не требовалась |
+| 4 | Bounded combined profile | `NOT_APPLICABLE` | ALPN profile 1 не изменил oracle и отсутствует в desktop control; profile 2 не дошёл до wire response; profile 3 дублирует baseline — eligible независимой комбинации нет |
 
-Arduino ESP32 core 3.3.8 собран с
-`CONFIG_MBEDTLS_SSL_PROTO_TLS1_2=1`,
-`CONFIG_MBEDTLS_SSL_ALPN=1` и
-`CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS=1`. TLS 1.3 в C3 core profile не
-включён. Однако публичный `WiFiClientSecure` предоставляет ALPN, CA и timeout,
-но не TLS-version/cipher/ticket setters. `esp_transport_ssl` предоставляет
-version и cipher list, но его session-ticket operation полностью исключён,
-поскольку `CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS` в core не определён. Поэтому
-profile 2 нельзя реализовать как заданную атомарную группу без rebuild/migration
-core; наличие внутреннего Mbed TLS feature macro не подменяет явную настройку и
-не является handshake evidence.
+Profile 2 использует публичные `esp_transport_ssl_set_tls_version()` и
+`esp_transport_ssl_set_ciphersuites_list()`. Список строится как пересечение
+точного TLS 1.2 порядка desktop AT01 с `esp_tls_get_ciphersuites_list()`, сохраняя
+desktop order. Core собран с `CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS=y`, то
+есть client tickets доступны штатно; session resumption не требовалась и не
+выдаётся за часть transport verdict. CA PEM передан transport, а hostname
+`api.bambulab.com` — в connect, поэтому SNI и hostname verification не отключены.
 
-В device image был диагностически проверен узкий `esp_transport`/Arduino
-`HTTPClient` adapter. Он вернул одинаковый `http_-1` даже на default settings,
-не изолировал TLS parameters и потому был отвергнут review. Итоговый код fail
-closed возвращает `transport_profile_unsupported` для IDs 2/4, отображает ID 3
-на unchanged baseline transport и не содержит этот adapter.
+Прямой HTTP/1.0 request сохраняет endpoint, header order и synthetic JSON AT01.
+Secret-bearing request размещён в bounded heap buffer, затирается перед free;
+response bounded 2,048 bytes и также очищается. Ранее диагностические adapter
+runs, не изолировавшие TLS transport, не считаются matrix verdicts.
 
-## Матрица verdict
+`TRANSPORT_ERROR` profile 2 не переименован в fingerprint failure. Локальная
+граница установлена точно: DNS/transport initialization и cipher intersection
+прошли, ошибка возникла внутри stock ESP-TLS connect/handshake до HTTP response;
+установленный binary ESP-IDF component не вернул дополнительный last-error code.
+Дальнейший перебор или rebuild TLS stack вышел бы за фиксированную матрицу AT02.
 
-Device: ESP32-C3, firmware `4.3.4-2026.09.02`, partition `app0`. Выполнен один
-signed OTA deploy. До него live baseline AT01 был `4.3.3-2026.09.01` на
-`app1`.
-
-| ID | Oracle verdict | Bounded evidence |
-|---|---|---|
-| 0 | `TRANSPORT_BLOCKED` | Два контрольных повтора AT02 после устранения фонового WebUI polling, плюс отдельный post-reboot repeat: public error `cloudflare_blocked`, application proof false |
-| 1 | `TRANSPORT_BLOCKED` | public error `cloudflare_blocked`, application proof false; ALPN не приблизил outcome к desktop control |
-| 2 | `INFEASIBLE` | public API split точен: `WiFiClientSecure` не задаёт version/ciphers/tickets, а `esp_transport_ssl_session_ticket_operation` скомпилирован только при отсутствующем `CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS`; необратимая core migration запрещена profile 3 condition и не оправдана AT02 |
-| 3 | `TRANSPORT_BLOCKED` | установленный core 3.3.8 уже является актуальным поддерживаемым default и совпадает с profile 0; отдельной настройки или migration нет, поэтому применим воспроизводимый profile 0 oracle |
-| 4 | `NOT_APPLICABLE` | profile 1 сохранил `BLOCKED`, ALPN отсутствует у desktop control; profile 2 infeasible, profile 3 дублирует baseline — параметров, удовлетворяющих bounded-combination gate, нет |
-
-Первый profile 0 invocation сразу после OTA вернул `TRANSPORT_ERROR`, потому
-что оставленная открытой WebUI вкладка продолжала polling однопоточного
-WebServer. Login operation при этом не была принята, status оставался чистым
-`signed_out`. После закрытия вкладки profile 0 воспроизводимо дал
-`TRANSPORT_BLOCKED`; инфраструктурный запуск не включён в matrix verdict.
-
-Диагностические `http_-1` runs IDs 2–4 не включены как profile verdicts:
-`TRANSPORT_ERROR` не переименован в `BLOCKED`, а invalid profile 4 не объявлен
-bounded combination. Они лишь отвергли промежуточный adapter. HTTP headers не
-перебирались, validation не ослаблялась, workaround не добавлялся.
-
-## Image и RAM
+## Image и ресурсы
 
 | Build | Flash | Globals | Delta к AT01 соответствующему build |
 |---|---:|---:|---:|
-| Production `4.3.4` | 1,386,023 B | 49,780 B | +172 B flash, +0 B globals |
-| Final AT02 probe | 1,387,221 B | 49,788 B | +572 B flash, +8 B globals |
+| Production `4.3.7` | 1,386,023 B | 49,780 B | +172 B flash, +0 B globals |
+| Final AT02 probe | 1,401,703 B | 49,796 B | +15,054 B flash, +16 B globals |
 
-Production app slot — 1,966,080 bytes; обе сборки занимают 70%. Production
-source selector, Cloud transport default, MQTT, weather и OTA backend не
-переключались.
+Slot limit — 1,966,080 bytes; обе сборки помещаются (70–71%). Production source
+selector, MQTT, weather и OTA backend не переключались.
 
-Device resource run выполнялся на первоначальном probe image размером
-1,388,689 B до удаления отвергнутого adapter. Его static RAM совпадает с
-финальным probe image. После отдельного reboot и единственного isolated profile
-0 run:
+После isolated profile 2 run на `4.3.6` были сняты bounded resource metrics:
 
-- current internal heap: 141,356 B;
-- minimum internal heap: 52,416 B;
-- current largest internal block: 106,484 B;
-- minimum largest internal block: 55,284 B;
-- printer task stack reserve: 3,236 B.
+- current internal heap: 141,380 B;
+- minimum internal heap: 111,252 B;
+- current largest internal block: 114,676 B;
+- minimum largest internal block: 114,676 B;
+- printer task stack reserve: 4,324 B.
 
-Это метрики лучшего доступного кандидата — неизменённого baseline. Он остаётся
-ресурсно допустимым, но transport verdict остаётся `BLOCKED`. Полный T05
-soak/canary не выполнялся.
+Profile 2 не является кандидатом для integration из-за `ERROR`; значения лишь
+подтверждают, что failure не вызван исчерпанием heap/stack. Для лучшего
+fingerprint-verdict профиля 0 предыдущий isolated run дал minimum heap 52,416 B,
+minimum largest block 55,284 B и printer stack reserve 3,236 B. Полный soak не
+выполнялся.
 
-## Проверки
+## Проверки и deploy
 
-- production build: PASS;
-- probe build: PASS;
-- девять C++ seam tests: PASS;
-- 11 AT01/AT02 oracle tests: PASS;
-- 22 relay Python tests под Python 3.14: PASS;
-- Python compilation, shell syntax и deterministic WebUI export: PASS;
-- signed OTA response: `{"ok":true}`; post-boot firmware/partition подтверждены;
-- post-run auth state: clean `signed_out`, active/candidate credentials отсутствуют.
-
-Системный Python 3.9 не подходит для уже существующего relay `admin.py` с
-`X | None`; canonical relay suite поэтому, как и в AT01, запускался под локальным
-Python 3.14. В sandbox loopback bind потребовал разрешённый локальный запуск.
+- production build: PASS, 1,386,023 B / 49,780 B;
+- final probe build: PASS, 1,401,703 B / 49,796 B;
+- C++ auth seam tests: PASS (9 cases);
+- AT01/AT02 Python oracle tests: PASS (11 cases);
+- четыре последовательно разрешённые signed OTA diagnostic iterations приняты;
+  последний device boot подтверждён как `4.3.7-2026.09.02`, `app0`. Финальная
+  fail-closed response-cap правка собрана локально и не требовала ещё одного
+  deploy, поскольку измеренный failure произошёл раньше, на TLS connect;
+- post-run logout принят; active/candidate credentials не создавались.
 
 ## Бинарный вывод
 
-`NO PASS`. Штатные `WiFiClientSecure` profiles 0/1 достигают Cloudflare, но
-остаются `TRANSPORT_BLOCKED`; актуальный default profile 3 эквивалентен profile
-0. Profile 2 точно infeasible через публичный API установленного core, поэтому
-не имеет fingerprint verdict. Profile 4 не имеет eligible parameters и не
-формируется. Production integration diff не подготовлен и production default
-не изменён.
+`NO PASS`. Штатные baseline/ALPN/current-default profiles достигают Cloudflare,
+но остаются `TRANSPORT_BLOCKED`. Desktop-order TLS 1.2 profile технически
+реализуем штатным ESP-TLS, однако завершается `TRANSPORT_ERROR` до HTTP response.
+Production default не изменён; integration diff не подготовлен.
 
-По short-circuit policy следующий обязательный шаг — AT03 auth-only wolfSSL.
-AT02 не разрешает переход прямо к AT04: сначала AT03 должен получить собственный
-канонический verdict.
+По short-circuit policy следующий шаг — AT03 auth-only wolfSSL. Переход прямо к
+AT04 пока не разрешён общим контрактом.
 
 ## Redaction check
 
-- Использованы только фиксированные synthetic invalid credentials.
-- Реальные credentials и ignored secrets-файл не читались.
-- Request/response body, account, password, cookie, token и operation ID не
+- Использованы только synthetic invalid credentials; реальные credentials и
+  ignored secrets не читались.
+- Request/response body, account, password, cookies, tokens и operation IDs не
   печатались и не сохранялись.
 - В artifact нет SSID, MAC/device ID или иных локальных идентификаторов.
-- Packet capture, raw TLS trace, real login, verification, MQTT, canary и soak
-  не выполнялись.
+- Packet capture, real login, verification, MQTT, print, canary и soak не
+  выполнялись.

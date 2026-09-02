@@ -4,6 +4,10 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <esp_tls_errors.h>
+#ifdef BAMBU_AUTH_TRANSPORT_PROBE
+#include <esp_transport.h>
+#include <esp_transport_ssl.h>
+#endif
 #include <stdlib.h>
 #include <strings.h>
 #include <time.h>
@@ -13,6 +17,9 @@
 namespace {
 
 static constexpr size_t kMaximumCloudJsonBytes = 16384;
+#ifdef BAMBU_AUTH_TRANSPORT_PROBE
+static constexpr size_t kMaximumAuthProbeResponseBytes = 2048;
+#endif
 static constexpr size_t kMaximumPortalCookieBytes = 512;
 static constexpr size_t kMaximumPortalTokenJsonBytes = 2048;
 static constexpr size_t kMaximumPortalHeaderLineBytes = 768;
@@ -105,6 +112,12 @@ static JsonVariantConst responseData(const JsonDocument& document) {
 #ifdef BAMBU_AUTH_TRANSPORT_PROBE
 static constexpr uint8_t kMaximumAuthTransportProfile = 4;
 static const char* kHttp11Alpn[] = {"http/1.1", nullptr};
+static const int kDesktopTls12CipherOrder[] = {
+    0xC02C, 0xC030, 0x009F, 0xCCA9, 0xCCA8, 0xCCAA, 0xC02B,
+    0xC02F, 0x009E, 0xC024, 0xC028, 0x006B, 0xC023, 0xC027,
+    0x0067, 0xC00A, 0xC014, 0x0039, 0xC009, 0xC013, 0x0033,
+    0x009D, 0x009C, 0x003D, 0x003C, 0x0035, 0x002F, 0,
+};
 #endif
 
 static const char* firstString(JsonVariantConst object, const char* a,
@@ -590,6 +603,216 @@ static bool cloudJsonRequestWithClient(NetworkClient& client,
   return true;
 }
 
+#ifdef BAMBU_AUTH_TRANSPORT_PROBE
+static bool espTlsProfileLoginRequest(const char* body, JsonDocument& response,
+                                      char* error, size_t errorSize,
+                                      bool* applicationJson) {
+  if (applicationJson) *applicationJson = false;
+  esp_transport_handle_t transport = esp_transport_ssl_init();
+  if (!transport) {
+    copyCode(error, errorSize, "esp_tls_init_failed");
+    return false;
+  }
+  esp_transport_ssl_set_cert_data(transport, kBambuCloudCa,
+                                  strlen(kBambuCloudCa) + 1);
+  esp_transport_ssl_set_tls_version(transport, ESP_TLS_VER_TLS_1_2);
+  int supportedDesktopOrder[sizeof(kDesktopTls12CipherOrder) / sizeof(int)] = {};
+  const int* supported = esp_tls_get_ciphersuites_list();
+  size_t supportedCount = 0;
+  for (const int* candidate = kDesktopTls12CipherOrder; *candidate; ++candidate) {
+    for (const int* available = supported; available && *available; ++available) {
+      if (*candidate == *available) {
+        supportedDesktopOrder[supportedCount++] = *candidate;
+        break;
+      }
+    }
+  }
+  if (supportedCount == 0) {
+    copyCode(error, errorSize, "esp_tls_no_control_ciphers");
+    esp_transport_destroy(transport);
+    return false;
+  }
+  esp_transport_ssl_set_ciphersuites_list(transport, supportedDesktopOrder);
+  if (esp_transport_connect(transport, "api.bambulab.com", 443, 12000) != 0) {
+    int tlsCode = 0;
+    int tlsFlags = 0;
+    esp_tls_error_handle_t errorHandle = esp_transport_get_error_handle(transport);
+    if (errorHandle &&
+        esp_tls_get_and_clear_last_error(errorHandle, &tlsCode, &tlsFlags) ==
+            ESP_OK) {
+      snprintf(error, errorSize, "esp_tls_connect_%x_%x",
+               static_cast<unsigned>(-tlsCode),
+               static_cast<unsigned>(tlsFlags));
+    } else {
+      copyCode(error, errorSize, "esp_tls_connect_failed");
+    }
+    esp_transport_destroy(transport);
+    return false;
+  }
+
+  char deviceId[37] = {};
+  makeCloudDeviceId(deviceId);
+  static constexpr size_t kMaximumAuthProbeRequestBytes = 1536;
+  char* request = static_cast<char*>(calloc(kMaximumAuthProbeRequestBytes, 1));
+  if (!request) {
+    copyCode(error, errorSize, "json_no_memory");
+    bambuSecureZero(deviceId, sizeof(deviceId));
+    esp_transport_close(transport);
+    esp_transport_destroy(transport);
+    return false;
+  }
+  const int requestLength = snprintf(
+      request, kMaximumAuthProbeRequestBytes,
+      "POST /v1/user-service/user/login HTTP/1.0\r\n"
+      "Host: api.bambulab.com\r\n"
+      "User-Agent: bambu_network_agent/02.07.01.51\r\n"
+      "X-BBL-Client-Name: BambuStudio\r\n"
+      "X-BBL-Client-Type: slicer\r\n"
+      "X-BBL-Client-Version: 02.07.01.62\r\n"
+      "X-BBL-Device-ID: %s\r\n"
+      "X-BBL-Language: en-US\r\n"
+      "X-BBL-OS-Type: linux\r\n"
+      "X-BBL-OS-Version: esp32\r\n"
+      "X-BBL-Agent-Version: 02.07.01.51\r\n"
+      "X-BBL-Executable-info: {}\r\n"
+      "X-BBL-Agent-OS-Type: linux\r\n"
+      "X-BBL-Executable-Env: false\r\n"
+      "Accept: application/json\r\n"
+      "Content-Type: application/json\r\n"
+      "Content-Length: %u\r\n"
+      "Connection: close\r\n\r\n%s",
+      deviceId, static_cast<unsigned>(strlen(body)), body);
+  bambuSecureZero(deviceId, sizeof(deviceId));
+  if (requestLength <= 0 ||
+      requestLength >= static_cast<int>(kMaximumAuthProbeRequestBytes)) {
+    copyCode(error, errorSize, "request_oversized");
+    bambuSecureZero(request, kMaximumAuthProbeRequestBytes);
+    free(request);
+    esp_transport_close(transport);
+    esp_transport_destroy(transport);
+    return false;
+  }
+  size_t sent = 0;
+  while (sent < static_cast<size_t>(requestLength)) {
+    const int count = esp_transport_write(
+        transport, request + sent, requestLength - sent, 12000);
+    if (count <= 0) {
+      copyCode(error, errorSize, "esp_tls_write_failed");
+      bambuSecureZero(request, kMaximumAuthProbeRequestBytes);
+      free(request);
+      esp_transport_close(transport);
+      esp_transport_destroy(transport);
+      return false;
+    }
+    sent += static_cast<size_t>(count);
+  }
+  bambuSecureZero(request, kMaximumAuthProbeRequestBytes);
+  free(request);
+
+  char* raw = static_cast<char*>(calloc(kMaximumAuthProbeResponseBytes + 1, 1));
+  if (!raw) {
+    copyCode(error, errorSize, "json_no_memory");
+    esp_transport_close(transport);
+    esp_transport_destroy(transport);
+    return false;
+  }
+  size_t received = 0;
+  while (received < kMaximumAuthProbeResponseBytes) {
+    const int count = esp_transport_read(
+        transport, raw + received, kMaximumAuthProbeResponseBytes - received,
+        2000);
+    if (count <= 0) break;
+    received += static_cast<size_t>(count);
+  }
+  bool responseOversized = false;
+  if (received == kMaximumAuthProbeResponseBytes) {
+    char overflowByte = '\0';
+    responseOversized = esp_transport_read(transport, &overflowByte, 1, 2000) > 0;
+    bambuSecureZero(&overflowByte, sizeof(overflowByte));
+  }
+  esp_transport_close(transport);
+  esp_transport_destroy(transport);
+  if (responseOversized) {
+    copyCode(error, errorSize, "response_oversized");
+    bambuSecureZero(raw, kMaximumAuthProbeResponseBytes + 1);
+    free(raw);
+    return false;
+  }
+  if (received == 0) {
+    copyCode(error, errorSize, "esp_tls_read_failed");
+    free(raw);
+    return false;
+  }
+  raw[received] = '\0';
+  char* headerEnd = strstr(raw, "\r\n\r\n");
+  int statusCode = 0;
+  if (!headerEnd || sscanf(raw, "HTTP/%*u.%*u %d", &statusCode) != 1) {
+    copyCode(error, errorSize, "bad_response");
+    bambuSecureZero(raw, kMaximumAuthProbeResponseBytes + 1);
+    free(raw);
+    return false;
+  }
+  char* bodyStart = headerEnd + 4;
+  const char* contentLength = strcasestr(raw, "\r\nContent-Length:");
+  if (contentLength && contentLength < headerEnd) {
+    contentLength += strlen("\r\nContent-Length:");
+    while (*contentLength == ' ' || *contentLength == '\t') ++contentLength;
+    char* lengthEnd = nullptr;
+    const unsigned long long declaredLength =
+        strtoull(contentLength, &lengthEnd, 10);
+    const size_t headerBytes = static_cast<size_t>(bodyStart - raw);
+    if (lengthEnd != contentLength &&
+        declaredLength > kMaximumAuthProbeResponseBytes - headerBytes) {
+      copyCode(error, errorSize, "response_oversized");
+      bambuSecureZero(raw, kMaximumAuthProbeResponseBytes + 1);
+      free(raw);
+      return false;
+    }
+  }
+  const size_t bodyLength = received - static_cast<size_t>(bodyStart - raw);
+  JsonDocument parsed;
+  const DeserializationError parseError = deserializeJson(
+      parsed, bodyStart, bodyLength, DeserializationOption::NestingLimit(8));
+  JsonVariantConst root = parsed.as<JsonVariantConst>();
+  const bool parsedObject = !parseError && root.is<JsonObjectConst>();
+  if (statusCode != 200) {
+    const bool hasTypedCode = parsedObject &&
+        (root["code"].is<int>() || root["code"].is<const char*>());
+    const bool hasTypedError = parsedObject && root["error"].is<const char*>();
+    if (applicationJson) {
+      *applicationJson = bambuAuthRejectedApplicationJsonCoordinates(
+          statusCode, parsedObject, hasTypedCode, hasTypedError);
+    }
+    bambuAuthHttpFailureCode(statusCode, bodyStart, error, errorSize);
+    bambuSecureZero(raw, kMaximumAuthProbeResponseBytes + 1);
+    free(raw);
+    return false;
+  }
+  if (!parsedObject) {
+    copyCode(error, errorSize,
+             parseError == DeserializationError::NoMemory ? "json_no_memory" :
+                                                             "bad_response");
+    bambuSecureZero(raw, kMaximumAuthProbeResponseBytes + 1);
+    free(raw);
+    return false;
+  }
+  response.set(parsed);
+  JsonVariantConst data = responseData(response);
+  const bool hasAuthData = data.is<JsonObjectConst>() &&
+      (data["loginType"].is<const char*>() ||
+       data["accessToken"].is<const char*>() ||
+       data["access_token"].is<const char*>() ||
+       data["refreshToken"].is<const char*>() ||
+       data["refresh_token"].is<const char*>());
+  if (applicationJson)
+    *applicationJson = bambuAuthSuccessfulApplicationJsonCoordinates(
+        true, hasAuthData);
+  bambuSecureZero(raw, kMaximumAuthProbeResponseBytes + 1);
+  free(raw);
+  return true;
+}
+#endif
+
 static bool cloudJsonRequest(SecureNetworkCoordinator& coordinator,
                              const char* url, const char* method,
                              const char* body, const char* bearer,
@@ -607,7 +830,11 @@ static bool cloudJsonRequest(SecureNetworkCoordinator& coordinator,
     copyCode(error, errorSize, "transport_profile_invalid");
     return false;
   }
-  if (transportProfile == 2 || transportProfile == 4) {
+  if (transportProfile == 2) {
+    return espTlsProfileLoginRequest(body, response, error, errorSize,
+                                     applicationJson);
+  }
+  if (transportProfile == 4) {
     copyCode(error, errorSize, "transport_profile_unsupported");
     return false;
   }

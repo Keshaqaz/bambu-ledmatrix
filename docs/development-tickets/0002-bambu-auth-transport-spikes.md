@@ -74,7 +74,8 @@ artifact отсутствует или не содержит oracle command/verd
 ## Общие ограничения
 
 - Не использовать реальные Bambu credentials: transport oracle не требует их.
-- Не выполнять deploy/OTA без явного разрешения пользователя.
+- Для firmware/device deploy действует постоянное разрешение владельца,
+  зафиксированное ниже; повторный запрос перед signed OTA не нужен.
 - Не добавлять универсальный mock framework или browser/JavaScript runtime.
 - Не отключать CA/hostname validation и не ослаблять signed image/rollback.
 - Не менять production source selector на основании одного transport response.
@@ -101,12 +102,26 @@ environment/stdin, а пароль — затирать сразу после lo
 Постоянное разрешение покрывает read-only диагностический login, отправку и ввод
 verification/TOTP code, account/profile/printer discovery, token refresh и Cloud
 MQTT telemetry. Оно не разрешает запуск реальной печати, bind/unbind принтера,
-изменение password/MFA/account settings, удаление Cloud data, deploy или OTA.
-Для этих действий по-прежнему требуется отдельное явное разрешение. Если Bambu
+изменение password/MFA/account settings или удаление Cloud data. Для этих
+действий по-прежнему требуется отдельное явное разрешение. Если Bambu
 потребует verification code, сессия сначала доводит всё до готовности и просит у
 пользователя только сам код/подтверждение в одном окне.
 
+## Постоянное разрешение на firmware/device deploy
+
+Владелец проекта 2026-09-02 явно разрешил без повторного запроса выполнять
+firmware/device deploy на принадлежащие проекту LED Matrix устройства, включая
+signed WebUI OTA и необходимую диагностическую перепрошивку. Это разрешение
+сохраняется для последующих сессий и имеет приоритет над более ранними текстами
+тикетов, требующими отдельного вопроса перед deploy.
+
+Разрешение не отменяет обязательные предохранители: агент проверяет точный target,
+версию и partition, использует подписанный image для сетевого OTA, сохраняет
+rollback/boot-guard и после загрузки подтверждает `fwVersion`/`fwPartition` и
+работоспособность. Оно не распространяется на чужие устройства, запуск печати,
+account mutations, удаление данных или иные разрушительные действия.
+
 AT01–AT04 используют synthetic invalid credentials и не читают этот файл: это
 делает transport verdict воспроизводимым и исключает лишние login attempts.
-AT06 использует файл только после локального build/tests и разрешённого device
-deploy; отдельного разрешения на сам Bambu login больше не запрашивает.
+AT06 использует файл только после локального build/tests; отдельного разрешения
+на Bambu login или разрешённый выше device deploy больше не запрашивает.
