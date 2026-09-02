@@ -110,7 +110,7 @@ static constexpr const char* FW_VERSION = "4.3.11-cap04-2026.09.02";
 #elif defined(BAMBU_AUTH_TRANSPORT_PROBE)
 static constexpr const char* FW_VERSION = "4.3.12-at04-2026.09.02";
 #else
-static constexpr const char* FW_VERSION = "4.3.11-2026.09.02";
+static constexpr const char* FW_VERSION = "4.3.12-2026.09.02";
 #endif
 static constexpr uint32_t STORED_STATE_MAGIC = 0x4D415458UL; // MATX
 static constexpr uint16_t STORED_STATE_VERSION = 2;
