@@ -1,6 +1,6 @@
 ---
 id: AT04
-status: proposed
+status: complete
 date: 2026-09-01
 source: ./0002-bambu-auth-transport-spikes.md
 ---

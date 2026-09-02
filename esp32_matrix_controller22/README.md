@@ -12,12 +12,13 @@
 
 `src/app.cpp`
 
-Установленная версия: `4.0.11-2026.08.20` (`app0`). Текущий исходник T04:
-`4.2.0-2026.08.28`; production-сборка занимает 1 381 447 байт flash (70%)
-и 49 236 байт глобальной памяти (15%). От последней записанной T01-сборки это
-+104 506 байт flash и +7 192 байта globals; относительно исходного ADR baseline
-дельта +29 160 и +2 640 байт. На устройство T04 не загружался, поэтому
-on-device minimum heap, largest block и task high-water marks пока не сняты.
+Установленная версия: `4.2.0-2026.08.28` (`app1`), OTA выполнено 2026-08-28.
+Текущий исходник T04: `4.2.2-2026.08.31`. Production-сборка занимает
+1 389 979 байт flash (70%)
+и 49 828 байт глобальной памяти (15%). От последней записанной T01-сборки это
++113 038 байт flash и +7 784 байта globals; относительно исходного ADR baseline
+дельта +37 692 и +3 232 байта. On-device minimum heap, largest block и task
+high-water marks T04 пока не сняты.
 
 Что выбрать в Arduino IDE:
 
@@ -55,8 +56,11 @@ sh tools/sign_ota.sh build/esp32.esp32.esp32c3/esp32_matrix_controller22.ino.bin
 `fwVersion`, `fwPartition`, health и доступность rollback/boot-guard. Разрешение
 не распространяется на чужие устройства и несвязанные разрушительные действия.
 
-Сетевой путь один: аутентифицированный WebUI. ArduinoOTA/espota на порту 3232
-отключён. В `Система → Обновление прошивки` выбрать оба файла:
+Сетевой путь один: WebUI. По принятому security level 0 локальный WebUI/API не
+требует admin password/session/CSRF; ECDSA-подпись сохраняется как проверка
+целостности firmware. Уже установленная `4.2.0` всё ещё содержит прежний T01
+session gate — его нужно удалить следующей firmware-итерацией. ArduinoOTA/espota
+на порту 3232 отключён. В `Система → Обновление прошивки` выбрать оба файла:
 
 1. Production image
    `build/esp32.esp32.esp32c3/esp32_matrix_controller22.ino.bin` (появляется при
@@ -112,9 +116,12 @@ PlatformIO-конфигурация (`platformio.ini`, разметка `min_spi
 ```bash
 c++ -std=c++11 -Wall -Wextra -pedantic tests/wifi_reconnect_policy_test.cpp \
   -o /tmp/wifi_reconnect_policy_test && /tmp/wifi_reconnect_policy_test
-c++ -std=c++11 -Wall -Wextra -pedantic tests/t01_security_policy_test.cpp \
-  -o /tmp/t01_security_policy_test && /tmp/t01_security_policy_test
 ```
+
+`tests/t01_security_policy_test.cpp` проверяет отменённую ADR 0002 модель с
+паролями и сессией и поэтому не входит в актуальный набор проверок. При удалении
+старого gate из прошивки его нужно заменить узким host-тестом открытого локального
+доступа security level 0.
 
 Для локального предпросмотра веб-интерфейса без прошивки:
 
@@ -161,15 +168,15 @@ c++ -std=c++11 -Wall -Wextra -pedantic tests/t01_security_policy_test.cpp \
 интерфейсе — `1..255` с мягкой квадратичной калибровкой: точная регулировка на
 малой яркости, минимум — едва заметное свечение.
 
-При первом запуске `4.1.0` WebUI просит создать пароль администратора; session
-cookie — `HttpOnly/SameSite=Strict`, изменяющие запросы требуют CSRF token.
-Первичное создание admin-пароля принимается только через onboarding AP, не через
-сохранённую STA-сеть.
-Onboarding AP получает уникальные 12 цифр вместо общего `12345678`: матрица
-показывает их четырьмя группами по три цифры (число верхних точек — номер группы).
-Остаточная угроза текущей C3: Secure Boot, flash/NVS encryption и eFuse не
-включались, поэтому физическое чтение flash может раскрыть Wi-Fi/AP/relay secrets;
-T01 защищает сетевой доступ и OTA, но не выдаёт это за защиту от физического доступа.
+Локальная модель доступа — **security level 0** из
+[`ADR 0002`](../docs/adr/0002-use-security-level-zero-for-local-access.md): onboarding
+AP открыт, WebUI и `/api/*` не требуют admin password, session cookie или CSRF.
+Любой клиент LAN/AP может читать diagnostics, менять настройки, запускать Cloud
+onboarding/logout/refresh, reboot и signed Web OTA; владелец принимает этот риск
+ради отсутствия раздражающего домашнего login flow. Установленная `4.2.0` пока
+не соответствует решению: её уникальный AP password и admin provisioning должны
+быть удалены следующей firmware-итерацией. Bambu password при этом по-прежнему
+не сохраняется, а Cloud tokens не возвращаются через API.
 
 Анимации на самой матрице: янтарная «волна зажигания» при включении, значок
 Wi-Fi с дугами при поиске сети, столб прогресса при OTA (зелёная заливка —
@@ -195,12 +202,12 @@ API-ключ в transit. На время `fetchWeather()` прошивка вы�
 sh tools/export_web_ui.sh
 sh tools/generate_web_ui_gzip.sh
 sh tools/check_web_ui_export.sh
-c++ -std=c++17 -Wall -Wextra -pedantic tests/t01_security_policy_test.cpp -o /tmp/t01_security_policy_test && /tmp/t01_security_policy_test
 c++ -std=c++17 -Wall -Wextra -pedantic tests/wifi_reconnect_policy_test.cpp -o /tmp/wifi_reconnect_policy_test && /tmp/wifi_reconnect_policy_test
 c++ -std=c++17 -Wall -Wextra -pedantic tests/printer_status_source_test.cpp -o /tmp/printer_status_source_test && /tmp/printer_status_source_test
 c++ -std=c++17 -Wall -Wextra -pedantic tests/bambu_report_parser_test.cpp -o /tmp/bambu_report_parser_test && /tmp/bambu_report_parser_test
 c++ -std=c++17 -Wall -Wextra -pedantic tests/bambu_lifecycle_mapping_test.cpp -o /tmp/bambu_lifecycle_mapping_test && /tmp/bambu_lifecycle_mapping_test
 c++ -std=c++17 -Wall -Wextra -pedantic tests/bambu_credential_store_test.cpp -o /tmp/bambu_credential_store_test && /tmp/bambu_credential_store_test
+c++ -std=c++17 -Wall -Wextra -pedantic tests/bambu_auth_contract_test.cpp -o /tmp/bambu_auth_contract_test && /tmp/bambu_auth_contract_test
 python3 -m py_compile tools/bambu_relay/relay.py tools/bambu_relay/mock_relay.py
 python3 -m unittest discover -s tools/bambu_relay -p "test_*.py"
 for f in tools/export_web_ui.sh tools/check_web_ui_export.sh tools/bambu_relay/openwrt/bambu-relay.init; do sh -n "$f" || exit 1; done
@@ -215,15 +222,27 @@ arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs .
 ## Bambu Cloud и Relay
 
 T04 добавляет в WebUI direct Cloud onboarding: email/password, email/SMS
-verification, явный выбор принтера, MQTT `pushall`, refresh и logout. TOTP-код
-принимается, но текущий записанный контракт подтверждает только access-token в
-cookie и не подтверждает обязательный refresh token. В этом случае onboarding
-останавливается с recoverable `tfa_refresh_contract_missing`, не заменяя active
-credential; для завершения этой ветки нужна проверка реального ответа Bambu.
+verification, явный выбор принтера, MQTT `pushall`, refresh и logout. После
+TOTP firmware повторяет first-party portal flow: получает временную session
+cookie от `/api/sign-in/tfa`, затем запрашивает полный credential envelope у
+`/api/auth/token`. Cookie ограничена фиксированным буфером, передаётся только
+между этими последовательными TLS-запросами и сразу затирается. Неполный
+envelope даёт recoverable error и не заменяет active credential.
 Пароль существует только во время login operation и затирается после её
 завершения; active/candidate credentials хранятся атомарно с checksum и rollback.
 Google OAuth не эмулируется: для Google-created account сначала один раз задайте
 Bambu-пароль через официальный `Forgot password`.
+
+Повторный login для штатной работы не нужен. Direct Cloud сам обновляет tokens
+за 7 дней до expiry (во время печати откладывает до срочного окна 24 часа),
+обрабатывает MQTT auth reject и повторяет временные ошибки через
+1 мин / 5 мин / 15 мин / 1 ч / 6 ч. Ротированный refresh token и account UID
+записываются во flash ESP в отдельный checksum-protected recovery slot до
+MQTT-проверки: rollback или reboot продолжит операцию с самым новым token только
+для того же аккаунта. Ручной кнопки и API refresh нет. Это сознательный
+reliability-over-security выбор security level 0;
+повторный login остаётся только для внешнего revoke/блокировки аккаунта или
+несовместимого изменения Bambu Cloud contract.
 
 До T05 это shadow path: матрица и основной status WebUI продолжают читать
 `RelayHttpSource`, а direct snapshot доступен только в `/api/status.bambuDirect`.

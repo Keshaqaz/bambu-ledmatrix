@@ -1,7 +1,8 @@
 ---
 id: AT05
-status: proposed
+status: complete
 date: 2026-09-01
+decided: 2026-09-02
 source: ./0002-bambu-auth-transport-spikes.md
 ---
 
@@ -42,11 +43,18 @@ adapter → минимальный ClientHello-compatible adapter. Более с
 
 ## Критерии приёмки
 
-- [ ] Выбор или отказ следует воспроизводимым artifacts, а не предположению.
-- [ ] ADR и master ticket map согласованы.
-- [ ] AT06 имеет один точный production implementation/acceptance target.
-- [ ] T05 matrix и численные C3 gates не расширены и не ослаблены.
-- [ ] В документах и Git diff отсутствуют credentials, cookies и raw bodies.
+- [x] Выбор или отказ следует воспроизводимым artifacts, а не предположению.
+- [x] ADR и master ticket map согласованы.
+- [x] AT06 имеет один точный production implementation/acceptance target.
+- [x] T05 matrix и численные C3 gates не расширены и не ослаблены.
+- [x] В документах и Git diff отсутствуют credentials, cookies и raw bodies.
+
+Решение от 2026-09-02:
+[AT05-decision](../research/bambu-auth-transport/AT05-decision.md) — выбран
+штатный Mbed TLS/HTTPClient стек с восстановлением заявленного `User-Agent`
+через `setUserAgent` (минимальная форма кандидата AT04; Cloudflare-блокером был
+подменяемый `ESP32HTTPClient`, а не TLS fingerprint). Пересмотр ADR не
+потребовался.
 
 ## Стартовый промпт
 

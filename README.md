@@ -22,10 +22,32 @@ firmware/device deploy на принадлежащие проекту LED Matrix
 удаление данных и иные несвязанные разрушительные действия. Канонический
 контракт: `docs/development-tickets/0002-bambu-auth-transport-spikes.md`.
 
+## Текущее состояние
+
+- На матрице работает `4.0.11-2026.08.20` (`app0`). После потери известной
+  Wi-Fi-сети попытки идут через `5/10/20/40/60` секунд и далее раз в минуту,
+  без ручной перезагрузки матрицы.
+- Устранён перегрев CPU: статичный экран больше не проверяется с частотой 4 FPS,
+  а `FastLED.show()` вызывается только при реальном изменении кадра. Температура
+  снизилась с `71.3 °C` на `4.0.4` до `49.3–51.3 °C` на `4.0.5`.
+- Краткая потеря Wi-Fi, relay или временный `unknown/offline` больше не очищает
+  видимую полосу печати; она снимается после явного `idle`.
+- Рендер температуры проверен: строка температуры остаётся в границах матрицы при
+  всех сочетаниях поворота и отражения.
+- Погодные запросы идут HTTP-first с последовательным HTTPS-фоллбэком для OWM и
+  Open-Meteo. После диагностики `4.0.10` матрица подтвердила корректные
+  gateway/DNS и получила OWM `200`: `17.19 °C`.
+- По состоянию на 16 июля 2026 Bambu relay на роутере снова подключён к Cloud
+  MQTT. Токен проверяется каждые 6 часов; его безопасная замена включает
+  валидацию, атомарное обновление, проверку MQTT и автоматический rollback.
+
 ## Документация
 
 | Что нужно | Куда смотреть |
 |---|---|
 | Собрать/прошить плату, OTA, веб-превью | [`esp32_matrix_controller22/README.md`](esp32_matrix_controller22/README.md) |
 | Запустить/задеплоить relay, его API и конфиг | [`esp32_matrix_controller22/tools/bambu_relay/README.md`](esp32_matrix_controller22/tools/bambu_relay/README.md) |
+| Проверить или заменить Bambu Cloud token | [`TOKEN_ROTATION_RUNBOOK.md`](esp32_matrix_controller22/tools/bambu_relay/TOKEN_ROTATION_RUNBOOK.md) |
+| Почему ротация не полностью unattended | [`BAMBU_AUTH_ROTATION_RESEARCH.md`](esp32_matrix_controller22/tools/bambu_relay/BAMBU_AUTH_ROTATION_RESEARCH.md) |
 | Рабочий контекст: сеть, тулчейн, принятые решения, грабли | [`CLAUDE.md`](CLAUDE.md) |
+| Итоги диагностики и работ 15 июня 2026 | [`SESSION_CONTEXT_2026-06-15.md`](SESSION_CONTEXT_2026-06-15.md) |

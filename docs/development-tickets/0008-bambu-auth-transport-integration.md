@@ -1,7 +1,8 @@
 ---
 id: AT06
-status: proposed
+status: complete
 date: 2026-09-01
+completed: 2026-09-02
 source: ./0002-bambu-auth-transport-spikes.md
 ---
 
@@ -50,15 +51,19 @@ arguments. Отдельно спросить только разрешение �
 
 ## Критерии приёмки
 
-- [ ] Production path использует выбранный autonomous transport без external
+- [x] Production path использует выбранный autonomous transport без external
   relay, companion, proxy или manual token bootstrap.
-- [ ] Certificate/hostname validation, credential erasure, signed OTA и rollback
+- [x] Certificate/hostname validation, credential erasure, signed OTA и rollback
   не ослаблены; одновременно существует не более одного TLS-сеанса.
-- [ ] Existing T04 host tests и production build проходят; image ≤ `1 750 000`.
-- [ ] Реальный login достигает Bambu application state, завершает необходимую
+- [x] Existing T04 host tests и production build проходят; image ≤ `1 750 000`.
+- [x] Реальный login достигает Bambu application state, завершает необходимую
   verification и получает первый валидный Cloud MQTT report.
-- [ ] Logout и повторный login проходят; API/logs/artifact не раскрывают secrets.
-- [ ] T05 остаётся неизменным и начинается только после этого acceptance.
+- [x] Logout и повторный login проходят; API/logs/artifact не раскрывают secrets.
+- [x] T05 остаётся неизменным и начинается только после этого acceptance.
+
+Sanitized результат: `docs/research/bambu-auth-transport/AT06-integration.md`
+(production `4.3.11-2026.09.02`, oracle `TRANSPORT_PASS` ×2, image
+1,386,725 B / 49,780 B globals, полный T04 acceptance на устройстве).
 
 ## Стартовый промпт
 

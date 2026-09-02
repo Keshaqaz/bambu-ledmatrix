@@ -1,7 +1,7 @@
 ---
 status: proposed
 date: 2026-08-27
-amended: 2026-09-01
+amended: 2026-09-02
 ---
 
 # Оптимизировать ESP32-C3 и перенести Bambu Cloud relay в прошивку
@@ -207,6 +207,46 @@ transport, а не credentials, verification logic или ресурсов C3.
 затем пройти существующие credential-erasure, single-TLS, signed image и C3
 resource gates. Подмена только HTTP headers не считается решением, а отключение
 certificate validation запрещено.
+
+Решение transport-потока (AT05, 2026-09-02) зафиксировано в
+[AT05-decision](../research/bambu-auth-transport/AT05-decision.md). Статусы
+AT01–AT05:
+
+- **AT01** complete — desktop контроль `PASS`, production ESP
+  `TRANSPORT_BLOCKED`; oracle и wire baseline зафиксированы.
+- **AT02** complete, `NO PASS` — все применимые штатные профили Mbed TLS
+  `BLOCKED`; TLS 1.2 desktop-order профиль — локальный `TRANSPORT_ERROR` до
+  HTTP-ответа.
+- **AT03** complete, `NO PASS` — wolfSSL 5.8.4 после исправления CA-цепочки
+  воспроизводимо `BLOCKED` на уровне fingerprint; независимо от вердикта
+  кандидат отклонён по GPLv3 и отсутствию официального компонента для
+  ESP-IDF 5.5.x.
+- **AT04** complete, `PASS` ×13 — и доказано, что дискриминатором Cloudflare
+  был не TLS ClientHello, а заголовок `User-Agent: ESP32HTTPClient`, который
+  `HTTPClient` молча подставляет вместо отбрасываемого ядром `addHeader`;
+  production-идентичность `bambu_network_agent/02.07.01.51` фактически никогда
+  не отправлялась.
+- **AT05** decided 2026-09-02 — выбран кандидат, пересмотр ADR не требуется.
+
+Выбранный production transport — действующий штатный Mbed TLS/HTTPClient стек
+без замены TLS: заявленная идентичность клиента восстанавливается через
+`HTTPClient::setUserAgent("bambu_network_agent/02.07.01.51")` вместо молча
+отбрасываемого `addHeader`. Это минимальная форма кандидата AT04: profiles 10 и
+12 доказали на байт-идентичном ClientHello, что вердикт определяется только
+этой строкой. Уточнение к правилу выше: коррекция заголовка принята не как
+замена transport-квалификации, а потому что (а) она восстанавливает
+идентичность, уже заявленную остальными `X-BBL-*` заголовками, а не подменяет
+произвольное значение; (б) `PASS` измерен оракулом 13 раз; (в) реализация
+всё равно проходит полные ворота T04 acceptance (AT06), затем T05 canary/soak
+и C3 resource gates. Отключение certificate validation по-прежнему запрещено.
+
+Fallback (не является target'ом AT06): прямой stock-Mbed TLS адаптер AT04
+(измеренный `PASS` ×13) применяется только если wrapper-путь не воспроизведёт
+`PASS` на устройстве; такой исход требует addendum к AT05-decision, после чего
+адаптер становится единственным target'ом. Регрессионный детектор — пара
+oracle-профилей AT04 10 (`PASS`) / 12 (`BLOCKED`) — отслеживает, не начнёт ли
+Cloudflare блокировать и заявленный UA. T05 остаётся заблокированным до
+завершения AT06; матрица T05 и численные C3 gates не расширены и не ослаблены.
 
 ### 5. Credentials заменяются атомарно
 

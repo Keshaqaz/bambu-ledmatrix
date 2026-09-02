@@ -35,14 +35,14 @@ metrics и elapsed time. Сертификат сервера проверяет�
 
 ## Карта
 
-| ID | Самодостаточный тикет | Зависимость |
-|---|---|---|
-| AT01 | [Зафиксировать transport oracle и wire baseline](./0003-bambu-auth-transport-baseline.md) | текущая production build |
-| AT02 | [Проверить штатные профили Mbed TLS](./0004-bambu-auth-mbedtls-profiles.md) | AT01 |
-| AT03 | [Проверить auth-only wolfSSL](./0005-bambu-auth-wolfssl-spike.md) | AT01 |
-| AT04 | [Проверить ClientHello-compatible transport](./0006-bambu-auth-clienthello-spike.md) | AT02/AT03 не дали `PASS` |
-| AT05 | [Выбрать и зафиксировать production transport](./0007-bambu-auth-transport-decision.md) | первый `PASS` либо завершённый AT04 |
-| AT06 | [Интегрировать transport и закрыть T04 auth acceptance](./0008-bambu-auth-transport-integration.md) | AT05 выбрал кандидата |
+| ID | Самодостаточный тикет | Зависимость | Статус |
+|---|---|---|---|
+| AT01 | [Зафиксировать transport oracle и wire baseline](./0003-bambu-auth-transport-baseline.md) | текущая production build | complete — desktop `PASS`, ESP `BLOCKED` |
+| AT02 | [Проверить штатные профили Mbed TLS](./0004-bambu-auth-mbedtls-profiles.md) | AT01 | complete — `NO PASS` (`BLOCKED`/`ERROR`) |
+| AT03 | [Проверить auth-only wolfSSL](./0005-bambu-auth-wolfssl-spike.md) | AT01 | complete — `NO PASS` (воспроизводимо `BLOCKED`) |
+| AT04 | [Проверить ClientHello-compatible transport](./0006-bambu-auth-clienthello-spike.md) | AT02/AT03 не дали `PASS` | complete — `PASS` ×13 |
+| AT05 | [Выбрать и зафиксировать production transport](./0007-bambu-auth-transport-decision.md) | первый `PASS` либо завершённый AT04 | decided 2026-09-02 — [AT05-decision](../research/bambu-auth-transport/AT05-decision.md) |
+| AT06 | [Интегрировать transport и закрыть T04 auth acceptance](./0008-bambu-auth-transport-integration.md) | AT05 выбрал кандидата | complete 2026-09-02 — [AT06-integration](../research/bambu-auth-transport/AT06-integration.md) |
 
 По умолчанию применяется short-circuit: AT02 → при отсутствии `PASS` AT03 → при
 отсутствии `PASS` AT04. Независимый AT03 можно подготовить после AT01, но его
@@ -51,6 +51,14 @@ device-прогон не нужен, если AT02 уже дал стабиль�
 документировать несовместимость toolchain/resource, после чего следующий
 кандидат разрешён. После AT06 возобновляется T05 canary/soak; его сценарии и
 численные ворота не дублируются здесь.
+
+Итог short-circuit (2026-09-02): AT02 `NO PASS` → AT03 `NO PASS` (после
+устранения локальной CA-ошибки — воспроизводимый fingerprint `BLOCKED`) →
+AT04 `PASS` ×13. Решение AT05: штатный Mbed TLS/HTTPClient стек с
+восстановлением заявленного `User-Agent` через `setUserAgent` (минимальная
+форма кандидата AT04; Cloudflare-блокером был подменяемый `ESP32HTTPClient`,
+а не TLS fingerprint); fallback — прямой адаптер AT04. Детали и единственный
+target AT06 — в [AT05-decision](../research/bambu-auth-transport/AT05-decision.md).
 
 ## Контракт артефактов между сессиями
 

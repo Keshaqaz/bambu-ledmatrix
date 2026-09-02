@@ -1,6 +1,6 @@
 # LED Matrix: Working Context
 
-Last updated: 2026-08-20
+Last updated: 2026-08-28
 
 This file is the operational context for the whole repo (firmware + relay).
 User-facing docs: `README.md` (repo map), `esp32_matrix_controller22/README.md`
@@ -11,7 +11,7 @@ token operations).
 ## Project
 
 - Firmware project: `esp32_matrix_controller22/`
-- Deployed firmware: `4.0.11-2026.08.20`, partition `app0`; source is `4.2.0-2026.08.28` (T04) and has not been deployed
+- Deployed firmware: `4.2.0-2026.08.28`, partition `app1`; OTA from `4.0.11` succeeded on 2026-08-28 and the new session endpoint remained available after the boot-guard window
 - Target board: `ESP32C3 Dev Module` / FQBN `esp32:esp32:esp32c3:PartitionScheme=min_spiffs`
 - Main firmware: `src/app.cpp`; web UI source: `src/index_html.h`; browser preview export: `web/index.html` (re-export via `tools/export_web_ui.sh`, verify via `tools/check_web_ui_export.sh`)
 - Relay: `tools/bambu_relay/relay.py` (deployed on the OpenWrt router)
@@ -30,11 +30,12 @@ token operations).
 
 ## Build & Flash
 
-- Working toolchain: `arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs --export-binaries .` from the project root; flash over USB with `-u -p /dev/cu.usbmodem101`. Network updates use authenticated signed WebUI OTA only; sign with `sh tools/sign_ota.sh build/.../*.ino.bin`. ArduinoOTA/espota is disabled.
+- **Local access policy:** [ADR 0002](docs/adr/0002-use-security-level-zero-for-local-access.md) defines security level 0: open AP and WebUI/API without admin password, session or CSRF. Deployed `4.2.0` still contains the superseded T01 onboarding/session gate; remove it in the next firmware change before continuing live T04 onboarding.
+- Working toolchain: `arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs --export-binaries .` from the project root; flash over USB with `-u -p /dev/cu.usbmodem101`. Network updates retain signed WebUI OTA for image integrity; sign with `sh tools/sign_ota.sh build/.../*.ino.bin`. ArduinoOTA/espota is disabled.
 - Libraries installed via `arduino-cli lib install`: `FastLED@3.10.3`, `ArduinoJson@7.4.3`
 - PlatformIO is currently broken on this machine: `~/.platformio/penv/bin/platformio` has a missing Python interpreter, while `/Users/kesha/Library/Python/3.9/bin/platformio` runs under unsupported Python 3.9. Use `arduino-cli`; `platformio.ini` is retained for future repair.
 - arduino-cli uses esp32 core 3.3.8. **Core 3.x gotcha:** `NetworkClient::setTimeout()` takes milliseconds (core 2.x, which old PlatformIO builds used, took seconds); `setHandshakeTimeout()` still takes seconds. `setTimeout(8)` = 8 ms killed all weather TLS connections until fixed (commit 932e290). Audit client timeouts when porting code written for core 2.x.
-- **OTA:** `min_spiffs` scheme, two 1.875MB app slots (binary limit 1 966 080 bytes). `/api/update` requires a valid WebUI session, CSRF token and ECDSA-P256 signature supplied as `X-OTA-Signature`; signature is verified over the streamed image before `Update.end()` commits the boot slot. ArduinoOTA/espota is disabled. Bump `FW_VERSION` in `src/app.cpp`; verify `fwVersion`/`fwPartition` after a user-authorized OTA.
+- **OTA:** `min_spiffs` scheme, two 1.875MB app slots (binary limit 1 966 080 bytes). Target security-level-0 `/api/update` has no user/session gate but still requires the ECDSA-P256 `X-OTA-Signature` for image integrity before `Update.end()` commits the boot slot. Deployed `4.2.0` still has the superseded session/CSRF gate. ArduinoOTA/espota is disabled. Bump `FW_VERSION` in `src/app.cpp`; verify `fwVersion`/`fwPartition` after OTA.
 - **Standing deploy authorization (owner, 2026-09-02):** firmware/device deploys to project-owned LED Matrix hardware are pre-authorized; do not ask again before signed WebUI OTA or necessary diagnostic flashing. Resolve the exact target, use signed images for network OTA, retain rollback/boot-guard, and verify version, partition, and health afterward. This does not authorize deploying to third-party devices, starting prints, mutating accounts, deleting data, or other destructive actions.
 - **arduino-cli gotcha:** `compile --output-dir <dir>` also silently overwrites the sketch-local `build/` export — a test build (e.g. a deliberately crashing one) can poison the `build/.../*.ino.bin` you later OTA. Verify `build/` freshness (or recompile with `--export-binaries`) before uploading.
 - **Boot-guard anti-brick:** NVS namespace `bootguard` counts boots, cleared after 60 s uptime; 3 consecutive failures → `esp_ota_set_boot_partition()` rollback to the other slot (refuses cleanly if that slot is empty/corrupt). Known tradeoff: 3 manual resets within the first 60 s also trigger rollback.
@@ -44,13 +45,13 @@ token operations).
 
 - Single display mode: `Часы + темп` (id `6`); fire/plasma/lava render code deleted (freed ~17 KB static RAM), `normalizeMode()` always returns 6. `mode`/`lavaHue`/`showColon`/`colonBright` stay in `Config` for NVS layout only and are forced by `sanitizeLoadedConfig()`
 - Clock colon is gone entirely (drawColon2x2/colonOn deleted, `showColon` forced `false`); `colonBright` is NOT dead — it scales the printer-overlay track brightness, keep it at 90
-- Web UI: flat 5-section bottom nav, autosave, HttpOnly session + CSRF, secrets via `***` sentinel + `data-clear`, and `file://` preview mocks. Firmware serves deterministic gzip from `src/index_html_gz.h`; after editing `src/index_html.h` run `sh tools/export_web_ui.sh && sh tools/generate_web_ui_gzip.sh`.
+- Web UI: flat 5-section bottom nav, autosave, open local access per security level 0, secrets via `***` sentinel + `data-clear`, and `file://` preview mocks. Firmware serves deterministic gzip from `src/index_html_gz.h`; after editing `src/index_html.h` run `sh tools/export_web_ui.sh && sh tools/generate_web_ui_gzip.sh`.
 - Boot/Wi-Fi/OTA animations: amber ignition ring (`showBoot`), Wi-Fi icon with arcs (`showConnecting`), amber bottom-up progress column + green fill / red cross (`showOtaProgress`/`Done`/`Error`); all draw through `px()` so they follow rotation/flip (snapshot is refreshed in `setup()` before `showBoot`)
 - Only font is `F_MICRO` 3x5; font picker, weather icons, blinking colon, and the `Доступ` settings tab are removed
 - Brightness UI range `1..255` with a quadratic calibration curve before `FastLED.setBrightness()`
 - Legacy `Config` fields (`fontIndex`, `showDegree`, `clockFace`, `webPass`, `apPass`) exist only for NVS layout compatibility and are sanitized/ignored at runtime. Old Bambu credential buffers are read only through the explicit v1 NVS blob and are removed from runtime/current storage.
 - **NVS padding gotcha:** new `Config` fields appended into former struct padding don't change `sizeof(Config)`, so old blobs load fine but the new fields read as `0` (not their compiled defaults) — happened with `tzFromWeather`/`weatherProvider` in 4.0.0; fixed by a one-time POST after deploy
-- Onboarding AP has a persisted unique 12-digit password shown on the matrix in four groups; the common `12345678` no longer works. WebUI requires an administrator session after one-time password provisioning; mutations require CSRF.
+- Target onboarding AP is open and WebUI/API have no admin/session/CSRF under ADR 0002. The unique 12-digit AP password and admin provisioning present in deployed `4.2.0` are superseded implementation to remove, not product requirements.
 - `showClockTemp()` owns the printer overlay rendering; overlay glyphs per lifecycle:
   - `preparing`: breathing first green column on gray track
   - `printing`: gray track + green progress fill (active column ramps smoothly)
@@ -67,14 +68,23 @@ token operations).
 - T04 direct Cloud shadow path owns email/password auth, email/SMS verification,
   printer selection, refresh/logout and direct MQTT, while
   renderer and primary status remain on `RelayHttpSource` until T05.
-- TOTP entry is implemented fail-closed, but the recorded contract only proves
-  an access-token cookie from `/api/sign-in/tfa`, not the refresh token required
-  by the active/candidate store. The firmware returns
-  `tfa_refresh_contract_missing` and preserves the old active credential rather
-  than guessing a token shape; live contract validation is still required.
+- TOTP follows the first-party portal sequence: `/api/sign-in/tfa` establishes
+  a bounded, transient session cookie, then `/api/auth/token` returns the full
+  `token`, `refreshToken`, `expiresIn`, `refreshExpiresIn` envelope. The cookie
+  is reduced to one `name=value` pair and wiped after the second request; an
+  incomplete envelope fails closed without changing the active credential.
 - `BambuCloud` uses versioned checksum-protected active/candidate credential
   slots. Candidate is promoted only after account/directory checks, MQTT and the
   first valid report; reboot/error removes candidate and preserves active.
+- Direct Cloud refresh is autonomous; there is no manual UI/API rotation path.
+  It refreshes inside a 7-day window (deferring while printing until the last
+  24 hours), bootstraps missing expiry after 5 minutes, retries at
+  1m/5m/15m/1h/6h, and reacts immediately to confirmed MQTT auth rejection.
+  The newest rotated refresh token and account UID are persisted before candidate
+  validation in checksum-protected NVS `refreshNext`; reboot/rollback retries it
+  only for the matching account and clears it after successful active promotion.
+  Persisting this credential
+  is an explicit reliability-over-security decision under security level 0.
 - Password and verification code are bounded to one operation and explicitly
   wiped. API/UI/diagnostics expose state/reason codes, never tokens or password.
 - `BambuReportParser` consumes MQTT fragments without allocating
@@ -131,9 +141,13 @@ token operations).
 
 ## Operational Notes
 
-- Last verified and deployed build (2026-08-20): 1,352,287 bytes flash
-  (68%), 46,596 bytes globals (14%); OTA image SHA-256
-  `5e09a6a71b9b2ef78bd2ec3db03f3b03f0ac0b72c0406e532ee1a550a6f3153f`
+- Last deployed build (2026-08-28): `4.2.0-2026.08.28`, 1,381,447 bytes
+  linked image (70%), 49,236 bytes globals (15%); exported OTA image SHA-256
+  `42323f84fbcc19dc8c152e2f687291c23cfa529c98c49b9a0b40a4a4d0255da8`.
+- Current T04 autonomous-refresh source build `4.2.2-2026.08.31` (not deployed):
+  1,389,979 bytes linked image (70%), 49,828 bytes globals (15%); exported OTA
+  image is 1,390,128 bytes, SHA-256
+  `47c5889250823504f59523c878be7a4bc732faa8b0e3832e3f9985afa5ab9af9`.
 - If the matrix shows stale printer state, check process health first with
   `curl http://192.168.1.1:8787/healthz`; `/status` requires the configured
   `X-Relay-Key` and must not be queried by putting that key in shell history
