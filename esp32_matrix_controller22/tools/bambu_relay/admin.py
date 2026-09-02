@@ -16,6 +16,20 @@ from pathlib import Path
 
 
 DEFAULT_AUTH_CHECK_URL = "https://api.bambulab.com/v1/design-user-service/my/preference"
+DEFAULT_REFRESH_URL = "https://api.bambulab.com/v1/user-service/user/refreshtoken"
+
+
+# Stock bambu_network_agent identity block (SYNCED ARTIFACT). Reverse-
+# engineered, unsupported; Bambu can break it without notice. Provenance and
+# wire order: BAMBU_REFRESH_CONTRACT_RESEARCH.md / OBN NETWORK_PLUGIN.md S6.10.1.
+# Track ClusterM/open-bamboo-networking and bump the *_VERSION env overrides
+# when Bambu ships a new plug-in build.
+BAMBU_AGENT_VERSION = os.environ.get("BAMBU_AGENT_VERSION", "02.07.01.51")
+BAMBU_CLIENT_VERSION = os.environ.get("BAMBU_CLIENT_VERSION", "02.07.01.62")
+BAMBU_DEVICE_ID = os.environ.get(
+    "BAMBU_DEVICE_ID", "b1c524d7-33c2-5f0a-9c2b-4a6e8f1d2a3b"
+)
+BAMBU_OS_TYPE = os.environ.get("BAMBU_OS_TYPE", "linux")
 
 
 class AdminError(RuntimeError):
@@ -60,12 +74,12 @@ def remove_assignment(contents: str, name: str) -> str:
     return pattern.sub("", contents, count=1)
 
 
-def parse_token_input(raw_input: str) -> tuple[str, int | None]:
+def parse_token_input(raw_input: str) -> tuple[str, int | None, str | None]:
     value = raw_input.strip()
     if not value:
         raise AdminError("read an empty token from stdin")
     if not value.startswith("{"):
-        return value, None
+        return value, None, None
     try:
         payload = json.loads(value)
     except json.JSONDecodeError as exc:
@@ -76,16 +90,50 @@ def parse_token_input(raw_input: str) -> tuple[str, int | None]:
     token = data.get("accessToken") or data.get("access_token") or data.get("token")
     if not isinstance(token, str) or not token:
         raise AdminError("login response did not contain accessToken")
-    expires_in = data.get("expiresIn", data.get("expires_in"))
+    refresh = data.get("refreshToken") or data.get("refresh_token")
+    if not isinstance(refresh, str):
+        refresh = None
+    expires_at = _expires_at_from_lifetime(data.get("expiresIn", data.get("expires_in")))
+    return token, expires_at, refresh
+
+
+def _expires_at_from_lifetime(expires_in) -> int | None:
     if expires_in is None:
-        return token, None
+        return None
     try:
         lifetime = int(expires_in)
-    except (TypeError, ValueError) as exc:
-        raise AdminError("login response contained an invalid expiresIn") from exc
+    except (TypeError, ValueError):
+        return None
     if lifetime <= 0:
-        raise AdminError("login response contained a non-positive expiresIn")
-    return token, int(time.time()) + lifetime
+        return None
+    return int(time.time()) + lifetime
+
+
+def stock_identity_headers() -> list[tuple[str, str]]:
+    """Stock bambu_network_agent identity headers in wire order, for a pre-auth
+    POST such as token refresh. Authorization and X-BBL-Client-ID are
+    intentionally omitted: refresh is a pre-auth, account-scoped call."""
+    try:
+        os_version = os.environ.get("BAMBU_OS_VERSION") or os.uname().release
+    except AttributeError:
+        os_version = "0.0"
+    language = os.environ.get("BAMBU_LANGUAGE", "en-US")
+    return [
+        ("User-Agent", f"bambu_network_agent/{BAMBU_AGENT_VERSION}"),
+        ("X-BBL-Client-Name", "BambuStudio"),
+        ("X-BBL-Client-Type", "slicer"),
+        ("X-BBL-Client-Version", BAMBU_CLIENT_VERSION),
+        ("X-BBL-Device-ID", BAMBU_DEVICE_ID),
+        ("X-BBL-Language", language),
+        ("X-BBL-OS-Type", BAMBU_OS_TYPE),
+        ("X-BBL-OS-Version", os_version),
+        ("X-BBL-Agent-Version", BAMBU_AGENT_VERSION),
+        ("X-BBL-Executable-info", "{}"),
+        ("X-BBL-Agent-OS-Type", BAMBU_OS_TYPE),
+        ("X-BBL-Executable-Env", "false"),
+        ("accept", "application/json"),
+        ("Content-Type", "application/json"),
+    ]
 
 
 def atomic_write(path: Path, contents: str, mode: int = 0o600) -> None:
@@ -133,6 +181,25 @@ def validate_cloud_token(token: str, url: str) -> None:
         raise AdminError("validation response did not contain an account id", 3)
 
 
+def post_refresh(url: str, refresh_token: str) -> dict:
+    body = json.dumps({"refreshToken": refresh_token}).encode("utf-8")
+    request = urllib.request.Request(url, data=body, method="POST")
+    for name, value in stock_identity_headers():
+        request.add_header(name, value)
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            raw = response.read().decode("utf-8", "ignore") or "{}"
+        payload = json.loads(raw)
+    except urllib.error.HTTPError as exc:
+        exit_code = 2 if exc.code in (401, 403) else 3
+        raise AdminError(f"HTTP {exc.code} from refresh endpoint", exit_code) from exc
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise AdminError(f"refresh request failed: {exc}", 3) from exc
+    if not isinstance(payload, dict):
+        raise AdminError("refresh endpoint returned a non-object response", 3)
+    return payload.get("data") if isinstance(payload.get("data"), dict) else payload
+
+
 def verify_relay(url: str, relay_key: str, timeout: float) -> None:
     deadline = time.monotonic() + timeout
     last_error = "relay did not become ready"
@@ -150,18 +217,22 @@ def verify_relay(url: str, relay_key: str, timeout: float) -> None:
         time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
 
 
-def install_cloud_token() -> None:
-    config_path = Path(os.environ.get("BAMBU_RELAY_CONFIG", "/root/bambu_relay.conf"))
-    service_path = os.environ.get("BAMBU_RELAY_SERVICE", "/etc/init.d/bambu-relay")
-    auth_url = os.environ.get("BAMBU_AUTH_CHECK_URL", DEFAULT_AUTH_CHECK_URL)
-    status_url = os.environ.get("BAMBU_RELAY_STATUS_URL", "http://127.0.0.1:8787/status")
-    verify_timeout = float(os.environ.get("BAMBU_RELAY_VERIFY_TIMEOUT", "120"))
-
-    token, expires_at = parse_token_input(sys.stdin.read())
-    validate_cloud_token(token, auth_url)
+def apply_new_tokens(
+    config_path: Path,
+    service_path: str,
+    auth_url: str,
+    status_url: str,
+    verify_timeout: float,
+    access_token: str,
+    expires_at: int | None,
+    refresh_token: str | None = None,
+) -> None:
+    validate_cloud_token(access_token, auth_url)
 
     old_contents = config_path.read_text()
-    new_contents = replace_assignment(old_contents, "BAMBU_CLOUD_TOKEN", token)
+    new_contents = replace_assignment(old_contents, "BAMBU_CLOUD_TOKEN", access_token)
+    if refresh_token:
+        new_contents = replace_assignment(new_contents, "BAMBU_CLOUD_REFRESH_TOKEN", refresh_token)
     if expires_at is not None:
         new_contents = replace_assignment(
             new_contents, "BAMBU_CLOUD_TOKEN_EXPIRES_AT", str(expires_at)
@@ -184,7 +255,51 @@ def install_cloud_token() -> None:
                 f"but relay restart failed: {rollback_error}"
             ) from install_error
         raise AdminError("new token failed; previous config restored and relay restarted") from install_error
+
+
+def install_cloud_token() -> None:
+    config_path = Path(os.environ.get("BAMBU_RELAY_CONFIG", "/root/bambu_relay.conf"))
+    service_path = os.environ.get("BAMBU_RELAY_SERVICE", "/etc/init.d/bambu-relay")
+    auth_url = os.environ.get("BAMBU_AUTH_CHECK_URL", DEFAULT_AUTH_CHECK_URL)
+    status_url = os.environ.get("BAMBU_RELAY_STATUS_URL", "http://127.0.0.1:8787/status")
+    verify_timeout = float(os.environ.get("BAMBU_RELAY_VERIFY_TIMEOUT", "120"))
+
+    token, expires_at, refresh_token = parse_token_input(sys.stdin.read())
+    apply_new_tokens(
+        config_path, service_path, auth_url, status_url, verify_timeout,
+        token, expires_at, refresh_token,
+    )
     print("Cloud token installed and relay verified")
+
+
+def refresh_cloud_token() -> None:
+    config_path = Path(os.environ.get("BAMBU_RELAY_CONFIG", "/root/bambu_relay.conf"))
+    service_path = os.environ.get("BAMBU_RELAY_SERVICE", "/etc/init.d/bambu-relay")
+    auth_url = os.environ.get("BAMBU_AUTH_CHECK_URL", DEFAULT_AUTH_CHECK_URL)
+    refresh_url = os.environ.get("BAMBU_REFRESH_URL", DEFAULT_REFRESH_URL)
+    status_url = os.environ.get("BAMBU_RELAY_STATUS_URL", "http://127.0.0.1:8787/status")
+    verify_timeout = float(os.environ.get("BAMBU_RELAY_VERIFY_TIMEOUT", "120"))
+
+    refresh_token = read_assignments(config_path.read_text()).get("BAMBU_CLOUD_REFRESH_TOKEN", "")
+    if not refresh_token:
+        raise AdminError(
+            "BAMBU_CLOUD_REFRESH_TOKEN is empty; bootstrap with an official login first", 2
+        )
+
+    payload = post_refresh(refresh_url, refresh_token)
+    access_token = payload.get("accessToken") or payload.get("access_token")
+    if not isinstance(access_token, str) or not access_token:
+        raise AdminError("refresh response did not contain accessToken", 3)
+    new_refresh = payload.get("refreshToken") or payload.get("refresh_token")
+    if not isinstance(new_refresh, str) or not new_refresh:
+        new_refresh = refresh_token
+    expires_at = _expires_at_from_lifetime(payload.get("expiresIn", payload.get("expires_in")))
+
+    apply_new_tokens(
+        config_path, service_path, auth_url, status_url, verify_timeout,
+        access_token, expires_at, new_refresh,
+    )
+    print("Cloud token refreshed and relay verified")
 
 
 def check_cloud_token() -> None:
@@ -209,7 +324,10 @@ def check_cloud_token() -> None:
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("install-cloud-token", "check-cloud-token"))
+    parser.add_argument(
+        "command",
+        choices=("install-cloud-token", "check-cloud-token", "refresh-cloud-token"),
+    )
     return parser.parse_args()
 
 
@@ -220,6 +338,8 @@ def main() -> int:
             install_cloud_token()
         elif args.command == "check-cloud-token":
             check_cloud_token()
+        elif args.command == "refresh-cloud-token":
+            refresh_cloud_token()
         return 0
     except AdminError as exc:
         print(f"bambu-relay-admin: {exc}", file=sys.stderr)

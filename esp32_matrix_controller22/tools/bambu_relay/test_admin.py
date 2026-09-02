@@ -45,6 +45,33 @@ class RotationHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_POST(self):
+        if self.path != "/refreshtoken":
+            self.send_response(404)
+            self.end_headers()
+            return
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        self.server.last_refresh_body = self.rfile.read(length) if length else b""
+        self.server.last_refresh_headers = [(k, v) for k, v in self.headers.items()]
+        status = getattr(self.server, "refresh_status", 200)
+        if status != 200:
+            self.send_response(status)
+            self.end_headers()
+            return
+        response = getattr(self.server, "refresh_response", None)
+        if response is None:
+            response = {
+                "accessToken": "fresh-token",
+                "refreshToken": "rotated-refresh",
+                "expiresIn": 3600,
+            }
+        body = json.dumps(response).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def log_message(self, _format, *_args):
         return
 
@@ -56,6 +83,7 @@ class AdminCliTest(unittest.TestCase):
         self.config = self.root / "bambu_relay.conf"
         self.config.write_text(
             "BAMBU_CLOUD_TOKEN='old-token'\n"
+            "BAMBU_CLOUD_REFRESH_TOKEN='old-refresh'\n"
             "BAMBU_PRINTER_SERIAL='SERIAL'\n"
             "BAMBU_RELAY_KEY='relay-key'\n"
         )
@@ -72,6 +100,10 @@ class AdminCliTest(unittest.TestCase):
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), RotationHandler)
         self.server.auth_status = 200
         self.server.status_connected = True
+        self.server.refresh_status = 200
+        self.server.refresh_response = None
+        self.server.last_refresh_headers = None
+        self.server.last_refresh_body = None
         self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.server_thread.start()
         self.base_url = f"http://127.0.0.1:{self.server.server_port}"
@@ -87,6 +119,7 @@ class AdminCliTest(unittest.TestCase):
             "BAMBU_RELAY_CONFIG": str(self.config),
             "BAMBU_RELAY_SERVICE": str(self.service),
             "BAMBU_AUTH_CHECK_URL": f"{self.base_url}/preference",
+            "BAMBU_REFRESH_URL": f"{self.base_url}/refreshtoken",
             "BAMBU_RELAY_STATUS_URL": f"{self.base_url}/status",
             "BAMBU_RELAY_VERIFY_TIMEOUT": "1",
         })
@@ -197,6 +230,109 @@ class AdminCliTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(stat.S_IMODE(self.config.stat().st_mode), 0o600)
+
+    def test_refresh_rotates_token_and_persists_rotated_refresh_token(self):
+        result = self.run_admin("", command="refresh-cloud-token")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = self.config.read_text()
+        self.assertIn("BAMBU_CLOUD_TOKEN='fresh-token'", config)
+        self.assertIn("BAMBU_CLOUD_REFRESH_TOKEN='rotated-refresh'", config)
+        self.assertIn("BAMBU_CLOUD_TOKEN_EXPIRES_AT=", config)
+        self.assertEqual(self.service_log.read_text().splitlines(), ["restart"])
+        self.assertNotIn("fresh-token", result.stdout + result.stderr)
+        self.assertNotIn("rotated-refresh", result.stdout + result.stderr)
+
+    def test_refresh_sends_stock_identity_block_in_wire_order_without_authorization(self):
+        self.run_admin("", command="refresh-cloud-token")
+
+        received = self.server.last_refresh_headers or []
+        lowered = [k.lower() for k, _ in received]
+        self.assertNotIn("authorization", lowered)
+        expected_order = [
+            "user-agent", "x-bbl-client-name", "x-bbl-client-type",
+            "x-bbl-client-version", "x-bbl-device-id", "x-bbl-language",
+            "x-bbl-os-type", "x-bbl-os-version", "x-bbl-agent-version",
+            "x-bbl-executable-info", "x-bbl-agent-os-type", "x-bbl-executable-env",
+            "accept", "content-type",
+        ]
+        ordered = []
+        seen = set()
+        for name in lowered:
+            if name in expected_order and name not in seen:
+                seen.add(name)
+                ordered.append(name)
+        self.assertEqual(ordered, expected_order)
+
+        self.assertEqual(
+            self.server.last_refresh_body, b'{"refreshToken": "old-refresh"}'
+        )
+        values = {k.lower(): v for k, v in received}
+        self.assertTrue(values.get("user-agent", "").startswith("bambu_network_agent/"))
+        self.assertEqual(values.get("x-bbl-client-name"), "BambuStudio")
+        self.assertEqual(values.get("x-bbl-client-type"), "slicer")
+        self.assertEqual(values.get("x-bbl-executable-info"), "{}")
+
+    def test_refresh_keeps_refresh_token_when_server_does_not_rotate(self):
+        self.server.refresh_response = {
+            "accessToken": "fresh-token",
+            "refreshToken": "old-refresh",
+            "expiresIn": 3600,
+        }
+
+        result = self.run_admin("", command="refresh-cloud-token")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("BAMBU_CLOUD_REFRESH_TOKEN='old-refresh'", self.config.read_text())
+
+    def test_refresh_failure_leaves_config_untouched(self):
+        self.server.refresh_status = 401
+
+        result = self.run_admin("", command="refresh-cloud-token")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("HTTP 401", result.stderr)
+        config = self.config.read_text()
+        self.assertIn("BAMBU_CLOUD_TOKEN='old-token'", config)
+        self.assertIn("BAMBU_CLOUD_REFRESH_TOKEN='old-refresh'", config)
+        self.assertFalse(self.service_log.exists())
+
+    def test_refresh_with_empty_refresh_token_signals_rotation_needed(self):
+        self.config.write_text(
+            "BAMBU_CLOUD_TOKEN='old-token'\nBAMBU_PRINTER_SERIAL='SERIAL'\n"
+        )
+
+        result = self.run_admin("", command="refresh-cloud-token")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIsNone(self.server.last_refresh_body)
+        self.assertFalse(self.service_log.exists())
+
+    def test_refresh_rolls_back_on_relay_verify_failure(self):
+        self.server.status_connected = False
+
+        result = self.run_admin("", command="refresh-cloud-token")
+
+        self.assertNotEqual(result.returncode, 0)
+        config = self.config.read_text()
+        self.assertIn("BAMBU_CLOUD_TOKEN='old-token'", config)
+        self.assertIn("BAMBU_CLOUD_REFRESH_TOKEN='old-refresh'", config)
+        self.assertEqual(self.service_log.read_text().splitlines(), ["restart", "restart"])
+        self.assertNotIn("fresh-token", result.stdout + result.stderr)
+
+    def test_install_from_login_json_bootstraps_refresh_token(self):
+        login = json.dumps({
+            "accessToken": "fresh-token",
+            "refreshToken": "boot-refresh",
+            "expiresIn": 3600,
+        })
+
+        result = self.run_admin(login)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = self.config.read_text()
+        self.assertIn("BAMBU_CLOUD_TOKEN='fresh-token'", config)
+        self.assertIn("BAMBU_CLOUD_REFRESH_TOKEN='boot-refresh'", config)
 
 
 if __name__ == "__main__":

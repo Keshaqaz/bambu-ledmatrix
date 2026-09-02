@@ -1,4 +1,12 @@
 BAMBU_CLOUD_TOKEN=''
+# Refresh token for autonomous rotation. Populated automatically by
+# install-cloud-token when the official login JSON contains a refreshToken,
+# and rotated by refresh-cloud-token. Leave empty to disable auto-refresh
+# (the cron check then falls back to manual rotation on expiry).
+# BAMBU_CLOUD_REFRESH_TOKEN=''
+# Managed automatically by admin.py when a complete login JSON with expiresIn
+# is installed. Omit it when only a raw opaque access token is available.
+# BAMBU_CLOUD_TOKEN_EXPIRES_AT=''
 BAMBU_CLOUD_UID=''
 BAMBU_PRINTER_SERIAL=''
 

@@ -7,6 +7,22 @@ TAG="bambu-relay-token"
 output="$($ADMIN check-cloud-token 2>&1)"
 status=$?
 
+# Autonomous recovery: only when rotation is confirmed needed (exit 2).
+# Never attempt refresh on transient failures (exit 3) -- see
+# TOKEN_ROTATION_RUNBOOK.md: do not replace the token on a transient error.
+if [ "$status" -eq 2 ]; then
+  refresh_output="$($ADMIN refresh-cloud-token 2>&1)"
+  if [ $? -eq 0 ]; then
+    previous="$(cat "$STATE_FILE" 2>/dev/null)"
+    printf '%s\n' ok > "$STATE_FILE"
+    if [ -n "$previous" ] && [ "$previous" != "ok" ]; then
+      logger -t "$TAG" -p daemon.notice "cloud token refreshed automatically"
+    fi
+    exit 0
+  fi
+  output="auto-refresh failed: $refresh_output | check said: $output"
+fi
+
 if [ "$status" -eq 0 ]; then
   previous="$(cat "$STATE_FILE" 2>/dev/null)"
   printf '%s\n' ok > "$STATE_FILE"
