@@ -1,36 +1,53 @@
 # T05 device/canary runbook
 
 Этот прогон выполняется только после явного разрешения владельца. Он объединяет
-OTA, Bambu authorization, shadow/canary, fault recovery, rollback и запуск
-72-часового soak в одно присутствие владельца. Пароль, verification/TOTP codes,
-tokens и print payload не записываются.
+OTA, shadow/canary, fault recovery, rollback и запуск 72-часового soak в одно
+присутствие владельца. Пароль, verification/TOTP codes, tokens и print payload
+не записываются.
 
-Локально подготовленный `4.3.3-2026.09.01`: linked image `1 385 857` байт,
-экспортированный `.ino.bin` `1 386 000` байт, globals `49 780` байт; SHA-256
-image `59834aa4102695c20e5d4fab3a8d819de9153fb9e6c0508e12419042eef8983e`.
+Актуально для 2026-09-02: на матрице production `4.3.11-2026.09.02` (слот
+`app1`, flash 1 386 725 B / 70%, globals 49 780 B / 15%); T04 auth acceptance
+закрыт в AT06, T05 разблокирован.
 
-## Canary evidence — 2026-09-01
+Подготовленный T05 canary-образ `4.3.12-2026.09.02` (production-сборка,
+отличие от `4.3.11` — только bump `FW_VERSION`): linked image `1 386 725` байт
+(70%), globals `49 780` байт (15%), экспортированный `.ino.bin` `1 386 880`
+байт; gate `<= 1 750 000` выполнен; SHA-256 image
+`6d0f1e40e5f461d78e7629741dd6573c044fb064563710cd51877d9d0a4b45b4`; подписан
+`tools/sign_ota.sh` (ECDSA-P256, `X-OTA-Signature`), подпись рядом с образом.
+
+## Canary evidence — 2026-09-01 (pre-AT06) и 2026-09-02 (AT06)
 
 - USB-переход с T04 на `4.3.1` и следующий passwordless signed Web OTA прошли;
   слот сменился `app0 -> app1`, неподписанный запрос отклонён `403`.
 - После boot guard: minimum internal heap `114 388`, minimum largest block
   `114 676`, reserve loop `3 024`, weather `17 236`, printer `7 488` байт.
-  Эти доступные C3 gates проходят; MQTT reserve ожидает рабочую Cloud session.
-- Реальный initial password login на `4.3.3` классифицирован как
-  `cloudflare_blocked` до email/SMS/TOTP state. Обезличенный differential probe
-  с Mac, тем же endpoint, HTTP/1.0 и header set дошёл до Bambu API и получил
-  ожидаемый `400` для фиктивного аккаунта. Значит Cloudflare отклоняет сетевой
-  fingerprint ESP32 до проверки credentials.
-- Это не C3 memory/CPU failure: перенос того же firmware/TLS stack на S3 не
-  устранит блокировку. Direct Cloud canary и 72-часовой soak не запускаются до
-  отдельного решения для поддерживаемого Cloud login transport.
+  Эти доступные C3 gates проходят; MQTT reserve подтверждается в окне T05.
+- AT06 (2026-09-02) устранил прежний `cloudflare_blocked`: дискриминатором был
+  `User-Agent: ESP32HTTPClient`, молча подставляемый `HTTPClient` вместо
+  отбрасываемого ядром `addHeader`; фикс — `setUserAgent("bambu_network_agent/
+  02.07.01.51")`. Device oracle на probe-сборке с production-фиксом:
+  `TRANSPORT_PASS` ×2 (см. [AT06-integration](../docs/research/bambu-auth-transport/AT06-integration.md)).
+- Полный T04 acceptance выполнен на production `4.3.11`: real login, email
+  verification, printer selection, первый валидный Cloud MQTT report
+  (`mqttConnected=true`, `firstValidReport=true`, `ready`) — дважды, logout
+  (`signed_out`, credentials стёрты) и повторный login до `ready`.
+  **В окне T05 password login / verification / printer selection / первый
+  direct report повторно не требуются** — достаточно убедиться, что
+  `bambuDirect.state=ready`, `configured=true`, `firstValidReport=true`.
+- Это не C3 memory/CPU failure и больше не transport blocker: Direct Cloud
+  canary и 72-часовой soak разрешены; S3-ветка остаётся только реакцией на
+  провал численных C3 gates в T05.
 
 ## До окна владельца
 
-1. Повторить production build для ESP32-C3 `min_spiffs`, проверить image
+1. Собрать production build для ESP32-C3 `min_spiffs` (выполнено:
+   `4.3.12-2026.09.02`, метрики и SHA-256 выше), проверить image
    `<= 1 750 000` байт и подписать именно `.ino.bin` штатным ECDSA-P256 ключом.
-2. Повторить host tests и WebUI gzip/export check. Записать SHA-256 image и
-   подписи. Ничего не загружать на устройство.
+   Перед загрузкой убедиться в свежести `build/` (см. gotcha в CLAUDE.md) и в
+   строке `4.3.12-2026.09.02` внутри образа.
+2. Прогнать host tests (8 C++ + AT01 oracle + relay) и WebUI gzip/export check.
+   Ничего не загружать на устройство до подтверждения окна.
 3. Подготовить каталог вне репозитория для обезличенного soak JSONL.
 
 ## Одно окно владельца (примерно 75–90 минут)
@@ -39,16 +56,19 @@ image `59834aa4102695c20e5d4fab3a8d819de9153fb9e6c0508e12419042eef8983e`.
    WebUI. Проверить, что AP, WebUI и `/api/*` открыты по security level 0, а OTA
    по-прежнему принимает только корректно подписанный image.
 2. Загрузить подписанный T05 image через WebUI OTA. Проверить новый
-   `fwVersion`, смену `app0/app1`, стабильные 60 секунд boot guard, часы,
-   погоду, яркость, AP и сохранение настроек. Неподписанный тестовый image не
-   коммитить; достаточно локальной проверки rejection path до `Update.end()`.
-3. Оставить renderer source `relay`. Владелец сам вводит Bambu password и
-   verification/TOTP code, явно выбирает printer. Убедиться, что printer
-   остаётся в Cloud Mode и виден в Bambu Handy. Проверить первый direct report;
-   в diagnostics допустимы только counters/reason codes.
-4. Запустить одну короткую representative print. На `relay` сравнить lifecycle,
-   visible lifecycle, progress, layers, remaining time, job, stage и detail;
-   необъяснённые shadow mismatch counters должны остаться на нуле.
+   `fwVersion 4.3.12-2026.09.02`, смену `app1 -> app0`, стабильные 60 секунд
+   boot guard, часы, погоду, яркость, AP и сохранение настроек. Неподписанный
+   тестовый image не коммитить; достаточно локальной проверки rejection path до
+   `Update.end()`.
+3. Login/verification/printer selection/первый direct report уже проверены в
+   AT06 на `4.3.11` — повторять не нужно. Достаточно зафиксировать, что после
+   OTA `bambuDirect.state=ready`, `configured=true`, `mqttConnected=true`,
+   `firstValidReport=true`, и printer остаётся в Cloud Mode и виден в Bambu
+   Handy. В diagnostics допустимы только counters/reason codes.
+4. Владелец сам запускает одну короткую representative print. На `relay`
+   сравнить lifecycle, visible lifecycle, progress, layers, remaining time, job,
+   stage и detail; необъяснённые shadow mismatch counters должны остаться на
+   нуле.
 5. Во время печати запросить weather refresh и sunrise: HTTP может выполниться,
    HTTPS должен быть отложен без остановки MQTT. Затем последовательно проверить
    bounded recovery после Wi-Fi loss, DNS failure, MQTT disconnect и временного
@@ -65,13 +85,13 @@ image `59834aa4102695c20e5d4fab3a8d819de9153fb9e6c0508e12419042eef8983e`.
    minimum largest internal block `>= 32 768`, reserve loop/weather/printer/MQTT
    каждого `>= 2 048` байт. Если любой gate уже провален, прекратить C3 canary,
    сохранить измерения и принять S3; функции и защиты не удалять.
-9. Запустить unattended soak:
+9. Запустить unattended soak (JSONL — строго вне репозитория):
 
    ```bash
    python3 tools/t05_soak_monitor.py \
      --url http://192.168.1.65 \
      --hours 72 --interval 60 \
-     --output /tmp/ledmatrix-t05-soak.jsonl
+     --output "$TMPDIR/ledmatrix-t05-soak.jsonl"
    ```
 
 После запуска владельцу больше не нужно оставаться у устройства.
