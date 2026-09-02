@@ -720,7 +720,10 @@ static bool cloudJsonRequestWithClient(NetworkClient& client,
   if (!http.begin(client, url)) { copyCode(error, errorSize, "https_begin_failed"); return false; }
   char deviceId[37] = {};
   makeCloudDeviceId(deviceId);
-  http.addHeader("User-Agent", "bambu_network_agent/02.07.01.51");
+  // User-Agent задаётся только через setUserAgent(): addHeader молча
+  // отбрасывает его (allow-list ядра), и HTTPClient отправляет дефолтный
+  // "ESP32HTTPClient", который Cloudflare блокирует (см. AT04/AT05/AT06).
+  http.setUserAgent("bambu_network_agent/02.07.01.51");
   http.addHeader("X-BBL-Client-Name", "BambuStudio");
   http.addHeader("X-BBL-Client-Type", "slicer");
   http.addHeader("X-BBL-Client-Version", "02.07.01.62");
@@ -793,21 +796,29 @@ static bool cloudJsonRequestWithClient(NetworkClient& client,
 #endif
   DeserializationError jsonError = deserializeJson(
       response, input, DeserializationOption::NestingLimit(8));
+  // Пустой 200 (Content-Length: 0, ноль байт, без overflow) — валидный
+  // ответ action-эндпоинтов (например, sendemail/code): считаем его пустым
+  // документом; вызывающие проверки формы данных не ослабляются (AT06).
+  const bool emptySuccessResponse = code == 200 && !input.overflowed() &&
+      jsonError == DeserializationError::EmptyInput;
   if (jsonError || input.overflowed()) {
+    if (!emptySuccessResponse) {
 #ifdef BAMBU_AUTH_TRANSPORT_PROBE
-    gProbe200Length = contentLength;
-    gProbe200Read = static_cast<int32_t>(input.readCount());
-    gProbe200First = probe200FirstByte;
-    gProbe200Error = jsonError.code() == DeserializationError::Ok && input.overflowed()
-        ? static_cast<uint8_t>(DeserializationError::NoMemory)
-        : static_cast<uint8_t>(jsonError.code());
-    gProbe200Code = code;
-    gProbe200Shape = 0;
+      gProbe200Length = contentLength;
+      gProbe200Read = static_cast<int32_t>(input.readCount());
+      gProbe200First = probe200FirstByte;
+      gProbe200Error = jsonError.code() == DeserializationError::Ok && input.overflowed()
+          ? static_cast<uint8_t>(DeserializationError::NoMemory)
+          : static_cast<uint8_t>(jsonError.code());
+      gProbe200Code = code;
+      gProbe200Shape = 0;
 #endif
-    copyCode(error, errorSize,
-             jsonError == DeserializationError::NoMemory ? "json_no_memory" : "bad_response");
-    http.end();
-    return false;
+      copyCode(error, errorSize,
+               jsonError == DeserializationError::NoMemory ? "json_no_memory" : "bad_response");
+      http.end();
+      return false;
+    }
+    response.clear();
   }
 #ifdef BAMBU_AUTH_TRANSPORT_PROBE
   gProbe200Code = code;
@@ -2367,11 +2378,29 @@ bool BambuCloud::discoverAccountAndPrinters(char* error, size_t errorSize) {
 #endif
   const char* uid = firstString(profileData, "uid", "userId", "user_id");
   if (!uid[0]) uid = firstString(profileData, "accountId", "account_id");
-  if (!uid[0] || strlen(uid) >= sizeof(pendingAuth_.uid)) {
+  char uidText[BAMBU_CLOUD_UID_CAPACITY] = {};
+  if (uid[0]) {
+    strlcpy(uidText, uid, sizeof(uidText));
+  } else {
+    // Bambu отдаёт uid целым числом (измерено в AT06, ключи preference:
+    // uid/name/handle/...), принимаем и строку, и неотрицательное целое.
+    static constexpr const char* kUidKeys[] = {"uid", "userId", "user_id",
+                                               "accountId", "account_id"};
+    for (const char* key : kUidKeys) {
+      JsonVariantConst candidate = profileData[key];
+      if (!candidate.is<int64_t>()) continue;
+      const int64_t numeric = candidate.as<int64_t>();
+      if (numeric < 0) continue;
+      snprintf(uidText, sizeof(uidText), "%llu",
+               static_cast<unsigned long long>(numeric));
+      break;
+    }
+  }
+  if (!uidText[0] || strlen(uidText) >= sizeof(pendingAuth_.uid)) {
     copyCode(error, errorSize, "account_identity_missing");
     return false;
   }
-  strlcpy(pendingAuth_.uid, uid, sizeof(pendingAuth_.uid));
+  strlcpy(pendingAuth_.uid, uidText, sizeof(pendingAuth_.uid));
 
   snprintf(url, sizeof(url), "%s/v1/iot-service/api/user/bind", apiHost);
   JsonDocument directory;
@@ -2528,6 +2557,11 @@ void BambuCloud::processRefresh() {
 void BambuCloud::processLogout() {
   stopMqtt();
   credentialTx_.logout();
+  // Сброс валидности отчётов обязателен: иначе service() продолжает видеть
+  // устаревший firstValidReport и возвращает фазу в READY после SIGNED_OUT
+  // (обнаружено в AT06: logout «залипал» в ready при полностью стёртых
+  // учётных данных).
+  source_.resetValidation();
   bambuSecureZero(&refreshRecovery_, sizeof(refreshRecovery_));
   eraseCredentialNvs();
   clearPendingAuth();
