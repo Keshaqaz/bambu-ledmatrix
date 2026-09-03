@@ -5,9 +5,10 @@ OTA, shadow/canary, fault recovery, rollback и запуск 72-часового
 присутствие владельца. Пароль, verification/TOTP codes, tokens и print payload
 не записываются.
 
-Актуально для 2026-09-02: на матрице production `4.3.11-2026.09.02` (слот
-`app1`, flash 1 386 725 B / 70%, globals 49 780 B / 15%); T04 auth acceptance
-закрыт в AT06, T05 разблокирован.
+Актуально для 2026-09-03: на матрице production `4.3.12-2026.09.02` (слот
+`app0`, flash 1 386 725 B / 70%, globals 49 780 B / 15%), `4.3.11` остаётся на
+`app1` как boot-guard fallback; T04 auth acceptance закрыт в AT06, T05 canary
+идёт (см. execution record внизу файла).
 
 Подготовленный T05 canary-образ `4.3.12-2026.09.02` (production-сборка,
 отличие от `4.3.11` — только bump `FW_VERSION`): linked image `1 386 725` байт
@@ -95,6 +96,53 @@ OTA, shadow/canary, fault recovery, rollback и запуск 72-часового
    ```
 
 После запуска владельцу больше не нужно оставаться у устройства.
+
+## Execution record — окно 2026-09-03
+
+Окно подтверждено владельцем 09:21 MSK. Хронология и результаты:
+
+- **Wi-Fi recovery:** матрица была в onboarding AP `ESP32-Matrix-75DC3C`
+  (после ошибочного `/api/disconnect` прошлой сессии). Восстановлена на
+  `Bibas_2.4` через Wi-Fi модуль pve (`wlp3s0` + wpa_supplicant + dhclient,
+  POST `/api/connect`) без участия Mac. После подключения устройство
+  перезагрузилось само — это ожидаемое поведение `/api/connect`.
+- **Переключения без reboot:** `cloud_direct → relay` (effectiveSource за ~6 с,
+  Finding A flap прекратился — relay демотит в idle и остаётся), затем
+  API-failure тест (невалидный `bambuRelayUrl` на порт 9): bounded failure
+  (`bambuConnected=false`, lifecycle unknown, видимый overlay сохранён,
+  статус-эндпоинт жив, без reboot), восстановление URL → `connected=true`,
+  lifecycle=idle. Финал: `relay → cloud_direct` за ~6 с, без reboot
+  (аптайм непрерывен сквозь все три операции).
+- **OTA/boot инцидент:** `/api/reboot` из стабильного 4.3.12 → серия ранних
+  крашей в первом ~60 с окне → boot-guard откат на `4.3.11`/`app1`. Повторная
+  подписанная OTA `4.3.12` → та же серия → откат. Третья установка —
+  стабильно `4.3.12`/`app0`, soak стартовал с неё. Это 3-й эпизод паттерна
+  (включая первую установку 2026-09-02); краш интермиттирующий, ограничен
+  boot-окном. Root-cause требует сериального лога — **открытый дефект**,
+  блокер для закрытия T05 (см. CLAUDE.md, Build & Flash).
+- **`/api/update` quirk:** оба OTA-загрузки вернули curl `HTTP 000`
+  (обрыв ответа), но образ каждый раз принимался, подпись проверялась и
+  коммитился — доверять только `/api/status` после загрузки.
+- **Finding A воспроизведён живьём** (read-only замер, 3 мин, опрос 5 с):
+  цикл `idle(1)/visible 0` ↔ `finished(5)/visible 5/progress 100` с периодами
+  ~15–65 с, shadow mismatches росли 5→10 за 3 мин; суммарно за окно
+  mismatch-счётчик дошёл до 45/45, маска причин покрывает lifecycle/visible/
+  progress + job_name/stage/detail. Дефект присутствует и в `4.3.11`, и в
+  `4.3.12`. Фикс после окна, TDD (см. CLAUDE.md, Bambu Integration).
+- **C3 gates (стартовые, после стабилизации 4.3.12):** reserves PASS
+  (loop 3 024, weather 17 232, printer 7 160, mqtt 3 148), largest block PASS
+  (min 38 900–61 428 vs 32 768), image PASS (1 386 725 ≤ 1 750 000).
+  Gate `heapInternalMinimum >= 51 200` — **недостижим в steady state**:
+  low-water mark падает до ~46–50 K уже через минуты из-за TLS-хендшейков
+  (direct MQTT + weather). Реальный сигнал утечки — `heapMonotonicallyFalling`
+  в soak-мониторе. Калибровку гейта решает владелец; S3 по этому гейту
+  не инициирован.
+- **Soak запущен 2026-09-03 ~06:43 UTC** на `4.3.12`/`app0`, источник
+  `cloud_direct`: `tools/t05_soak_monitor.py --hours 72 --interval 60`,
+  JSONL `/Users/kesha/Desktop/vibecoding/ledmatrix-t05-soak/
+  ledmatrix-t05-soak.jsonl` (вне репозитория), PID в `soak_monitor.pid`,
+  лог рядом. Первые 3 сэмпла: fw/partition/heap/stacks/shadow пишутся,
+  `cloud_direct`, mqtt connected.
 
 ## Через 72 часа
 
