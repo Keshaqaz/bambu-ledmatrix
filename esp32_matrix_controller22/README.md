@@ -208,6 +208,7 @@ c++ -std=c++17 -Wall -Wextra -pedantic tests/bambu_report_parser_test.cpp -o /tm
 c++ -std=c++17 -Wall -Wextra -pedantic tests/bambu_lifecycle_mapping_test.cpp -o /tmp/bambu_lifecycle_mapping_test && /tmp/bambu_lifecycle_mapping_test
 c++ -std=c++17 -Wall -Wextra -pedantic tests/bambu_credential_store_test.cpp -o /tmp/bambu_credential_store_test && /tmp/bambu_credential_store_test
 c++ -std=c++17 -Wall -Wextra -pedantic tests/bambu_auth_contract_test.cpp -o /tmp/bambu_auth_contract_test && /tmp/bambu_auth_contract_test
+c++ -std=c++17 -Wall -Wextra -pedantic tests/t05_soak_log_test.cpp -o /tmp/t05_soak_log_test && /tmp/t05_soak_log_test
 python3 -m py_compile tools/bambu_relay/relay.py tools/bambu_relay/mock_relay.py
 python3 -m unittest discover -s tools/bambu_relay -p "test_*.py"
 for f in tools/export_web_ui.sh tools/check_web_ui_export.sh tools/bambu_relay/openwrt/bambu-relay.init; do sh -n "$f" || exit 1; done

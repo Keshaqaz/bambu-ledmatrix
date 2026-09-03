@@ -48,6 +48,7 @@
 #include "secure_network_coordinator.hpp"
 #include "t05_resilience.hpp"
 #include "local_access_policy.hpp"
+#include "soak_log.hpp"
 #include "wifi_reconnect_policy.hpp"
 
 // PlatformIO compiles sources as plain C++ and does not apply Arduino's .ino
@@ -74,6 +75,8 @@ void handleRoot();
 void handleGetSettings();
 void handlePostSettings();
 void handleStatus();
+void handleSoakGet();
+void handleSoakReset();
 void handleScanWifi();
 void handleConnectWifi();
 void handleDisconnectWifi();
@@ -110,8 +113,11 @@ static constexpr const char* FW_VERSION = "4.3.11-cap04-2026.09.02";
 #elif defined(BAMBU_AUTH_TRANSPORT_PROBE)
 static constexpr const char* FW_VERSION = "4.3.12-at04-2026.09.02";
 #else
-static constexpr const char* FW_VERSION = "4.3.12-2026.09.02";
+static constexpr const char* FW_VERSION = "4.3.13-2026.09.03";
 #endif
+static constexpr uint8_t SOAK_FW_MINOR = 13;  // 4.3.x — пишется в soak boot ring
+static constexpr uint32_t SOAK_SAMPLE_INTERVAL_MS = 60000UL;
+static constexpr uint32_t SOAK_CHECKPOINT_INTERVAL_MS = 600000UL;
 static constexpr uint32_t STORED_STATE_MAGIC = 0x4D415458UL; // MATX
 static constexpr uint16_t STORED_STATE_VERSION = 2;
 static constexpr size_t BAMBU_TOKEN_CAPACITY = 384;
@@ -2597,6 +2603,162 @@ void handlePostSettings() {
   sendJsonDocument(200, resp);
 }
 
+// ════════════════════════════════════════════════════════════
+//  SOAK LOG: автономный журнал T05 в NVS (namespace "soaklog").
+//  Прошивка сама копит минимумы/счётчики/аптайм и кольцо boot-записей;
+//  вердикт читается GET /api/soak, сброс — POST /api/soak/reset.
+// ════════════════════════════════════════════════════════════
+static constexpr const char* SOAK_NVS_NAMESPACE = "soaklog";
+static SoakState soakState;
+static uint32_t soakLastSampleMs = 0;
+static uint32_t soakLastCheckpointMs = 0;
+static uint32_t soakUptimeRemainderMs = 0;
+static uint32_t soakBootShadowMismatches = 0; // счётчики этой загрузки для дельт
+static uint32_t soakBootMqttReconnects = 0;
+
+static const char* soakResetReasonName(uint8_t reason) {
+  switch (reason) {
+    case 1:  return "poweron";
+    case 2:  return "sw";
+    case 3:  return "panic";
+    case 4:  return "int_wdt";
+    case 5:  return "task_wdt";
+    case 6:  return "wdt";
+    case 7:  return "deepsleep";
+    case 8:  return "brownout";
+    case 9:  return "sdio";
+    case 10: return "usb";
+    case 11: return "jtag";
+    case 12: return "efuse";
+    default: return "unknown";
+  }
+}
+
+static void soakPersist() {
+  soakSeal(soakState);
+  Preferences nvs;
+  if (nvs.begin(SOAK_NVS_NAMESPACE, false)) {
+    nvs.putBytes("state", &soakState, sizeof(soakState));
+    nvs.end();
+  }
+}
+
+// Вызывается один раз из setup(): загрузить журнал, дописать boot-запись
+// с причиной ресета (диагностика крашей в boot-окне) и сохранить.
+static void soakRecordBoot() {
+  Preferences nvs;
+  if (nvs.begin(SOAK_NVS_NAMESPACE, true)) {
+    nvs.getBytes("state", &soakState, sizeof(soakState));
+    nvs.end();
+  }
+  if (!soakValid(soakState)) soakState = soakFresh();
+  uint8_t partition = 255;
+  const esp_partition_t* run = esp_ota_get_running_partition();
+  if (run && run->label[0] == 'a' && run->label[1] == 'p' &&
+      run->label[2] == 'p' && run->label[3] >= '0' && run->label[3] <= '9')
+    partition = run->label[3] - '0';
+  soakPushBoot(soakState, (uint8_t)esp_reset_reason(), partition, SOAK_FW_MINOR,
+               soakState.soakUptimeSeconds);
+  soakPersist();
+  Serial.printf("[Soak] boot #%u, reset=%s, soakUptime=%u s\n",
+                (unsigned)soakState.bootCount,
+                soakResetReasonName((uint8_t)esp_reset_reason()),
+                (unsigned)soakState.soakUptimeSeconds);
+}
+
+// Раз в минуту из loop(): сложить минимумы и дельты счётчиков в RAM-копию,
+// раз в 10 минут — чекпоинт в NVS (потери при краше <= 10 минут аптайма).
+static void soakServicePass() {
+  uint32_t now = millis();
+  if (soakLastSampleMs != 0 && now - soakLastSampleMs < SOAK_SAMPLE_INTERVAL_MS)
+    return;
+  if (soakLastSampleMs == 0) soakLastSampleMs = now;
+  uint32_t elapsed = now - soakLastSampleMs;
+  soakLastSampleMs = now;
+  soakUptimeRemainderMs += elapsed;
+  soakFoldHeap(soakState, heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+               minimumLargestInternalBlock.load());
+  soakFoldStack(soakState,
+                loopTaskHandle ? (uint16_t)uxTaskGetStackHighWaterMark(loopTaskHandle) : 0,
+                weatherTaskHandle ? (uint16_t)uxTaskGetStackHighWaterMark(weatherTaskHandle) : 0,
+                bambuTaskHandle ? (uint16_t)uxTaskGetStackHighWaterMark(bambuTaskHandle) : 0,
+                0); // mqtt-стек приходит через cloudStatus ниже
+  {
+    BambuCloudPublicStatus cloudStatus = bambuCloud.publicStatus();
+    soakFoldStack(soakState, 0, 0, 0, (uint16_t)cloudStatus.mqttTaskStackReserve);
+    taskENTER_CRITICAL(&shadowDiagnosticsMux);
+    uint32_t mismatches = shadowDiagnostics.mismatches;
+    taskEXIT_CRITICAL(&shadowDiagnosticsMux);
+    soakFoldCounters(soakState, mismatches, soakBootShadowMismatches,
+                     cloudStatus.mqttReconnectCount, soakBootMqttReconnects);
+    soakBootShadowMismatches = mismatches;
+    soakBootMqttReconnects = cloudStatus.mqttReconnectCount;
+  }
+  bool checkpoint = soakLastCheckpointMs == 0 ||
+                    now - soakLastCheckpointMs >= SOAK_CHECKPOINT_INTERVAL_MS;
+  if (checkpoint) {
+    if (soakLastCheckpointMs != 0 || soakState.soakUptimeSeconds != 0) {
+      soakState.soakUptimeSeconds += soakUptimeRemainderMs / 1000UL;
+    }
+    soakUptimeRemainderMs = 0;
+    soakLastCheckpointMs = now;
+    soakPersist();
+  }
+}
+
+void handleSoakGet() {
+  JsonDocument doc;
+  doc["fwVersion"] = FW_VERSION;
+  doc["fwPartition"] = esp_ota_get_running_partition()->label;
+  doc["soakUptimeSeconds"] = soakState.soakUptimeSeconds;
+  doc["soakUptimeHours"] = soakState.soakUptimeSeconds / 3600UL;
+  doc["bootCount"] = soakState.bootCount;
+  doc["minHeap"] = soakState.minHeap == SOAK_HEAP_UNSET ? 0 : soakState.minHeap;
+  doc["minLargestBlock"] = soakState.minLargest == SOAK_HEAP_UNSET ? 0 : soakState.minLargest;
+  doc["minStackLoop"] = soakState.minStackLoop == SOAK_STACK_UNSET ? 0 : soakState.minStackLoop;
+  doc["minStackWeather"] = soakState.minStackWeather == SOAK_STACK_UNSET ? 0 : soakState.minStackWeather;
+  doc["minStackPrinter"] = soakState.minStackPrinter == SOAK_STACK_UNSET ? 0 : soakState.minStackPrinter;
+  doc["minStackMqtt"] = soakState.minStackMqtt == SOAK_STACK_UNSET ? 0 : soakState.minStackMqtt;
+  doc["shadowMismatchesTotal"] = soakState.shadowMismatchesTotal;
+  doc["mqttReconnectsTotal"] = soakState.mqttReconnectsTotal;
+  doc["checkpointCount"] = soakState.checkpointCount;
+  const SoakBootRecord* latest = soakLatestBoot(soakState);
+  if (latest) {
+    doc["currentBoot"]["seq"] = latest->seq;
+    doc["currentBoot"]["resetReason"] = soakResetReasonName(latest->resetReason);
+    doc["currentBoot"]["resetReasonCode"] = latest->resetReason;
+    doc["currentBoot"]["partition"] = latest->partition == 0 ? "app0" :
+                                      latest->partition == 1 ? "app1" : "unknown";
+  }
+  JsonArray boots = doc["boots"].to<JsonArray>();
+  for (int i = SOAK_BOOT_RING_CAPACITY - 1; i >= 0; --i) {
+    const SoakBootRecord& record = soakState.boots[i];
+    if (record.seq == 0) continue;
+    JsonObject entry = boots.add<JsonObject>();
+    entry["seq"] = record.seq;
+    entry["resetReason"] = soakResetReasonName(record.resetReason);
+    entry["partition"] = record.partition == 0 ? "app0" :
+                         record.partition == 1 ? "app1" : "unknown";
+    entry["fwMinor"] = record.fwMinor;
+    entry["soakUptimeAtBoot"] = record.soakUptimeAtBoot;
+  }
+  sendJsonDocument(200, doc);
+}
+
+void handleSoakReset() {
+  soakState = soakFresh();
+  soakLastSampleMs = 0;
+  soakLastCheckpointMs = 0;
+  soakUptimeRemainderMs = 0;
+  soakBootShadowMismatches = 0;
+  soakBootMqttReconnects = 0;
+  soakPersist();
+  Serial.println("[Soak] журнал сброшен владельцем, soak перезапущен");
+  JsonDocument resp;
+  resp["ok"] = true;
+  sendJsonDocument(200, resp);
+}
+
 void handleStatus() {
   JsonDocument doc;
   doc["wifi"]   = wifiConnected.load();
@@ -3348,6 +3510,10 @@ void setup() {
     }
   }
 
+  // Soak-журнал: как можно раньше, чтобы краш в ранней инициализации тоже
+  // попал в кольцо boot-записей с причиной ресета.
+  soakRecordBoot();
+
   FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
   FastLED.setMaxPowerInVoltsAndMilliamps(5, 2500);
   clearMatrix(); FastLED.show();
@@ -3475,6 +3641,8 @@ void setup() {
   server.on("/api/settings",  HTTP_GET,  handleGetSettings);
   server.on("/api/settings",  HTTP_POST, handlePostSettings);
   server.on("/api/status",    HTTP_GET,  handleStatus);
+  server.on("/api/soak",      HTTP_GET,  handleSoakGet);
+  server.on("/api/soak/reset",HTTP_POST, handleSoakReset);
   server.on("/api/scan",      HTTP_GET,  handleScanWifi);
   server.on("/api/connect",   HTTP_POST, handleConnectWifi);
   server.on("/api/disconnect",HTTP_POST, handleDisconnectWifi);
@@ -3641,6 +3809,9 @@ void loop() {
   if (savePending.load() && !flushDeferredSave(false) && !savePending.load()) {
     Serial.println("[NVS] Deferred save failed");
   }
+
+  // Автономный soak-журнал: сэмпл раз в минуту, NVS-чекпоинт раз в 10 минут.
+  soakServicePass();
 
   // configTime — только из loop task (единая точка изменения глобального lwIP/time state)
   if (ntpPending.exchange(false)) {
