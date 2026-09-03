@@ -137,12 +137,34 @@ OTA, shadow/canary, fault recovery, rollback и запуск 72-часового
   (direct MQTT + weather). Реальный сигнал утечки — `heapMonotonicallyFalling`
   в soak-мониторе. Калибровку гейта решает владелец; S3 по этому гейту
   не инициирован.
-- **Soak запущен 2026-09-03 ~06:43 UTC** на `4.3.12`/`app0`, источник
-  `cloud_direct`: `tools/t05_soak_monitor.py --hours 72 --interval 60`,
-  JSONL `/Users/kesha/Desktop/vibecoding/ledmatrix-t05-soak/
-  ledmatrix-t05-soak.jsonl` (вне репозитория), PID в `soak_monitor.pid`,
-  лог рядом. Первые 3 сэмпла: fw/partition/heap/stacks/shadow пишутся,
-  `cloud_direct`, mqtt connected.
+- **Soak v1 (упразднён):** 2026-09-03 ~06:43–07:10 UTC на `4.3.12`/`app0`
+  вёлся Mac-монитором `tools/t05_soak_monitor.py` (31 сэмпл, JSONL
+  `/Users/kesha/Desktop/vibecoding/ledmatrix-t05-soak/ledmatrix-t05-soak.jsonl`)
+  — остановлен по требованию автономности, заменён журналом в прошивке (ниже).
+
+- **Soak перенесён в прошивку (автономно, без Mac/pve/роутера):** владелец
+  потребовал наблюдение строго на ESP. Внешний монитор остановлен (31 сэмпл
+  06:43–07:10 UTC, JSONL — история). Собрана, host-протестирована и прошита по
+  USB (`/dev/cu.usbmodem101`, 4.6 с, hash verified) `4.3.13-2026.09.03`:
+  журнал в NVS (`soaklog`) — минимумы heap/блоков/стеков, итоги shadow/reconnect,
+  аптайм, кольцо из 16 boot-записей с `esp_reset_reason()`; `GET /api/soak`,
+  `POST /api/soak/reset`.
+- **Корневая причина ранних крашей найдена по сериалу** (захват
+  `/Users/kesha/Desktop/vibecoding/ledmatrix-t05-soak/serial_reboot.log`):
+  при ранней загрузке прошивка сразу идёт в Bambu Cloud MQTT; если DNS ещё не
+  готов (`getaddrinfo() returns 202` для `us.mqtt.bambulab.com`), обработчик
+  ошибки mqtt/esp-tls падает в `Store access fault` (вариант: lwIP
+  `udp_remove` assert без TCPIP lock) → серия паник в первые ~3–15 с →
+  boot-guard откатывает. Холодный старт обычно выигрывает DNS-гонку,
+  `/api/reboot` и OTA-ребуты — проигрывают. Тот же дефект ронял устройство
+  посреди сетевого OTA (5 из 6 попыток — краш на моменте загрузки, HTTP 000,
+  троттлинг не помог). Фикс отдельным TDD-проходом: не коннектиться к MQTT до
+  подтверждённых Wi-Fi+DNS, ревизия esp-tls cleanup.
+- **Soak перезапущен ~11:00 MSK на 4.3.13/app0:** журнал сброшен
+  (`POST /api/soak/reset`), вердикт через `curl http://192.168.1.65/api/soak`
+  (доступно и с телефона). Известные косметические дефекты журнала 4.3.13:
+  `checkpointCount` всегда 0; после reset дельта mismatch считается от загрузки
+  (несколько объяснённых Finding-A mismatch могут быть зачтены).
 
 ## Через 72 часа
 

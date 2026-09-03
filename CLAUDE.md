@@ -11,13 +11,16 @@ token operations).
 ## Project
 
 - Firmware project: `esp32_matrix_controller22/`
-- Deployed firmware: `4.3.12-2026.09.02`, partition `app0` (3rd install on
-  2026-09-03 finally stuck; see the boot-instability gotcha under Build & Flash).
-  4.3.12 content: auth-transport production fixes (OWM/Cloud UA `setUserAgent`,
-  empty-200 body handling, numeric Cloud UID, logout `resetValidation`).
-  T04 (direct Cloud) is **complete**; T05 canary: source switching and
-  API-failure resilience verified live 2026-09-03, 72h soak running (path under
-  Operational Notes).
+- Deployed firmware: `4.3.13-2026.09.03`, partition `app0` — flashed over USB
+  (network OTA blocked by the mid-upload crash; see Build & Flash). 4.3.13 adds
+  the **autonomous on-device soak journal** (`src/soak_log.hpp`, NVS namespace
+  `soaklog`): mins of heap/largest-block/task reserves, shadow-mismatch and
+  MQTT-reconnect totals, accumulated uptime, and a 16-entry boot ring with
+  `esp_reset_reason()` per boot — readable via `GET /api/soak`, resettable via
+  `POST /api/soak/reset` (security level 0, no Mac/pve/router needed for T05
+  observation). T04 (direct Cloud) is **complete**; T05 canary: source
+  switching and API-failure resilience verified live 2026-09-03, 72h soak
+  restarted 2026-09-03 ~11:00 MSK with the firmware journal.
 - Target board: `ESP32C3 Dev Module` / FQBN `esp32:esp32:esp32c3:PartitionScheme=min_spiffs`
 - Main firmware: `src/app.cpp`; web UI source: `src/index_html.h`; browser preview export: `web/index.html` (re-export via `tools/export_web_ui.sh`, verify via `tools/check_web_ui_export.sh`)
 - Relay: `tools/bambu_relay/relay.py` (deployed on the OpenWrt router)
@@ -43,11 +46,32 @@ token operations).
 - PlatformIO is currently broken on this machine: `~/.platformio/penv/bin/platformio` has a missing Python interpreter, while `/Users/kesha/Library/Python/3.9/bin/platformio` runs under unsupported Python 3.9. Use `arduino-cli`; `platformio.ini` is retained for future repair.
 - arduino-cli uses esp32 core 3.3.8. **Core 3.x gotcha:** `NetworkClient::setTimeout()` takes milliseconds (core 2.x, which old PlatformIO builds used, took seconds); `setHandshakeTimeout()` still takes seconds. `setTimeout(8)` = 8 ms killed all weather TLS connections until fixed (commit 932e290). Audit client timeouts when porting code written for core 2.x.
 - **OTA:** `min_spiffs` scheme, two 1.875MB app slots (binary limit 1 966 080 bytes). Target security-level-0 `/api/update` has no user/session gate but still requires the ECDSA-P256 `X-OTA-Signature` for image integrity before `Update.end()` commits the boot slot. ArduinoOTA/espota is disabled. Bump `FW_VERSION` in `src/app.cpp`; verify `fwVersion`/`fwPartition` after OTA.
-- **`/api/update` response-drop gotcha (seen twice 2026-09-03):** curl can report `HTTP 000` mid-upload even though the server receives the full image, verifies the signature, and commits — always re-check `/api/status` (`fwVersion`/`fwPartition`/uptime reset) instead of trusting the client error. Allow a long client timeout; the 1.39 MB write takes tens of seconds.
+- **`/api/update` OTA-crash gotcha (BLOCKER, 2026-09-03):** 5 of 6 network OTA
+  attempts today crashed the device mid-upload — curl reported `HTTP 000`
+  (16–120 s in) and the device reset at the upload moment, no commit (only the
+  morning `4.3.12` 3rd install succeeded). Throttling (`--limit-rate 40K`)
+  does not help. Every attempt also erases/overwrites the target slot — check
+  both slots' validity before trusting any fallback. Until the early-boot
+  defect is fixed, prefer direct USB upload (`arduino-cli upload -p
+  /dev/cu.usbmodem101`; 4.3.13 flashed this way in 4.6 s, hash verified).
+  A prepared image is `4.3.13-2026.09.03`: 1,391,296 B, SHA-256
+  `0cd2067a39e21285beb39bafb211e64f1d2ec170dd2461a865c84deb63f4f6b0`, signed.
 - **Standing deploy authorization (owner, 2026-09-02):** firmware/device deploys to project-owned LED Matrix hardware are pre-authorized; do not ask again before signed WebUI OTA or necessary diagnostic flashing. Resolve the exact target, use signed images for network OTA, retain rollback/boot-guard, and verify version, partition, and health afterward. This does not authorize deploying to third-party devices, starting prints, mutating accounts, deleting data, or other destructive actions.
 - **arduino-cli gotcha:** `compile --output-dir <dir>` also silently overwrites the sketch-local `build/` export — a test build (e.g. a deliberately crashing one) can poison the `build/.../*.ino.bin` you later OTA. Verify `build/` freshness (or recompile with `--export-binaries`) before uploading.
 - **Boot-guard anti-brick:** NVS namespace `bootguard` counts boots, cleared after 60 s uptime; 3 consecutive failures → `esp_ota_set_boot_partition()` rollback to the other slot (refuses cleanly if that slot is empty/corrupt). Known tradeoff: 3 manual resets within the first 60 s also trigger rollback. Live-proven 2026-09-03 (twice): it rescued the device from 4.3.12 early-boot crash series and rolled back to 4.3.11.
-- **4.3.12 early-boot instability (OPEN defect, 2026-09-03):** after `/api/reboot` and after OTA-commit reboots, 4.3.12 repeatedly crashed inside the first ~60 s window and boot-guard rolled back to 4.3.11 (3rd episode of the same pattern, incl. the 2026-09-02 first install). Yet 4.3.12 ran 15+ min continuously the same day and the 3rd install stuck — the crash is intermittent and boot-window-bound. Needs serial-log root-cause (USB `/dev/cu.usbmodem101`) before the Finding-A fix; do not trust a single successful reboot as proof of health, verify `fwVersion` + uptime growth for several minutes.
+- **4.3.12 early-boot instability → root cause found (2026-09-03, serial
+  capture):** on early boot the firmware connects to Bambu Cloud MQTT
+  immediately; when DNS is not ready yet (`esp-tls: couldn't get hostname for
+  us.mqtt.bambulab.com, getaddrinfo() returns 202`) the mqtt/esp-tls error
+  teardown panics — **`Guru Meditation Error: Store access fault`** (and a
+  sibling variant: lwIP `assert failed: udp_remove ... Required to lock TCPIP
+  core functionality!`). The panic series (boots crash ~3–15 s in) trips the
+  boot-guard rollback. Cold power-on usually wins the DNS race; `/api/reboot`
+  and OTA-commit reboots usually lose it. Evidence:
+  `/Users/kesha/Desktop/vibecoding/ledmatrix-t05-soak/serial_reboot.log`.
+  Fix (needs its own TDD pass): don't connect MQTT before Wi-Fi+DNS are
+  confirmed usable, and audit the esp-tls cleanup path for the store-access
+  fault / missing TCPIP lock.
 - ESP32-C3 is single-core: background FreeRTOS tasks and `loop()` time-slice on the same CPU. During OTA `otaInProgress` freezes weatherTask/bambuTask (no TLS handshakes mid flash write) and Wi-Fi power save is switched off.
 
 ## Display / UI State
@@ -186,14 +210,19 @@ token operations).
   `6d0f1e40e5f461d78e7629741dd6573c044fb064563710cd51877d9d0a4b45b4`
   (signature `*.ino.bin.sig` beside it). 4.3.11 remains on `app1` as the
   boot-guard fallback.
-- **T05 72h soak running since 2026-09-03 ~06:43 UTC:** monitor
-  `esp32_matrix_controller22/tools/t05_soak_monitor.py` (PID recorded in
-  `soak_monitor.pid`), JSONL outside the repo at
-  `/Users/kesha/Desktop/vibecoding/ledmatrix-t05-soak/ledmatrix-t05-soak.jsonl`
-  (~4320 samples at 60 s interval). Progress: `wc -l` on the JSONL +
-  `curl http://192.168.1.65/api/status`. Closure criteria: 72 h in
-  `cloud_direct`, zero unexplained shadow mismatches (Finding A is the
-  documented exception), no crash/rollback episodes, reserves stable.
+- **T05 72h soak (since 2026-09-03 ~11:00 MSK) is ON-DEVICE (autonomous):** the
+  firmware journal accumulates mins of heap/largest-block/task reserves,
+  shadow-mismatch + MQTT-reconnect totals, uptime and a 16-entry boot ring with
+  reset reasons in NVS. Read verdict: `curl http://192.168.1.65/api/soak`
+  (works from a phone on the LAN; no Mac/pve/router needed). NVS checkpoint
+  every 10 min — `soakUptimeSeconds` grows stepwise, a crash loses ≤10 min.
+  Known cosmetic gaps in 4.3.13: `checkpointCount` stays 0 (wrapper adds
+  seconds directly), and a journal reset starts the shadow-mismatch delta from
+  boot, not from reset moment (a few explained Finding-A mismatches may be
+  pre-counted). The earlier Mac-side monitor run (31 samples, 2026-09-03
+  06:43–07:10 UTC) is historical evidence at
+  `/Users/kesha/Desktop/vibecoding/ledmatrix-t05-soak/ledmatrix-t05-soak.jsonl`;
+  serial crash captures sit next to it (`serial_reboot.log`).
 - **C3 gates reality (2026-09-03, 4.3.12):** reserves PASS (loop ~3 024,
   weather ~17 200, printer 7 160, mqtt 3 148 — all ≥ 2 048), largest block PASS
   (min ~38 900–53 000 vs gate 32 768), image PASS (1 386 725 B ≤ 1 750 000).
