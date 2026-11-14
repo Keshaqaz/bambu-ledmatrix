@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/assets/matrix-preview.svg" width="880" alt="Three frames of the 16×16 matrix: the clock with the outdoor temperature, the same with a green print-progress bar at 62%, and a yellow paused bar">
+<img src="docs/assets/matrix-preview.svg" width="880" alt="Animated 16×16 matrix: the clock and the outdoor temperature while a print goes preparing, printing, finished and idle, next to the blinking paused and error bars">
 
 ### LED Matrix
 
@@ -19,7 +19,7 @@ and a live Bambu Lab print-progress bar, straight from Bambu Cloud.
 ## Features
 
 - **The time and the weather at a glance.** The clock in a 3×5 pixel font on top, the outdoor temperature below, coloured by how warm it is. Weather from OpenWeatherMap with an automatic fallback to Open-Meteo; the time zone follows the weather location.
-- **Your print, live.** While a Bambu Lab printer works, a bar across the middle fills up with the progress. Preparing breathes, paused blinks yellow, a stopped print blinks red, a finished one breathes green. A short Wi-Fi or Cloud drop keeps the last bar on screen instead of blanking it.
+- **Your print, live.** While a Bambu Lab printer works, a bar across the middle fills up with the progress. Preparing breathes, paused blinks yellow, a stopped print blinks red, a finished one blinks green. A short Wi-Fi or Cloud drop keeps the last bar on screen instead of blanking it.
 - **No server in between.** The matrix signs in to Bambu Cloud itself (email + verification code), picks the printer, keeps its MQTT session and refreshes the token on its own. The printer stays in normal Cloud mode: Bambu Handy and Bambu Studio keep working.
 - **Set up from a phone.** On first boot the matrix opens a Wi-Fi network `ESP32-Matrix-XXXXXX`; the web page at `192.168.4.1` scans networks and connects. All settings live in that page: brightness (manual, day/night or sunrise/sunset), colours, rotation and mirroring, weather, the printer.
 - **Updates over the air that can't brick it.** Upload a new `.bin` in the web page. The image goes to the idle slot; three failed boots in a row roll back to the previous one by themselves.
@@ -71,7 +71,7 @@ Later updates go through the web page: **Система → Обновление
 | printing | the track fills up green with the progress; the active column ramps smoothly |
 | paused | the bar blinks yellow |
 | error (the print stopped: failed, or paused with an HMS error) | the bar blinks red |
-| finished | the full bar breathes green for a while, then goes back to idle |
+| finished | the full bar blinks green for a while, then goes back to idle |
 | offline / no data for a moment | the last bar stays until the printer reports idle |
 
 Informational HMS notices during a running print don't turn the bar red.
@@ -158,7 +158,7 @@ python3 tools/bambu_relay/test_relay.py
 sh tools/export_web_ui.sh && sh tools/generate_web_ui_gzip.sh
 sh tools/check_web_ui_export.sh
 
-# the picture at the top of this README
+# the animated picture at the top of this README
 python3 tools/render_matrix_preview.py
 ```
 

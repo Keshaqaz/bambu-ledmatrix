@@ -130,7 +130,7 @@ token operations).
   - `preparing`: breathing first green column on gray track
   - `printing`: gray track + green progress fill (active column ramps smoothly)
   - `paused` / `error`: blinking yellow / red bar
-  - `finished`: full-width breathing green bar
+  - `finished`: full-width green bar blinking at 500 ms (same `overlayPhase` as paused/error)
   - explicit `idle`: no overlay
   - transient `unknown` / `offline` or HTTP/Wi-Fi failure: preserve the last visible overlay and progress until relay reports an explicit `idle`
 - Temperature layout was checked on 2026-06-15: `+17` at auto-centered X and `ct6TempY=10` stays inside 16x16 for all 16 rotation/flip combinations. `rotation=2 + flipH=true` is equivalent to a vertical frame reflection and does not hide the temperature.
