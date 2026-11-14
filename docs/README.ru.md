@@ -56,7 +56,8 @@
 **Железо:** плата ESP32-C3, матрица WS2812B 16×16 на GPIO 4, блок питания 5 В.
 
 **Прошивка.** Проще всего взять готовый файл из
-[релизов](https://github.com/Keshaqaz/ledmatrix/releases/latest) и залить по USB:
+[релизов](https://github.com/Keshaqaz/ledmatrix/releases/latest) и залить по USB
+(плата стирается целиком, вместе с настройками):
 
 ```sh
 pip install esptool

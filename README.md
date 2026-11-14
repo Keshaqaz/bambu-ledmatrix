@@ -59,7 +59,7 @@ Informational printer notices during a print don't turn the bar red.
 
 **Firmware.** The easy way: grab the file from the
 [latest release](https://github.com/Keshaqaz/ledmatrix/releases/latest) and
-flash it over USB:
+flash it over USB (this wipes the board, saved settings included):
 
 ```sh
 pip install esptool
