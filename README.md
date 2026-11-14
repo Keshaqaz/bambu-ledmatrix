@@ -56,7 +56,7 @@ Informational printer notices during a print don't turn the bar red.
 ## Build one
 
 **Hardware:** an ESP32-C3 board, a 16×16 WS2812B matrix and a USB-C charger,
-5 V 3 A. Three wires, nothing to solder on the board but pins:
+5 V 3 A. Three wires:
 
 <img src="docs/assets/wiring.svg" width="880" alt="Wiring: a USB-C charger powers the ESP32-C3; the board's 5V, GND and GPIO 4 go to the matrix input 5V, GND and DIN">
 
