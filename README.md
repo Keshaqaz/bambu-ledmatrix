@@ -55,7 +55,23 @@ Informational printer notices during a print don't turn the bar red.
 
 ## Build one
 
-**Hardware:** an ESP32-C3 board, a 16×16 WS2812B matrix on GPIO 4, a 5 V supply.
+**Hardware:** an ESP32-C3 board, a 16×16 WS2812B matrix and a USB-C charger,
+5 V 3 A. Three wires, nothing to solder on the board but pins:
+
+<img src="docs/assets/wiring.svg" width="880" alt="Wiring: a USB-C charger powers the ESP32-C3; the board's 5V, GND and GPIO 4 go to the matrix input 5V, GND and DIN">
+
+| ESP32-C3 | Matrix, input side |
+| --- | --- |
+| 5V | 5V |
+| GND | GND |
+| GPIO 4 | DIN |
+
+- The matrix is powered through the board from the charger. The firmware caps
+  the LEDs at 2.5 A, so 3 A is enough even at full white.
+- Data goes straight to DIN, no level shifter or resistor in the author's build.
+- Use the matrix's **input** end (DIN, not DOUT; usually an arrow on the PCB).
+- Picture upside down or mirrored? Fix it in the settings (rotation, flip), no
+  rewiring needed.
 
 **Firmware.** The easy way: grab the file from the
 [latest release](https://github.com/Keshaqaz/bambu-ledmatrix/releases/latest) and

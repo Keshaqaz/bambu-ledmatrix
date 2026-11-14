@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="320" viewBox="0 0 880 320" role="img" aria-label="Wiring: a USB-C charger powers the ESP32-C3; the board's 5V, GND and GPIO 4 go to the matrix input 5V, GND and DIN">
+  <style>
+    .card  { fill: #f6f8fa; stroke: #d0d7de; }
+    .board { fill: #1f6f50; stroke: #14513a; }
+    .chip  { fill: #2b2f36; }
+    .port  { fill: #8c959f; stroke: #57606a; }
+    .panel { fill: #111214; stroke: #3d444d; }
+    .led   { fill: #2a2d33; }
+    .t     { fill: #1f2328; font: 600 15px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .s     { fill: #57606a; font: 13px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .w     { fill: #ffffff; font: 600 13px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .pin   { fill: #1f2328; font: 600 13px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .cable { stroke: #57606a; }
+    .gnd   { stroke: #1f2328; }
+    @media (prefers-color-scheme: dark) {
+      .card  { fill: #161b22; stroke: #30363d; }
+      .t     { fill: #e6edf3; }
+      .s     { fill: #8b949e; }
+      .pin   { fill: #e6edf3; }
+      .cable { stroke: #8b949e; }
+      .gnd   { stroke: #c9d1d9; }
+      .panel { stroke: #57606a; }
+    }
+  </style>
+
+  <rect class="card" x="0.5" y="0.5" width="879" height="319" rx="12"/>
+
+  <!-- charger -->
+  <rect class="port" x="28" y="128" width="118" height="64" rx="10"/>
+  <text class="w" x="87" y="156" text-anchor="middle" style="fill:#1f2328">USB-C</text>
+  <text class="w" x="87" y="175" text-anchor="middle" style="fill:#1f2328">5 V · 3 A</text>
+  <text class="s" x="87" y="214" text-anchor="middle">charger</text>
+
+  <!-- USB cable -->
+  <path class="cable" d="M146 160 H262" stroke-width="7" stroke-linecap="round" fill="none"/>
+
+  <!-- ESP32-C3 board -->
+  <rect class="board" x="262" y="70" width="200" height="180" rx="10"/>
+  <rect class="port" x="252" y="146" width="22" height="28" rx="5"/>
+  <rect class="chip" x="298" y="125" width="92" height="70" rx="6"/>
+  <text class="w" x="344" y="165" text-anchor="middle">ESP32-C3</text>
+  <circle cx="446" cy="115" r="7" fill="#d4a72c"/>
+  <circle cx="446" cy="160" r="7" fill="#d4a72c"/>
+  <circle cx="446" cy="205" r="7" fill="#d4a72c"/>
+  <text class="w" x="430" y="120" text-anchor="end">5V</text>
+  <text class="w" x="430" y="165" text-anchor="end">GND</text>
+  <text class="w" x="430" y="210" text-anchor="end">GPIO 4</text>
+  <text class="s" x="362" y="276" text-anchor="middle">ESP32-C3 board</text>
+
+  <!-- wires -->
+  <path d="M446 115 H636" stroke="#e5534b" stroke-width="5" stroke-linecap="round" fill="none"/>
+  <path class="gnd" d="M446 160 H636" stroke-width="5" stroke-linecap="round" fill="none"/>
+  <path d="M446 205 H636" stroke="#2da44e" stroke-width="5" stroke-linecap="round" fill="none"/>
+  <text class="s" x="541" y="105" text-anchor="middle">power</text>
+  <text class="s" x="541" y="150" text-anchor="middle">ground</text>
+  <text class="s" x="541" y="195" text-anchor="middle">data</text>
+
+  <!-- matrix -->
+  <rect class="panel" x="636" y="40" width="220" height="240" rx="10"/>
+  <g transform="translate(694 74)">
+    <!-- 16x16 hint grid, 10px pitch -->
+    <pattern id="leds" width="10" height="10" patternUnits="userSpaceOnUse">
+      <circle cx="5" cy="5" r="3.2" class="led"/>
+    </pattern>
+    <rect width="160" height="160" fill="url(#leds)"/>
+  </g>
+  <text class="w" x="648" y="120">5V</text>
+  <text class="w" x="648" y="165">GND</text>
+  <text class="w" x="648" y="210">DIN</text>
+  <text class="s" x="746" y="302" text-anchor="middle">WS2812B 16×16, input side</text>
+</svg>
