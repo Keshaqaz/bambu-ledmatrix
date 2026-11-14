@@ -6,7 +6,7 @@
 
 A clock that knows how your 3D print is doing.
 
-[![release](https://img.shields.io/badge/release-4.4.11-8A2BE2)](https://github.com/Keshaqaz/bambu-ledmatrix/releases/latest)
+[![release](https://img.shields.io/github/v/release/Keshaqaz/bambu-ledmatrix?label=release&color=8A2BE2)](https://github.com/Keshaqaz/bambu-ledmatrix/releases/latest)
 [![board](https://img.shields.io/badge/board-ESP32--C3-E7352C?logo=espressif&logoColor=white)](esp32_matrix_controller22/README.md)
 [![arduino](https://img.shields.io/badge/arduino--cli-esp32%203.3.8-00979D?logo=arduino&logoColor=white)](esp32_matrix_controller22/README.md)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
