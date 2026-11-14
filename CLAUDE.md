@@ -3,7 +3,10 @@
 Last updated: 2026-09-03
 
 This file is the operational context for the whole repo (firmware + relay).
-User-facing docs: `README.md` (repo map), `esp32_matrix_controller22/README.md`
+User-facing docs: `README.md` (English, GitHub front page) and its Russian
+twin `docs/README.ru.md` — keep both in sync; the header picture
+`docs/assets/matrix-preview.svg` is rendered by
+`esp32_matrix_controller22/tools/render_matrix_preview.py`. Also `esp32_matrix_controller22/README.md`
 (firmware), `esp32_matrix_controller22/tools/bambu_relay/README.md` (relay), and
 `esp32_matrix_controller22/tools/bambu_relay/TOKEN_ROTATION_RUNBOOK.md` (Cloud
 token operations).

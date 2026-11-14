@@ -1,0 +1,39 @@
+name: Bug
+description: The matrix, its web page or the relay does not work as described
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected and what you saw on the matrix or the web page instead.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Firmware version
+      description: "`fwVersion` from `http://<matrix>/api/status`, e.g. `4.4.11-2026.11.14`."
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: Printer status source
+      options:
+        - Direct Cloud (default)
+        - Relay
+        - Not using the printer
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: /api/status and /api/soak
+      description: The output of `curl http://<matrix>/api/status` and `curl http://<matrix>/api/soak`. They hold no tokens or passwords; replace your network name and IPs if you like.
+      render: json
+  - type: input
+    id: hardware
+    attributes:
+      label: Board and printer
+      description: e.g. ESP32-C3 SuperMini, Bambu Lab P1S

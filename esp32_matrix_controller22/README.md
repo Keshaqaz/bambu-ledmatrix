@@ -1,8 +1,7 @@
 # ESP32 Matrix Controller
 
-Этот проект можно открывать напрямую из `Arduino IDE` как обычный скетч:
-
-`/Users/kesha/Desktop/vibecoding/ledmatrix/esp32_matrix_controller22`
+Этот проект можно открывать напрямую из `Arduino IDE` как обычный скетч —
+папка `esp32_matrix_controller22/` этого репозитория.
 
 Главный файл скетча:
 
@@ -12,10 +11,10 @@
 
 `src/app.cpp`
 
-Развернутая версия: `4.4.0-2026.09.03` (`app0`, USB-flash, hash verified) —
-T06: direct Cloud является источником по умолчанию (одноразовая NVS-миграция
-`bsrcmig`). Production-сборка T06 занимает 1 391 273 байт flash и
-проходит flash-gate ADR (`≤ 1 750 000`); метрики RAM — в `/api/status`
+Развернутая версия: `4.4.11-2026.11.14` (OTA, `app1`; `app0` = `4.4.10`).
+С `4.4.0` (T06) direct Cloud является источником по умолчанию (одноразовая
+NVS-миграция `bsrcmig`). Production-сборка T06 занимала 1 391 273 байт flash и
+проходила flash-gate ADR (`≤ 1 750 000`); метрики RAM — в `/api/status`
 (`heapFree`, `heapMin`, `largestBlock`, task reserves) и soak-журнале `/api/soak`.
 
 Что выбрать в Arduino IDE:
