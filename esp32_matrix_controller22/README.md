@@ -12,13 +12,11 @@
 
 `src/app.cpp`
 
-Установленная версия: `4.2.0-2026.08.28` (`app1`), OTA выполнено 2026-08-28.
-Текущий исходник T04: `4.2.2-2026.08.31`. Production-сборка занимает
-1 389 979 байт flash (70%)
-и 49 828 байт глобальной памяти (15%). От последней записанной T01-сборки это
-+113 038 байт flash и +7 784 байта globals; относительно исходного ADR baseline
-дельта +37 692 и +3 232 байта. On-device minimum heap, largest block и task
-high-water marks T04 пока не сняты.
+Развернутая версия: `4.4.0-2026.09.03` (`app0`, USB-flash, hash verified) —
+T06: direct Cloud является источником по умолчанию (одноразовая NVS-миграция
+`bsrcmig`). Production-сборка T06 занимает 1 391 273 байт flash и
+проходит flash-gate ADR (`≤ 1 750 000`); метрики RAM — в `/api/status`
+(`heapFree`, `heapMin`, `largestBlock`, task reserves) и soak-журнале `/api/soak`.
 
 Что выбрать в Arduino IDE:
 
@@ -43,35 +41,30 @@ OTA в этом проекте когда-то провалилась.
 arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs --export-binaries .
 # сборка + прошивка по USB:
 arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs -u -p /dev/cu.usbmodem101 .
-# подписать production image для WebUI OTA:
-sh tools/sign_ota.sh build/esp32.esp32.esp32c3/esp32_matrix_controller22.ino.bin
 ```
 
 ## OTA-обновления
 
 Владелец проекта 2026-09-02 дал постоянное разрешение на firmware/device deploy
 на принадлежащие проекту LED Matrix устройства. Повторно спрашивать разрешение
-перед signed WebUI OTA или необходимой диагностической перепрошивкой не нужно.
+перед WebUI OTA или необходимой диагностической перепрошивкой не нужно.
 Перед загрузкой всё равно проверяются точный target, версия и image; после неё —
 `fwVersion`, `fwPartition`, health и доступность rollback/boot-guard. Разрешение
 не распространяется на чужие устройства и несвязанные разрушительные действия.
 
 Сетевой путь один: WebUI. По принятому security level 0 локальный WebUI/API не
-требует admin password/session/CSRF; ECDSA-подпись сохраняется как проверка
-целостности firmware. Уже установленная `4.2.0` всё ещё содержит прежний T01
-session gate — его нужно удалить следующей firmware-итерацией. ArduinoOTA/espota
-на порту 3232 отключён. В `Система → Обновление прошивки` выбрать оба файла:
+требует admin password/session/CSRF. С 2026-09-03 (решение владельца) подпись
+образа не проверяется — `/api/update` принимает неподписанный `.ino.bin`;
+целостность обеспечивают app-дескриптор в первом чанке, валидация
+`Update.end()` и boot-guard rollback. ArduinoOTA/espota на порту 3232 отключён.
+В `Система → Обновление прошивки` выбрать один файл:
 
-1. Production image
-   `build/esp32.esp32.esp32c3/esp32_matrix_controller22.ino.bin` (появляется при
-   сборке с `--export-binaries`). **Не** `merged.bin` — прошивка отклонит его
-   (нет app-дескриптора), но лучше не путать. Перед заливкой проверяйте свежесть
-   `build/`: `arduino-cli compile --output-dir <dir>` молча перезаписывает и его,
-   так что там может лежать не та сборка, что вы думаете.
-2. Подпись `.sig`, созданную `sh tools/sign_ota.sh <image>`. Приватный ключ
-   находится локально в `.secrets/ota_signing_private.pem`, исключён из Git и
-   должен храниться как эксплуатационный secret. Неподписанный или подписанный
-   другим ключом image записывается только во временный OTA slot и не коммитится.
+Production image
+`build/esp32.esp32.esp32c3/esp32_matrix_controller22.ino.bin` (появляется при
+сборке с `--export-binaries`). **Не** `merged.bin` — прошивка отклонит его
+(нет app-дескриптора), но лучше не путать. Перед заливкой проверяйте свежесть
+`build/`: `arduino-cli compile --output-dir <dir>` молча перезаписывает и его,
+так что там может лежать не та сборка, что вы думаете.
 
 Защита от кирпича:
 
@@ -151,6 +144,16 @@ c++ -std=c++11 -Wall -Wextra -pedantic tests/wifi_reconnect_policy_test.cpp \
 проходами. Это исправило перегрев: на `4.0.4` датчик CPU показывал `71.3 °C`
 после 22 минут, на `4.0.5` — `49.3 °C` через 4 минуты и `51.3 °C` через 5 минут.
 
+В `4.4.8` устранена повторная тепловая регрессия при открытом WebUI. После
+добавления Direct Cloud страница каждые 3 секунды запускала два неограниченных
+HTTP-запроса, а ArduinoJson передавал выросший `/api/status` в Wi-Fi-клиент по
+одному байту. Запросы перекрывались, WebServer переставал отвечать, температура
+за 7 минут выросла с `42.3` до `59.3 °C`. Теперь JSON сначала буферизуется,
+steady-state polling выполняется строго последовательно раз в 10 секунд, а
+отдельный auth polling работает только во время переходов авторизации. На
+`4.4.8` с открытым WebUI `/api/status` отвечал за `0.03–0.29 с`, а температура
+за то же окно снизилась с `51.3` до `43.3 °C`.
+
 Веб-интерфейс — пять разделов в нижней навигации:
 
 - **Экран** — яркость (ручная или авто день/ночь: по часам либо по рассвету/закату),
@@ -159,7 +162,8 @@ c++ -std=c++11 -Wall -Wextra -pedantic tests/wifi_reconnect_policy_test.cpp \
 - **Погода** — провайдер (`Авто` = OWM с фоллбэком на Open-Meteo / только OWM /
   только Open-Meteo), API-ключ OWM, локация городом или координатами, интервал.
   Open-Meteo работает без ключа, но только по координатам
-- **Принтер** — включение статуса печати, Relay URL/Key, live-прогресс
+- **Принтер** — включение статуса печати, выбор источника `Direct Cloud`
+  (по умолчанию) / `Relay`, Relay URL/Key для fallback, live-прогресс
 - **Система** — версия/слот прошивки, NTP (с зашитыми фоллбэками
   `time.google.com`/`time.cloudflare.com`), часовой пояс из локации погоды или
   вручную, OTA-загрузка, перезагрузка
@@ -172,10 +176,10 @@ c++ -std=c++11 -Wall -Wextra -pedantic tests/wifi_reconnect_policy_test.cpp \
 [`ADR 0002`](../docs/adr/0002-use-security-level-zero-for-local-access.md): onboarding
 AP открыт, WebUI и `/api/*` не требуют admin password, session cookie или CSRF.
 Любой клиент LAN/AP может читать diagnostics, менять настройки, запускать Cloud
-onboarding/logout/refresh, reboot и signed Web OTA; владелец принимает этот риск
-ради отсутствия раздражающего домашнего login flow. Установленная `4.2.0` пока
-не соответствует решению: её уникальный AP password и admin provisioning должны
-быть удалены следующей firmware-итерацией. Bambu password при этом по-прежнему
+onboarding/logout/refresh, reboot и Web OTA (с 2026-09-03 — без подписи образа);
+владелец принимает этот риск
+ради отсутствия раздражающего домашнего login flow (в развернутых `4.3.x+`
+legacy session gate полностью удалён). Bambu password при этом по-прежнему
 не сохраняется, а Cloud tokens не возвращаются через API.
 
 Анимации на самой матрице: янтарная «волна зажигания» при включении, значок
@@ -204,13 +208,18 @@ sh tools/generate_web_ui_gzip.sh
 sh tools/check_web_ui_export.sh
 c++ -std=c++17 -Wall -Wextra -pedantic tests/wifi_reconnect_policy_test.cpp -o /tmp/wifi_reconnect_policy_test && /tmp/wifi_reconnect_policy_test
 c++ -std=c++17 -Wall -Wextra -pedantic tests/printer_status_source_test.cpp -o /tmp/printer_status_source_test && /tmp/printer_status_source_test
+c++ -std=c++17 -Wall -Wextra -pedantic tests/bambu_service_gate_test.cpp -o /tmp/bambu_service_gate_test && /tmp/bambu_service_gate_test
+c++ -std=c++17 -Wall -Wextra -pedantic tests/finished_announcement_test.cpp -o /tmp/finished_announcement_test && /tmp/finished_announcement_test
 c++ -std=c++17 -Wall -Wextra -pedantic tests/bambu_report_parser_test.cpp -o /tmp/bambu_report_parser_test && /tmp/bambu_report_parser_test
 c++ -std=c++17 -Wall -Wextra -pedantic tests/bambu_lifecycle_mapping_test.cpp -o /tmp/bambu_lifecycle_mapping_test && /tmp/bambu_lifecycle_mapping_test
 c++ -std=c++17 -Wall -Wextra -pedantic tests/bambu_credential_store_test.cpp -o /tmp/bambu_credential_store_test && /tmp/bambu_credential_store_test
 c++ -std=c++17 -Wall -Wextra -pedantic tests/bambu_auth_contract_test.cpp -o /tmp/bambu_auth_contract_test && /tmp/bambu_auth_contract_test
 c++ -std=c++17 -Wall -Wextra -pedantic tests/t05_soak_log_test.cpp -o /tmp/t05_soak_log_test && /tmp/t05_soak_log_test
+c++ -std=c++17 -Wall -Wextra -pedantic tests/ota_display_policy_test.cpp -o /tmp/ota_display_policy_test && /tmp/ota_display_policy_test
 python3 -m py_compile tools/bambu_relay/relay.py tools/bambu_relay/mock_relay.py
 python3 -m unittest discover -s tools/bambu_relay -p "test_*.py"
+python3 -m unittest tools/test_ota_loop.py
+python3 -m unittest tools/test_web_ui_initial_render.py tools/test_web_ui_polling.py tools/test_web_json_transport.py
 for f in tools/export_web_ui.sh tools/check_web_ui_export.sh tools/bambu_relay/openwrt/bambu-relay.init; do sh -n "$f" || exit 1; done
 ```
 
@@ -218,6 +227,13 @@ for f in tools/export_web_ui.sh tools/check_web_ui_export.sh tools/bambu_relay/o
 
 ```bash
 arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs .
+```
+
+Живой regression loop для WebUI OTA (HTTP 200, смена слота, ровно одна
+boot-запись без watchdog; между итерациями соблюдает окно boot-guard):
+
+```bash
+python3 tools/ota_loop.py build/esp32.esp32.esp32c3/esp32_matrix_controller22.ino.bin --via pve --iters 3
 ```
 
 ## Bambu Cloud и Relay
@@ -245,21 +261,47 @@ reliability-over-security выбор security level 0;
 повторный login остаётся только для внешнего revoke/блокировки аккаунта или
 несовместимого изменения Bambu Cloud contract.
 
-До T05 это shadow path: матрица и основной status WebUI продолжают читать
-`RelayHttpSource`, а direct snapshot доступен только в `/api/status.bambuDirect`.
-Внешний relay (`tools/bambu_relay/`) остаётся рабочим rollback path.
+### Direct Cloud — источник по умолчанию (T06, 4.4.0)
+
+С `4.4.0-2026.09.03` direct Cloud — источник статуса принтера по умолчанию:
+
+- **Новые установки**: fresh NVS инициализируется значением `cloud_direct`.
+- **Миграция**: одноразовая NVS-миграция (marker `bsrcmig` в namespace `matrix`)
+  переводит на `cloud_direct` установки, где источником остался исторический
+  default `relay`. Повторная загрузка marker не перетирает — выбранный вручную
+  relay-rollback сохраняется.
+- **Transitional fallback**: пока direct-сессия не готова (нет активных
+  credentials или не получен первый валидный report), effective source остаётся
+  relay (`effectivePrinterSourceMode` в `t05_resilience.hpp`); состояние источника
+  видно в `/api/status` (`bambu.source` = настроенный, `bambu.effectiveSource` =
+  фактический). Это документированный миграционный механизм, а не скрытая
+  зависимость: внешние скрипты/companion/LAN MQTT не используются.
+- **Rollback (минимум один стабильный release)**: WebUI `Принтер → Источник
+  статуса → Relay` — применяется сразу, без перезагрузки; OTA boot-rollback —
+  второй уровень (два app-слота + boot guard). Relay-код, deployment и runbook
+  сохранены в `tools/bambu_relay/`.
+
+Onboarding после миграции: войти в Bambu (email/password + verification/TOTP;
+для Google-created account сначала один раз задайте Bambu-пароль через
+официальный `Forgot password`), выбрать принтер — после первого валидного report
+матрица переходит на direct Cloud и больше не нуждается в relay-хосте. Принтер
+остаётся в Cloud Mode и доступен в Bambu Handy.
+
+Диагностика: `/api/status` (поля `bambu*`, `bambu.source`,
+`bambu.effectiveSource`, shadow-mismatch counters), `/api/soak` (ресурсный
+журнал). Токены и пароль через API не отдаются.
+
+Известный риск: Bambu Cloud endpoints и MQTT credentials не являются
+гарантированным публичным контрактом; при несовместимом изменении cloud side
+fallback — relay-источник и OTA rollback.
 
 Запуск, деплой на OpenWrt-роутер, HTTP API и конфигурация relay описаны в
 [`tools/bambu_relay/README.md`](tools/bambu_relay/README.md).
 Проверка и безопасная замена истёкшего Cloud token — в
 [`tools/bambu_relay/TOKEN_ROTATION_RUNBOOK.md`](tools/bambu_relay/TOKEN_ROTATION_RUNBOOK.md).
 
-Со стороны матрицы в веб-интерфейсе (раздел `Принтер`) нужно включить:
-
-- тумблер `Статус печати`
-- `Relay URL = http://<хост_relay>:8787/status`
-- опционально `Relay Key`, если relay запущен с ключом
-
-Direct Cloud настраивается в соседней карточке того же раздела. Cloud REST,
+Со стороны матрицы основной путь — карточка Direct Cloud в разделе `Принтер`
+(login → выбор принтера). Relay-карточка (`Relay URL`, опционально `Relay Key`)
+нужна только для fallback/rollback-конфигурации. Cloud REST,
 Cloud MQTT, weather HTTPS/sunrise и OTA проходят через единый координатор:
 одновременно на ESP32-C3 существует не более одного TLS-сеанса.

@@ -71,11 +71,15 @@ struct PrinterStatePatch {
   char jobName[96];
   char stage[48];
   char detail[96];
+  // Terminal FAILED is visually an error, but unlike an active HMS/
+  // print_error alarm it is an announcement for a completed job. It gets a
+  // bounded display grace and is then latched until printer activity resumes.
+  bool terminalFailure;
 
   PrinterStatePatch()
       : present(0), transportConnected(false), printerOnline(false),
         lifecycle(PRINTER_UNKNOWN), progress(0), currentLayer(0),
-        totalLayers(0), remainingSeconds(0) {
+        totalLayers(0), remainingSeconds(0), terminalFailure(false) {
     jobName[0] = '\0';
     stage[0] = '\0';
     detail[0] = '\0';
@@ -98,8 +102,26 @@ inline PrinterLifecycle printerVisibleLifecycleForUpdate(
 class PrinterStatusReducer {
  public:
   static const uint32_t kFinishedGraceMs = 30000UL;
+  static const uint32_t kTerminalFailureGraceMs = 30000UL;
 
   PrinterStateSnapshot snapshot() const { return state_; }
+
+  // Персистящий латч (NVS): финиш этой работы уже был объявлен до бута —
+  // подавить следующий анонс (FINISH-патч коллапсирует в idle сразу).
+  void suppressFinishedAnnouncement() { finishedAnnounced_ = true; }
+  bool finishedAnnounced() const { return finishedAnnounced_; }
+  // Идёт ли сейчас анонс финиша (grace активен) — точка решения для
+  // персистентного подавления повторного анонса после бута.
+  bool finishedGraceActive() const { return finishedGraceActive_; }
+  void suppressTerminalFailureAnnouncement() {
+    terminalFailureAnnounced_ = true;
+  }
+  bool terminalFailureAnnounced() const {
+    return terminalFailureAnnounced_;
+  }
+  bool terminalFailureGraceActive() const {
+    return terminalFailureGraceActive_;
+  }
 
   void configure(bool enabled, bool configured, const char* detail) {
     const bool becameAvailable = enabled && configured &&
@@ -125,7 +147,26 @@ class PrinterStatusReducer {
         static_cast<uint32_t>(nowMs - finishedSinceMs_) < kFinishedGraceMs) {
       deferFinishedIdle = true;
     }
-    if ((patch.present & PRINTER_PATCH_LIFECYCLE) && !deferFinishedIdle) {
+    // Finding A: after the grace demote announced the finish, periodic
+    // cloud reports keep carrying FINISHED for the same job. Collapsing
+    // them to the demoted idle state (relay parity) stops the endless
+    // finished<->idle flapping; a non-finished lifecycle re-arms it.
+    const bool collapseFinishedReentry =
+        (patch.present & PRINTER_PATCH_LIFECYCLE) != 0 &&
+        patch.lifecycle == PRINTER_FINISHED && finishedAnnounced_;
+    const bool terminalFailurePatch =
+        (patch.present & PRINTER_PATCH_LIFECYCLE) != 0 &&
+        patch.lifecycle == PRINTER_ERROR && patch.terminalFailure;
+    const bool collapseTerminalFailureReentry =
+        terminalFailurePatch && terminalFailureAnnounced_;
+    if ((collapseFinishedReentry || collapseTerminalFailureReentry) &&
+        !deferFinishedIdle) {
+      // Релей-парити idle: lifecycle/progress/тексты — как после demote,
+      // поля работы (имя/слои) из патча применяются ниже.
+      state_.lifecycle = PRINTER_IDLE;
+      state_.visibleLifecycle = PRINTER_UNKNOWN;
+      state_.progress = 0;
+    } else if ((patch.present & PRINTER_PATCH_LIFECYCLE) && !deferFinishedIdle) {
       state_.lifecycle = patch.lifecycle;
       state_.visibleLifecycle = printerVisibleLifecycleForUpdate(
           state_.visibleLifecycle, patch.lifecycle);
@@ -134,9 +175,17 @@ class PrinterStatusReducer {
           finishedGraceActive_ = true;
           finishedSinceMs_ = nowMs;
         }
+      } else if (terminalFailurePatch) {
+        if (!terminalFailureGraceActive_) {
+          terminalFailureGraceActive_ = true;
+          terminalFailureSinceMs_ = nowMs;
+        }
       } else if (patch.lifecycle != PRINTER_UNKNOWN &&
                  patch.lifecycle != PRINTER_OFFLINE) {
         finishedGraceActive_ = false;
+        finishedAnnounced_ = false;
+        terminalFailureGraceActive_ = false;
+        terminalFailureAnnounced_ = false;
       }
     }
 
@@ -145,7 +194,8 @@ class PrinterStatusReducer {
          state_.lifecycle == PRINTER_OFFLINE) &&
         printerHasVisibleOverlay(previousVisible);
     if ((patch.present & PRINTER_PATCH_PROGRESS) && !retainingOverlay &&
-        !deferFinishedIdle)
+        !deferFinishedIdle && !collapseFinishedReentry &&
+        !collapseTerminalFailureReentry)
       state_.progress = patch.progress > 100 ? 100 : patch.progress;
     if (state_.lifecycle == PRINTER_FINISHED) state_.progress = 100;
     if (state_.lifecycle == PRINTER_IDLE) state_.progress = 0;
@@ -158,24 +208,35 @@ class PrinterStatusReducer {
         state_.remainingSeconds = patch.remainingSeconds;
       if (patch.present & PRINTER_PATCH_JOB_NAME)
         copyText(state_.jobName, patch.jobName);
-      if (patch.present & PRINTER_PATCH_STAGE)
+      if (patch.present & PRINTER_PATCH_STAGE && !collapseFinishedReentry &&
+          !collapseTerminalFailureReentry)
         copyText(state_.stage, patch.stage);
-      if (patch.present & PRINTER_PATCH_DETAIL)
+      if (patch.present & PRINTER_PATCH_DETAIL && !collapseFinishedReentry &&
+          !collapseTerminalFailureReentry)
         copyText(state_.detail, patch.detail);
+      if (collapseFinishedReentry || collapseTerminalFailureReentry) {
+        copyText(state_.stage, "idle");
+        copyText(state_.detail, "idle");
+      }
     }
   }
 
   void advance(uint32_t nowMs) {
-    if (!finishedGraceActive_ || state_.lifecycle != PRINTER_FINISHED ||
-        static_cast<uint32_t>(nowMs - finishedSinceMs_) < kFinishedGraceMs) {
-      return;
+    if (finishedGraceActive_ && state_.lifecycle == PRINTER_FINISHED &&
+        static_cast<uint32_t>(nowMs - finishedSinceMs_) >= kFinishedGraceMs) {
+      demoteAnnouncementToIdle();
+      finishedGraceActive_ = false;
+      // The finish is announced: later FINISHED reports describe the same
+      // job and must collapse back to idle (see apply()).
+      finishedAnnounced_ = true;
     }
-    state_.lifecycle = PRINTER_IDLE;
-    state_.visibleLifecycle = PRINTER_UNKNOWN;
-    state_.progress = 0;
-    copyText(state_.stage, "idle");
-    copyText(state_.detail, "idle");
-    finishedGraceActive_ = false;
+    if (terminalFailureGraceActive_ && state_.lifecycle == PRINTER_ERROR &&
+        static_cast<uint32_t>(nowMs - terminalFailureSinceMs_) >=
+            kTerminalFailureGraceMs) {
+      demoteAnnouncementToIdle();
+      terminalFailureGraceActive_ = false;
+      terminalFailureAnnounced_ = true;
+    }
   }
 
   void markUnavailable(bool transportConnected, PrinterLifecycle lifecycle,
@@ -212,10 +273,26 @@ class PrinterStatusReducer {
     state_.jobName[0] = '\0';
     state_.stage[0] = '\0';
     finishedGraceActive_ = false;
+    finishedAnnounced_ = false;
     finishedSinceMs_ = 0;
+    terminalFailureGraceActive_ = false;
+    terminalFailureAnnounced_ = false;
+    terminalFailureSinceMs_ = 0;
+  }
+
+  void demoteAnnouncementToIdle() {
+    state_.lifecycle = PRINTER_IDLE;
+    state_.visibleLifecycle = PRINTER_UNKNOWN;
+    state_.progress = 0;
+    copyText(state_.stage, "idle");
+    copyText(state_.detail, "idle");
   }
 
   PrinterStateSnapshot state_;
   bool finishedGraceActive_ = false;
+  bool finishedAnnounced_ = false;
   uint32_t finishedSinceMs_ = 0;
+  bool terminalFailureGraceActive_ = false;
+  bool terminalFailureAnnounced_ = false;
+  uint32_t terminalFailureSinceMs_ = 0;
 };

@@ -6,6 +6,13 @@ HTTP relay over Bambu MQTT for the ESP32 matrix firmware. Two modes:
 - `LAN MQTT`: убирает зависимость от Cloud token, но требует `LAN only` и
   отключает облачные функции принтера
 
+> **Статус с firmware `4.4.0` (2026-09-03):** direct Cloud в прошивке — источник
+> по умолчанию. Relay сохраняется как аварийный fallback и путь отката минимум
+> один стабильный release (WebUI `Принтер → Источник статуса → Relay`, без
+> перезагрузки; плюс OTA boot-rollback). Deployment, конфигурация, token
+> rotation и тесты ниже остаются актуальными. Удаление relay-кода — отдельное
+> решение после переходного окна.
+
 ## Files
 
 - `relay.py`: production relay

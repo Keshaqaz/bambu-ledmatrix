@@ -57,7 +57,7 @@ def retry_runtime(description: str, func, attempts: int = 24, delay: int = 5):
     for attempt in range(1, attempts + 1):
         try:
             return func()
-        except RuntimeError as exc:
+        except (RuntimeError, OSError) as exc:
             last_exc = exc
             print(f"[relay] {description} failed attempt {attempt}/{attempts}: {exc}")
             if attempt == attempts:
@@ -111,15 +111,16 @@ def resolve_serial(explicit_serial: str, cloud_token: str) -> str:
 
 
 def map_lifecycle(gcode_state: str, has_error: bool) -> str:
-    if has_error:
-        return "error"
+    # Ошибка = принтер сам остановился (FAILED или PAUSE с hms/print_error).
+    # Информационные hms/print_error при RUNNING/IDLE/FINISH игнорируются —
+    # паритет с прошивкой (bambuLifecycleFromReport).
     state = (gcode_state or "").upper()
     if state == "RUNNING":
         return "printing"
     if state == "PREPARE":
         return "preparing"
     if state in ("PAUSE", "PAUSED"):
-        return "paused"
+        return "error" if has_error else "paused"
     if state == "FINISH":
         return "finished"
     if state == "IDLE":

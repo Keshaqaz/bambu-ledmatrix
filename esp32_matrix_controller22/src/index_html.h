@@ -187,13 +187,13 @@ details .dbody{padding:2px 13px 13px}
       <label class="tog" title="Авто день/ночь"><input type="checkbox" id="autoBr" onchange="onAutoBr()"><span></span></label>
     </div>
     <div id="brManual">
-      <div class="sl"><input type="range" id="br" min="1" max="255" value="80" oninput="slv(this)"><span class="val">80</span></div>
+      <div class="sl"><input type="range" id="br" min="1" max="255" value="80" style="--p:31.10236%" oninput="slv(this)"><span class="val">80</span></div>
     </div>
     <div id="brAuto" class="hide">
       <div class="field"><label>День</label>
-        <div class="sl"><input type="range" id="brDay" min="1" max="255" value="80" oninput="slv(this)"><span class="val">80</span></div></div>
+        <div class="sl"><input type="range" id="brDay" min="1" max="255" value="80" style="--p:31.10236%" oninput="slv(this)"><span class="val">80</span></div></div>
       <div class="field"><label>Ночь</label>
-        <div class="sl"><input type="range" id="brNight" min="1" max="255" value="20" oninput="slv(this)"><span class="val">20</span></div></div>
+        <div class="sl"><input type="range" id="brNight" min="1" max="255" value="20" style="--p:7.48031%" oninput="slv(this)"><span class="val">20</span></div></div>
       <div class="field"><label>Переключение</label>
         <div class="seg mini">
           <button class="on" id="sunByClock" onclick="setSunMode(false)">По часам</button>
@@ -319,7 +319,7 @@ details .dbody{padding:2px 13px 13px}
       <div class="field"><label>Долгота</label><input type="number" id="owmLon" step="0.0001"></div>
     </div>
     <div class="field"><label>Интервал обновления (мин)</label>
-      <div class="sl"><input type="range" id="updateMin" min="1" max="60" value="10" oninput="slv(this)"><span class="val">10</span></div></div>
+      <div class="sl"><input type="range" id="updateMin" min="1" max="60" value="10" style="--p:15.25424%" oninput="slv(this)"><span class="val">10</span></div></div>
   </div>
 </div>
 
@@ -369,8 +369,8 @@ details .dbody{padding:2px 13px 13px}
 
   <div class="card" id="bambuCfg">
     <div class="ch"><h2>Источник статуса</h2></div>
-    <div class="field"><label>Renderer source</label><select id="bambuSource" onchange="requestAutoSave(0)"><option value="relay">Relay</option><option value="cloud_direct">Direct Cloud</option></select></div>
-    <div class="note" style="margin-bottom:11px">Переключение применяется сразу. Relay продолжает опрашиваться для shadow comparison и ручного rollback.</div>
+    <div class="field"><label>Renderer source</label><select id="bambuSource" onchange="requestAutoSave(0)"><option value="cloud_direct">Direct Cloud</option><option value="relay">Relay</option></select></div>
+    <div class="note" style="margin-bottom:11px">Direct Cloud — источник по умолчанию. Переключение применяется сразу; Relay остаётся аварийным fallback и путём отката (минимум один стабильный релиз) и продолжает опрашиваться для сравнения.</div>
     <div class="field"><label>Relay URL</label><input type="text" id="bambuRelayUrl" placeholder="http://192.168.1.1:8787/status"></div>
     <div class="field"><label>Relay Key</label>
       <div class="pass"><input type="password" id="bambuRelayKey" data-clear="false" placeholder="Новый ключ (необязательно)" oninput="secretEdited('bambuRelayKey','rkeyState')"><span class="eye" onclick="eye('bambuRelayKey')">👁</span></div>
@@ -417,18 +417,12 @@ details .dbody{padding:2px 13px 13px}
 
   <div class="card">
     <div class="ch"><h2>Обновление прошивки</h2></div>
-    <div class="note" style="margin-bottom:10px">Security level 0: пароль не требуется. Устанавливаются только образы с корректной ECDSA-подписью.</div>
+    <div class="note" style="margin-bottom:10px">Security level 0: пароль не требуется, образ принимается без подписи.</div>
     <label class="drop" id="drop">
       <input type="file" accept=".bin" id="fwFile" onchange="fwPick(this)">
       <span class="dico">⬆</span>
       <span class="dt" id="dropT">Выберите или перетащите .bin</span>
-      <span class="dh">esp32_matrix_controller22.ino.bin · min_spiffs · только подписанный образ</span>
-    </label>
-    <label class="drop" style="margin-top:8px">
-      <input type="file" accept=".sig" id="fwSig" onchange="fwPick(this)">
-      <span class="dico">✍</span>
-      <span class="dt" id="sigT">Выберите подпись .sig</span>
-      <span class="dh">Создаётся tools/sign_ota.sh тем же ключом, который встроен в прошивку</span>
+      <span class="dh">esp32_matrix_controller22.ino.bin · min_spiffs</span>
     </label>
     <div class="hide" id="fwProg" style="margin-top:10px">
       <div class="pbar"><i id="fwBar" style="width:0%;background:linear-gradient(90deg,#b06a18,var(--accent))"></i></div>
@@ -470,9 +464,9 @@ let hydrating=false,autosaveReady=false,autosaveTimer=0,autosavePending=false,au
 let appStarted=false;
 
 /* ── preview mode: моки для file:// ── */
-let mockConnResult=0,mockBambuAuth={state:'signed_out',operationId:'',operationExpiresIn:0,error:'',configured:false,candidatePending:false,printers:[]},mockSettings={brightness:80,autoColor:true,use24h:true,ntpServer:'pool.ntp.org',tzOffset:3,tzFromWeather:true,updateMin:10,weatherProvider:0,apiKeySet:true,city:'Moscow',owmLat:55.7558,owmLon:37.6173,owmUseCoords:false,rotation:0,flipH:false,flipV:false,autoBrightness:false,brightnessDay:80,brightnessNight:20,dayStartHour:7,nightStartHour:22,autoBrSunMode:false,ct6ClockX:0,ct6ClockY:2,ct6TempX:-1,ct6TempY:9,ct6ClockR:255,ct6ClockG:128,ct6ClockB:0,ct6TempR:0,ct6TempG:200,ct6TempB:255,bambuEnabled:true,bambuSource:'relay',bambuRelayUrl:'http://192.168.1.1:8787/status',bambuRelayKeySet:true,bambuConnected:true,bambuPrinterOnline:true,bambuLifecycle:3,bambuProgress:42,bambuDetail:'Preview: печать 42%',sunTimeValid:true,sunriseH:6,sunriseM:12,sunsetH:20,sunsetM:4};
+let mockConnResult=0,mockBambuAuth={state:'signed_out',operationId:'',operationExpiresIn:0,error:'',configured:false,candidatePending:false,printers:[]},mockSettings={brightness:80,autoColor:true,use24h:true,ntpServer:'pool.ntp.org',tzOffset:3,tzFromWeather:true,updateMin:10,weatherProvider:0,apiKeySet:true,city:'Moscow',owmLat:55.7558,owmLon:37.6173,owmUseCoords:false,rotation:0,flipH:false,flipV:false,autoBrightness:false,brightnessDay:80,brightnessNight:20,dayStartHour:7,nightStartHour:22,autoBrSunMode:false,ct6ClockX:0,ct6ClockY:2,ct6TempX:-1,ct6TempY:9,ct6ClockR:255,ct6ClockG:128,ct6ClockB:0,ct6TempR:0,ct6TempG:200,ct6TempB:255,bambuEnabled:true,bambuSource:'cloud_direct',bambuRelayUrl:'http://192.168.1.1:8787/status',bambuRelayKeySet:true,bambuConnected:true,bambuPrinterOnline:true,bambuLifecycle:3,bambuProgress:42,bambuDetail:'Preview: печать 42%',sunTimeValid:true,sunriseH:6,sunriseM:12,sunsetH:20,sunsetM:4};
 function mockJson(payload,status=200){return new Response(JSON.stringify(payload),{status,headers:{'Content-Type':'application/json'}});}
-function mockStatus(){return {wifi:true,ap:false,ssid:'Home WiFi',ip:'192.168.1.65',temp:23.4,cpuTemp:41.2,uptime:'3ч 14м',heap:'214 KB',heapInternalMinimum:128000,heapInternalLargest:92000,taskStackFree:{loop:6200,weather:4100,printer:3600,wifi:0},fwVersion:'preview',fwPartition:'app0',localSecurityLevel:0,otaPasswordRequired:false,otaSignatureRequired:true,rssi:'-58 dBm',weatherSource:'owm',weatherError:'',weatherAgeSec:240,connResult:mockConnResult,connIp:mockConnResult===2?'192.168.1.88':'',connStatus:0,connStatusText:'',savePending:false,saveError:false,bambuEnabled:mockSettings.bambuEnabled,bambuConfigured:true,bambuConnected:true,bambuPrinterOnline:true,bambuLifecycle:3,bambuProgress:42,bambuDetail:mockSettings.bambuDetail,sunTimeValid:true,sunriseH:6,sunriseM:12,sunsetH:20,sunsetM:4};}
+function mockStatus(){return {wifi:true,ap:false,ssid:'Home WiFi',ip:'192.168.1.65',temp:23.4,cpuTemp:41.2,uptime:'3ч 14м',heap:'214 KB',heapInternalMinimum:128000,heapInternalLargest:92000,taskStackFree:{loop:6200,weather:4100,printer:3600,wifi:0},fwVersion:'preview',fwPartition:'app0',localSecurityLevel:0,otaPasswordRequired:false,otaSignatureRequired:false,rssi:'-58 dBm',weatherSource:'owm',weatherError:'',weatherAgeSec:240,connResult:mockConnResult,connIp:mockConnResult===2?'192.168.1.88':'',connStatus:0,connStatusText:'',savePending:false,saveError:false,bambuEnabled:mockSettings.bambuEnabled,bambuConfigured:true,bambuConnected:true,bambuPrinterOnline:true,bambuLifecycle:3,bambuProgress:42,bambuDetail:mockSettings.bambuDetail,sunTimeValid:true,sunriseH:6,sunriseM:12,sunsetH:20,sunsetM:4};}
 async function apiFetch(url,opts={}){const headers=new Headers(opts.headers||{});if(opts.body!==undefined&&!headers.has('Content-Type'))headers.set('Content-Type','application/json');const method=(opts.method||'GET').toUpperCase();
   if(PREVIEW_MODE){
     if(url==='/api/settings'&&method==='GET')return mockJson(mockSettings);
@@ -494,7 +488,8 @@ async function apiFetch(url,opts={}){const headers=new Headers(opts.headers||{})
 
 /* ── базовые утилиты ── */
 function go(p){document.querySelectorAll('.page').forEach(e=>e.classList.toggle('on',e.id==='pg-'+p));
-  document.querySelectorAll('.nbtn').forEach(b=>b.classList.toggle('on',b.dataset.p===p));window.scrollTo({top:0});}
+  document.querySelectorAll('.nbtn').forEach(b=>b.classList.toggle('on',b.dataset.p===p));window.scrollTo({top:0});
+  if(p==='printer'&&appStarted)fetchBambuAuth();}
 function toast(m){const el=g('toastEl');el.textContent=m;el.classList.add('show');
   clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.classList.remove('show'),2400);}
 function eye(id){const e=g(id);e.type=e.type==='password'?'text':'password';}
@@ -626,7 +621,15 @@ function renderBambuAuth(d){
     const list=g('bcPrinterList');list.innerHTML='';
     (d.printers||[]).forEach(p=>{const b=document.createElement('button');b.className='btn2';b.style.marginBottom='7px';b.textContent=(p.name||'Bambu printer')+' · '+(p.serial||'');b.onclick=()=>bambuCloudSelect(p.serial);list.appendChild(b);});
   }}
-async function fetchBambuAuth(){try{const r=await apiFetch('/api/bambu/auth/status');if(r.ok)renderBambuAuth(await r.json());}catch(e){}}
+let bambuAuthTimer=0,bambuAuthRequestInFlight=false;
+const BAMBU_AUTH_TRANSIENT=new Set(['submitting_credentials','fetching_printers','connecting']);
+async function fetchBambuAuth(){
+  if(bambuAuthRequestInFlight||document.hidden||fwBusy)return;
+  bambuAuthRequestInFlight=true;clearTimeout(bambuAuthTimer);bambuAuthTimer=0;
+  try{const r=await apiFetch('/api/bambu/auth/status');if(r.ok){const d=await r.json();renderBambuAuth(d);
+    if(BAMBU_AUTH_TRANSIENT.has(d.state))bambuAuthTimer=setTimeout(fetchBambuAuth,2000);}}
+  catch(e){}
+  finally{bambuAuthRequestInFlight=false;}}
 async function bambuCloudLogin(){
   const email=g('bcEmail').value.trim(),password=g('bcPassword').value,region=g('bcRegion').value;
   if(!email||!password){toast('Введите аккаунт и Bambu-пароль');return;}
@@ -726,12 +729,15 @@ function buildSavePayload(){
   if(!g('tzAuto').checked)p.tzOffset=+g('tzOffset').value;
   return p;}
 
-/* ── статус (поллинг 3 с) ── */
+/* ── статус: только один запрос за раз, пауза 10 с после ответа ── */
 function describeWifiMode(d){if(d.wifi&&d.ap)return 'WiFi + AP';if(d.wifi)return 'WiFi клиент';if(d.ap)return 'Точка доступа';return 'Оффлайн';}
 function rssiLevel(r){return r>-50?4:r>-65?3:r>-75?2:1;}
 function fmtBytes(v){return Number.isFinite(+v)?Math.round(+v/1024)+' KB':'—';}
 const WSRC={'owm':'OpenWeatherMap','open-meteo':'Open-Meteo'};
+let statusRequestInFlight=false;
 async function fetchStatus(){
+  if(statusRequestInFlight)return;
+  statusRequestInFlight=true;
   try{
     const d=await(await apiFetch('/api/status')).json();
     /* шапка */
@@ -761,10 +767,9 @@ async function fetchStatus(){
     g('sunTxt').textContent=d.sunTimeValid?sunFmt(d):'—';
     /* принтер */
     updPrinter(d);
-    fetchBambuAuth();
     /* система */
     if(d.fwVersion)g('sFw').textContent=d.fwVersion+' · '+(d.fwPartition||'?');
-    g('sSecurity').textContent=d.localSecurityLevel===0&&!d.otaPasswordRequired&&d.otaSignatureRequired?'Level 0 · без пароля · signed OTA':'—';
+    g('sSecurity').textContent=d.localSecurityLevel===0&&!d.otaPasswordRequired?'Level 0 · без пароля · без подписи':'—';
     g('sUp').textContent=d.uptime||'—';
     g('sHeap').textContent=d.heap||'—';
     g('sHeapMin').textContent=fmtBytes(d.heapInternalMinimum);
@@ -786,7 +791,9 @@ async function fetchStatus(){
       else if(d.connResult===3){const reasons={4:'ошибка подключения',5:'соединение потеряно',6:'соединение разорвано',1:'сеть не найдена'};
         const reason=d.connStatusText||reasons[d.connStatus]||('Ошибка, код: '+d.connStatus);
         res.innerHTML='<div class="conn-fail">❌ '+escapeHtml(reason)+'</div>';}}
-  }catch(e){console.error('status fetch failed',e);}}
+  }catch(e){console.error('status fetch failed',e);}
+  finally{statusRequestInFlight=false;}
+}
 
 /* ── WiFi ── */
 function setConnBusy(b){connBusy=b;g('connBtn').disabled=b||scanBusy;g('scanBtn').disabled=b||scanBusy;
@@ -830,14 +837,12 @@ async function rebootDevice(){if(!confirm('Перезагрузить устро
 let fwBusy=false;
 function fwMsg(t,color){const el=g('fwResult');el.textContent=t;el.style.color=color||'';}
 function fwPick(inp){const f=inp.files[0];if(!f)return;
-  if(inp.id==='fwFile')g('dropT').textContent=f.name+' · '+Math.round(f.size/1024)+' КБ';else g('sigT').textContent=f.name+' · '+f.size+' байт';
-  g('fwBtn').disabled=!(g('fwFile').files[0]&&g('fwSig').files[0]);}
+  g('dropT').textContent=f.name+' · '+Math.round(f.size/1024)+' КБ';
+  g('fwBtn').disabled=!g('fwFile').files[0];}
 async function uploadFirmware(){
   if(fwBusy)return;
   const f=g('fwFile').files[0];
-  const sigFile=g('fwSig').files[0];
   if(!f){toast('Выберите .bin файл');return;}
-  if(!sigFile){toast('Выберите подпись .sig');return;}
   if(!/\.bin$/i.test(f.name)){toast('Нужен файл .bin');return;}
   if(/merged/i.test(f.name)){fwMsg('Это merged.bin — загружайте esp32_matrix_controller22.ino.bin','var(--red)');return;}
   if(!confirm('Прошить устройство файлом «'+f.name+'» ('+Math.round(f.size/1024)+' КБ)? Во время загрузки не отключайте питание.'))return;
@@ -846,16 +851,14 @@ async function uploadFirmware(){
   const bar=g('fwBar'),txt=g('fwPct');
   g('fwProg').classList.remove('hide');bar.style.width='0%';txt.textContent='0%';
   // WebServer однопоточный: на время загрузки прекращаем опрос /api/status
-  clearInterval(statusInterval);statusInterval=0;
+  stopStatusPolling();
   const prevFw=g('sFw').textContent;
-  const finish=ok=>{fwBusy=false;g('fwBtn').disabled=false;if(!statusInterval){fetchStatus();statusInterval=setInterval(fetchStatus,3000);}};
+  const finish=ok=>{fwBusy=false;g('fwBtn').disabled=false;scheduleStatusPoll(0);};
   if(PREVIEW_MODE){let p=0;const t=setInterval(()=>{p=Math.min(100,p+7);bar.style.width=p+'%';txt.textContent=p+'%';
     if(p===100){clearInterval(t);fwMsg('Preview: загрузка смоделирована','var(--green)');finish(false);}},120);return;}
   const fd=new FormData();fd.append('firmware',f,f.name);
   const xhr=new XMLHttpRequest();
   xhr.open('POST','/api/update?size='+f.size);
-  const sigBytes=new Uint8Array(await sigFile.arrayBuffer());
-  xhr.setRequestHeader('X-OTA-Signature',btoa(String.fromCharCode(...sigBytes)));
   xhr.timeout=300000;
   xhr.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded*100/e.total);bar.style.width=p+'%';txt.textContent=p+'%'+(p===100?' — проверка и запись…':'');}};
   xhr.onload=()=>{
@@ -878,11 +881,20 @@ const drop=g('drop');
   if(ev==='drop'&&e.dataTransfer.files[0]){g('fwFile').files=e.dataTransfer.files;fwPick(g('fwFile'));}}));
 
 /* ── init ── */
-let statusInterval=0;
-function startApp(){if(appStarted){fetchStatus();return;}appStarted=true;loadSettings();fetchStatus();statusInterval=setInterval(fetchStatus,3000);}
+const STATUS_POLL_MS=10000;
+let statusTimer=0;
+function stopStatusPolling(){clearTimeout(statusTimer);statusTimer=0;}
+function scheduleStatusPoll(delay=STATUS_POLL_MS){stopStatusPolling();
+  if(document.hidden||fwBusy)return;statusTimer=setTimeout(runStatusPoll,delay);}
+async function runStatusPoll(){
+  if(document.hidden||fwBusy)return;
+  await fetchStatus();scheduleStatusPoll();
+}
+async function startApp(){if(appStarted){scheduleStatusPoll(0);return;}appStarted=true;
+  await loadSettings();await fetchStatus();await fetchBambuAuth();scheduleStatusPoll();}
 startApp();
-document.addEventListener('visibilitychange',()=>{if(fwBusy)return;clearInterval(statusInterval);statusInterval=0;
-  if(!document.hidden){fetchStatus();statusInterval=setInterval(fetchStatus,3000);}});
+document.addEventListener('visibilitychange',()=>{stopStatusPolling();clearTimeout(bambuAuthTimer);bambuAuthTimer=0;
+  if(!document.hidden&&!fwBusy)scheduleStatusPoll(0);});
 window.addEventListener('beforeunload',e=>{if(autosaveRunning||autosavePending||autosaveQueued){e.preventDefault();e.returnValue='Изменения ещё сохраняются';}});
 setInterval(()=>{g('cTime').textContent=fmtTime();},10000);
 </script>

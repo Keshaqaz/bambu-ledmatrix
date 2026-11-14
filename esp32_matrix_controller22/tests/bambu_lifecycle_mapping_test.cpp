@@ -10,7 +10,16 @@ int main() {
   assert(bambuLifecycleFromReport("FINISH", false) == PRINTER_FINISHED);
   assert(bambuLifecycleFromReport("IDLE", false) == PRINTER_IDLE);
   assert(bambuLifecycleFromReport("FAILED", false) == PRINTER_ERROR);
-  assert(bambuLifecycleFromReport("RUNNING", true) == PRINTER_ERROR);
+  // Ошибка = принтер сам остановился. hms/print_error без остановки
+  // (информационные уведомления) не красят матрицу в красное.
+  assert(bambuLifecycleFromReport("RUNNING", true) == PRINTER_PRINTING);
+  assert(bambuLifecycleFromReport("PREPARE", true) == PRINTER_PREPARING);
+  assert(bambuLifecycleFromReport("IDLE", true) == PRINTER_IDLE);
+  assert(bambuLifecycleFromReport("FINISH", true) == PRINTER_FINISHED);
+  assert(bambuLifecycleFromReport("PAUSE", true) == PRINTER_ERROR);
+  assert(bambuLifecycleFromReport("PAUSED", true) == PRINTER_ERROR);
+  assert(bambuLifecycleFromReport("PAUSE", false) == PRINTER_PAUSED);
+  assert(bambuLifecycleFromReport("", true) == PRINTER_UNKNOWN);
   assert(bambuLifecycleFromReport("new_future_state", false) == PRINTER_UNKNOWN);
 
   PrinterStatusReducer reducer;

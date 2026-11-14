@@ -23,12 +23,12 @@ static PrinterStateSnapshot representativeSnapshot() {
   return value;
 }
 
-static void test_local_ota_policy_is_open_but_signed() {
+static void test_local_ota_policy_is_open_and_unsigned() {
   static_assert(LOCAL_SECURITY_LEVEL == 0, "local WebUI/API must stay open");
   static_assert(!OTA_PASSWORD_REQUIRED, "OTA must not require a user password");
-  static_assert(OTA_SIGNATURE_REQUIRED, "unsigned OTA must remain forbidden");
+  static_assert(!OTA_SIGNATURE_REQUIRED, "owner decision: OTA accepts unsigned images");
+  assert(authorizeLocalOtaUpload(false));
   assert(authorizeLocalOtaUpload(true));
-  assert(!authorizeLocalOtaUpload(false));
 }
 
 static void test_ota_blocks_new_tls_owners() {
@@ -114,7 +114,7 @@ static void test_source_mode_contract() {
 }
 
 int main() {
-  test_local_ota_policy_is_open_but_signed();
+  test_local_ota_policy_is_open_and_unsigned();
   test_ota_blocks_new_tls_owners();
   test_recovery_is_bounded_and_wrap_safe();
   test_shadow_compares_every_normalized_field_without_storing_values();

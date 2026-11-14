@@ -46,16 +46,21 @@ source: ../adr/0001-optimize-esp32-c3-and-move-bambu-cloud-on-device.md
 | T05 | Доказать устойчивость C3 и провести shadow/canary | T04 и AT06 |
 | T06 | Сделать direct Cloud автономным production-default | T05 |
 
-## Фактический статус на 2026-09-01
+## Фактический статус на 2026-09-03
 
 | Этап | Статус | Доказательство/блокер |
 |---|---|---|
 | T01 | Реализован | `c040b56`; production baseline, signed OTA и diagnostics находятся в firmware |
 | T02 | Реализован | `e46595d`, `0f89d38`, `081d880`; единый snapshot seam используется production code |
 | T03 | Завершён | browser callback исключён; принят on-device email/password flow |
-| T04 | Локальная реализация готова, real acceptance заблокирован | `dfe1708`, `47b1590`, `4091552`; ESP login получает `cloudflare_blocked` до Bambu JSON |
-| T05 | Local hardening и первый C3 device gate готовы; canary/soak не начаты | `554a1b7`, `85a6b2a`; auth transport должен пройти AT01–AT06 |
-| T06 | Не начат | Требует полного T05 canary и 72-hour soak |
+| T04 | Завершён | AT06 `PASS`; live direct login, refresh, MQTT verified 2026-09-02/03 |
+| T05 | Canary выполнен; soak-вердикт передан в техдолг решением владельца 2026-09-03 | Source switching + API-failure resilience verified live; on-device soak journal (`/api/soak`, 4.3.13). Открытые пункты: Finding A, ранний boot-crash (DNS race, root cause найден), recalibration `heapInternalMinimum` gate, 2× `int_wdt` в soak-окне |
+| T06 | Выполнен, `4.4.0-2026.09.03` deployed (USB) 2026-09-03 | `cloud_direct` — default для новых и мигрированных установок (одноразовая NVS-миграция `bsrcmig`); relay-код/runbook сохранены как fallback; smoke пройден; см. раздел T06 |
+
+Решение владельца 2026-09-03: 72-часовой soak-вердикт не блокирует перевод
+`cloud_direct` в production-default и уходит в техдолг вместе с расследованием
+`int_wdt`-сбросов и калибровкой heap-gate (журнал продолжает копиться на
+устройстве; вердикт читается `GET /api/soak`).
 
 Подготовленный image `4.3.3-2026.09.01` имеет linked size `1 385 857` байт
 (`1 386 000` байт экспортированный image). После boot guard измерены minimum
@@ -243,3 +248,36 @@ Transport spikes не добавляют новых сценариев к T05 и
 ### Заблокирован
 
 T05 — production default меняется только после успешного shadow, canary и C3/S3 decision.
+
+### Запись о выполнении (2026-09-03, `4.4.0-2026.09.03`)
+
+- `cloud_direct` — default: статический default изменён, NVS-ключ `bsource`
+  при отсутствии читается как `cloud_direct`, одноразовая NVS-миграция
+  (`bsrcmig` marker) переводит на `cloud_direct` существующие и свежие
+  установки; marker исключает повторный перехват явного relay-выбора после
+  ручного rollback. Пока direct-сессия не готова, effective source остаётся
+  relay (`effectivePrinterSourceMode`) — это документированный transitional
+  fallback, а не скрытая зависимость: relay остаётся аварийным возвратом
+  минимум один стабильный release по ADR 0001.
+- Relay-код, deployment, runbook и тесты не изменены и сохранены.
+- Документация синхронизирована: firmware README (onboarding/миграция/диагностика/
+  rollback), корневой README, relay README, CLAUDE.md.
+- Отложено в техдолг решением владельца 2026-09-03: 72-часовой soak-вердикт
+  (журнал продолжается на устройстве), расследование 2× `int_wdt` в soak-окне,
+  recalibration `heapInternalMinimum ≥ 50 KB` (TLS low-water легитимно уводит
+  минимум ниже gate), Finding A (finished↔idle flap direct-пути).
+- Деплой и smoke 2026-09-03 (вечер): владелец разрешил signed WebUI OTA; три
+  попытки оборвались одинаково на 131 072 байтах / ~20 с (HTTP 000,
+  детерминированный дефект приёмного тракта; до записи flash ни одна не дошла,
+  оба слота остались валидными, boot-guard ping-pong app0↔app1 всегда
+  приземлялся на рабочий образ). Активация выполнена USB-flash по подключении
+  кабеля владельцем: app0 = 4.4.0 (esptool hash verified), otadata сброшен
+  upload-рецептом на app0, app1 = 4.3.11 как boot-guard fallback.
+- Финальный smoke 4.4.0 (live): `fwVersion 4.4.0-2026.09.03`/`app0`; migration
+  применена — `source=cloud_direct`, `effectiveSource=cloud_direct`, direct
+  `ready`, MQTT connected, first report; cold boot автономен (без relay).
+  Security level 0: `localSecurityLevel=0`, OTA без пароля, подпись обязательна.
+  Ресурсы: min heap 53 024 (boot-window) ≥ 50 KB, largest block 61 428 ≥ 32 KB,
+  task reserves loop 2720 / weather 17240 / printer 7152 / mqtt 3136 — все
+  ≥ 2 KB. Soak-журнал возобновлён (`fwMinor=4`), int_wdt-серия OTA-инцидента
+  сохранена в boot ring. Weather OK (owm 200), relay-конфиг fallback цел.

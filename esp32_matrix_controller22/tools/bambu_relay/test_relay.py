@@ -1,8 +1,32 @@
 #!/usr/bin/env python3
+import socket
 import time
 import unittest
+from unittest import mock
 
 import relay
+
+
+class RetryRuntimeTest(unittest.TestCase):
+    @mock.patch("relay.time.sleep")
+    def test_retries_transient_dns_failure(self, sleep):
+        attempts = iter([
+            socket.gaierror(-3, "Try again"),
+            socket.gaierror(-3, "Try again"),
+            "connected",
+        ])
+
+        def connect():
+            result = next(attempts)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        self.assertEqual(
+            relay.retry_runtime("mqtt_connect", connect, attempts=3, delay=2),
+            "connected",
+        )
+        self.assertEqual(sleep.call_count, 2)
 
 
 class RelayStateTest(unittest.TestCase):
@@ -12,7 +36,13 @@ class RelayStateTest(unittest.TestCase):
         self.assertEqual(relay.map_lifecycle("PAUSE", False), "paused")
         self.assertEqual(relay.map_lifecycle("FINISH", False), "finished")
         self.assertEqual(relay.map_lifecycle("IDLE", False), "idle")
-        self.assertEqual(relay.map_lifecycle("RUNNING", True), "error")
+        # Ошибка = принтер сам остановился; уведомления hms/print_error
+        # без остановки не дают красную полосу.
+        self.assertEqual(relay.map_lifecycle("RUNNING", True), "printing")
+        self.assertEqual(relay.map_lifecycle("IDLE", True), "idle")
+        self.assertEqual(relay.map_lifecycle("FINISH", True), "finished")
+        self.assertEqual(relay.map_lifecycle("PAUSE", True), "error")
+        self.assertEqual(relay.map_lifecycle("FAILED", False), "error")
 
     def test_partial_packet_does_not_wipe_state(self):
         st = relay.RelayState("SERIAL", "test")

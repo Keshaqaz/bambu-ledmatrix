@@ -47,7 +47,7 @@ int main() {
       "{\"print\":{\"gcode_state\":\"RUNNING\","
       "\"stage\":{\"_id\":10,\"name\":\"first layer check\"},"
       "\"hms\":[{\"attr\":123}]}}" );
-  assert(errorPatch.lifecycle == PRINTER_ERROR);
+  assert(errorPatch.lifecycle == PRINTER_PRINTING);
   assert(strcmp(errorPatch.stage, "first layer check") == 0);
 
   PrinterStatePatch relayCorpus = parseOneByteFragments(
@@ -63,6 +63,53 @@ int main() {
       "{\"print\":{\"gcode_state\":\"FINISH\",\"mc_percent\":1}}");
   assert(finished.lifecycle == PRINTER_FINISHED);
   assert(finished.progress == 100);
+
+  // Живой репорт 2026-09-04 (push_status простаивающего принтера со старым
+  // FAILED): subtask_name непустой, затем gcode_file="" — пустой gcode_file
+  // не должен затирать имя работы (relay-паритет: gcode_file — fallback).
+  PrinterStatePatch staleFailed = parseOneByteFragments(
+      "{\"print\":{\"gcode_state\":\"FAILED\",\"mc_percent\":0,"
+      "\"mc_remaining_time\":59,\"subtask_name\":\"0.2mm layer\","
+      "\"gcode_file\":\"\",\"stg_cur\":255,\"total_layer_num\":45}}");
+  assert(staleFailed.lifecycle == PRINTER_ERROR);
+  assert(staleFailed.terminalFailure);
+  assert(staleFailed.progress == 0);
+  assert((staleFailed.present & PRINTER_PATCH_JOB_NAME) != 0);
+  assert(strcmp(staleFailed.jobName, "0.2mm layer") == 0);
+  assert(staleFailed.totalLayers == 45);
+  assert(staleFailed.remainingSeconds == 3540);
+  // Уведомление hms во время печати — не ошибка (принтер печатает дальше).
+  PrinterStatePatch hmsNotice = parseOneByteFragments(
+      "{\"print\":{\"gcode_state\":\"RUNNING\",\"hms\":[{\"attr\":123}]}}" );
+  assert(hmsNotice.lifecycle == PRINTER_PRINTING);
+  PrinterStatePatch idleNotice = parseOneByteFragments(
+      "{\"print\":{\"gcode_state\":\"IDLE\",\"print_error\":50348044,"
+      "\"hms\":[{\"attr\":50331904,\"code\":262151}]}}" );
+  assert(idleNotice.lifecycle == PRINTER_IDLE);
+  // Дельта только с hms (без gcode_state) не задаёт lifecycle.
+  PrinterStatePatch hmsOnly = parseOneByteFragments(
+      "{\"print\":{\"hms\":[{\"attr\":123,\"code\":65537}]}}" );
+  assert((hmsOnly.present & PRINTER_PATCH_LIFECYCLE) == 0);
+  // Принтер встал на паузу из-за ошибки — это ошибка.
+  PrinterStatePatch activeAlarm = parseOneByteFragments(
+      "{\"print\":{\"gcode_state\":\"PAUSE\",\"print_error\":117473287}}" );
+  assert(activeAlarm.lifecycle == PRINTER_ERROR);
+  assert(!activeAlarm.terminalFailure);
+  PrinterStatePatch hmsPause = parseOneByteFragments(
+      "{\"print\":{\"gcode_state\":\"PAUSE\",\"hms\":[{\"attr\":1}]}}" );
+  assert(hmsPause.lifecycle == PRINTER_ERROR);
+  PrinterStatePatch userPause = parseOneByteFragments(
+      "{\"print\":{\"gcode_state\":\"PAUSE\",\"print_error\":0,\"hms\":[]}}" );
+  assert(userPause.lifecycle == PRINTER_PAUSED);
+  // gcode_file используется только когда subtask_name не дал имени.
+  PrinterStatePatch fileOnly = parseOneByteFragments(
+      "{\"print\":{\"gcode_state\":\"IDLE\",\"gcode_file\":\"job.gcode\"}}");
+  assert(strcmp(fileOnly.jobName, "job.gcode") == 0);
+  // Оба пустые — патч не несёт имени и не затирает прежнее.
+  PrinterStatePatch bothEmpty = parseOneByteFragments(
+      "{\"print\":{\"gcode_state\":\"IDLE\",\"subtask_name\":\"\","
+      "\"gcode_file\":\"\"}}");
+  assert((bothEmpty.present & PRINTER_PATCH_JOB_NAME) == 0);
 
   PrinterStatePatch unknownArrays = parseOneByteFragments(
       "{\"print\":{\"gcode_state\":\"RUNNING\"},"

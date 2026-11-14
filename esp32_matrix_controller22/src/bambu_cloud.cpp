@@ -1,5 +1,9 @@
 #include "bambu_cloud.hpp"
 
+#include <WiFi.h>
+#include "mqtt_dns_gate.hpp"
+#include "mqtt_pause_policy.hpp"
+
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
@@ -1668,12 +1672,36 @@ class SemaphoreGuard {
 
 }  // namespace
 
+namespace {
+const char* kFinishAnnouncementNamespace = "bambufin";
+const char* kTerminalFailureAnnouncementNamespace = "bambufail";
+const char* kFinishAnnouncementKey = "ann";
+
+void persistAnnouncementRecord(const char* nameSpace, const char* jobKey) {
+  Preferences prefs;
+  if (!prefs.begin(nameSpace, false)) return;
+  FinishAnnouncementRecord record;
+  record.version = kFinishAnnouncementRecordVersion;
+  strlcpy(record.jobKey, jobKey, sizeof(record.jobKey));
+  prefs.putBytes(kFinishAnnouncementKey, &record, sizeof(record));
+  prefs.end();
+}
+
+void removeAnnouncementRecord(const char* nameSpace) {
+  Preferences prefs;
+  if (!prefs.begin(nameSpace, false)) return;
+  prefs.remove(kFinishAnnouncementKey);
+  prefs.end();
+}
+}  // namespace
+
 DirectCloudSource::DirectCloudSource() {
   reducer_.configure(true, false, "Direct Cloud не настроен");
 }
 
 PrinterStateSnapshot DirectCloudSource::snapshot() const {
   portENTER_CRITICAL(&mux_);
+  reducer_.advance(millis());
   PrinterStateSnapshot copy = reducer_.snapshot();
   portEXIT_CRITICAL(&mux_);
   return copy;
@@ -1720,9 +1748,76 @@ bool DirectCloudSource::acceptFragment(const char* data, size_t length,
     rejectedReports_++;
     return false;
   }
+  char jobKey[96];
+  finishJobKey(patch.present & PRINTER_PATCH_JOB_NAME ? patch.jobName : "",
+               jobKey, sizeof(jobKey));
+  const bool finishedPatch =
+      (patch.present & PRINTER_PATCH_LIFECYCLE) != 0 &&
+      patch.lifecycle == PRINTER_FINISHED;
+  const bool terminalFailurePatch =
+      (patch.present & PRINTER_PATCH_LIFECYCLE) != 0 &&
+      patch.lifecycle == PRINTER_ERROR && patch.terminalFailure;
+  const bool activityPatch =
+      (patch.present & PRINTER_PATCH_LIFECYCLE) != 0 &&
+      (patch.lifecycle == PRINTER_PREPARING ||
+       patch.lifecycle == PRINTER_PRINTING ||
+       patch.lifecycle == PRINTER_PAUSED ||
+       (patch.lifecycle == PRINTER_ERROR && !patch.terminalFailure));
+  bool persistAnnouncement = false;
+  bool persistTerminalFailureAnnouncement = false;
+  bool clearAnnouncement = false;
+  bool clearTerminalFailureAnnouncement = false;
   portENTER_CRITICAL(&mux_);
+  if (finishedPatch && !reducer_.finishedGraceActive() &&
+      !reducer_.finishedAnnounced()) {
+    // Первый FINISH этой сессии: если финиш той же работы уже объявляли
+    // до перезагрузки (NVS-запись), повторный «свежий финиш» не показываем.
+    if (shouldAnnounceBootFinished(finishRecord_, jobKey)) {
+      persistAnnouncement = true;
+    } else {
+      reducer_.suppressFinishedAnnouncement();
+    }
+  }
+  if (terminalFailurePatch && !reducer_.terminalFailureGraceActive() &&
+      !reducer_.terminalFailureAnnounced()) {
+    if (shouldAnnounceBootFinished(terminalFailureRecord_, jobKey)) {
+      persistTerminalFailureAnnouncement = true;
+    } else {
+      reducer_.suppressTerminalFailureAnnouncement();
+    }
+  }
+  if (activityPatch && finishAnnouncementRecordValid(finishRecord_))
+    clearAnnouncement = true;
+  if (activityPatch &&
+      finishAnnouncementRecordValid(terminalFailureRecord_))
+    clearTerminalFailureAnnouncement = true;
   reducer_.apply(patch, nowMs);
   portEXIT_CRITICAL(&mux_);
+  // NVS-операции — вне критической секции (flash-запись блокирующая).
+  if (persistAnnouncement) {
+    persistAnnouncementRecord(kFinishAnnouncementNamespace, jobKey);
+    portENTER_CRITICAL(&mux_);
+    finishRecord_ = FinishAnnouncementRecord();
+    finishRecord_.version = kFinishAnnouncementRecordVersion;
+    strlcpy(finishRecord_.jobKey, jobKey, sizeof(finishRecord_.jobKey));
+    portEXIT_CRITICAL(&mux_);
+  }
+  if (persistTerminalFailureAnnouncement) {
+    persistAnnouncementRecord(kTerminalFailureAnnouncementNamespace, jobKey);
+    portENTER_CRITICAL(&mux_);
+    terminalFailureRecord_ = FinishAnnouncementRecord();
+    terminalFailureRecord_.version = kFinishAnnouncementRecordVersion;
+    strlcpy(terminalFailureRecord_.jobKey, jobKey,
+            sizeof(terminalFailureRecord_.jobKey));
+    portEXIT_CRITICAL(&mux_);
+  }
+  if (clearAnnouncement) clearFinishAnnouncementRecord();
+  if (clearTerminalFailureAnnouncement) {
+    removeAnnouncementRecord(kTerminalFailureAnnouncementNamespace);
+    portENTER_CRITICAL(&mux_);
+    terminalFailureRecord_ = FinishAnnouncementRecord();
+    portEXIT_CRITICAL(&mux_);
+  }
   firstValidReport_.store(true);
   lastValidReportMs_.store(nowMs);
   staleMarked_.store(false);
@@ -1733,6 +1828,38 @@ void DirectCloudSource::resetValidation() {
   firstValidReport_.store(false);
   lastValidReportMs_.store(0);
   staleMarked_.store(false);
+}
+
+void DirectCloudSource::loadFinishAnnouncementRecord() {
+  const char* namespaces[] = {
+      kFinishAnnouncementNamespace,
+      kTerminalFailureAnnouncementNamespace,
+  };
+  FinishAnnouncementRecord* records[] = {
+      &finishRecord_,
+      &terminalFailureRecord_,
+  };
+  for (uint8_t i = 0; i < 2; ++i) {
+    Preferences prefs;
+    if (!prefs.begin(namespaces[i], true)) continue;
+    if (prefs.getBytesLength(kFinishAnnouncementKey) == sizeof(*records[i])) {
+      FinishAnnouncementRecord loaded;
+      prefs.getBytes(kFinishAnnouncementKey, &loaded, sizeof(loaded));
+      portENTER_CRITICAL(&mux_);
+      *records[i] = loaded;
+      portEXIT_CRITICAL(&mux_);
+    }
+    prefs.end();
+  }
+}
+
+void DirectCloudSource::clearFinishAnnouncementRecord() {
+  removeAnnouncementRecord(kFinishAnnouncementNamespace);
+  removeAnnouncementRecord(kTerminalFailureAnnouncementNamespace);
+  portENTER_CRITICAL(&mux_);
+  finishRecord_ = FinishAnnouncementRecord();
+  terminalFailureRecord_ = FinishAnnouncementRecord();
+  portEXIT_CRITICAL(&mux_);
 }
 
 void DirectCloudSource::service(uint32_t nowMs) {
@@ -1788,6 +1915,7 @@ bool BambuCloud::begin() {
   }
   xSemaphoreGive(mutex_);
   source_.configure(hasActive, hasActive ? "Direct Cloud ждёт MQTT" : "Direct Cloud не настроен");
+  source_.loadFinishAnnouncementRecord();
   bambuSecureZero(&active, sizeof(active));
   initialized_ = true;
   return true;
@@ -2054,9 +2182,32 @@ void BambuCloud::fail(const char* reason) {
   xSemaphoreGive(mutex_);
 }
 
-void BambuCloud::service(bool wifiAvailable, bool otaActive) {
+void BambuCloud::service(bool enabled, bool wifiAvailable, bool otaActive) {
   if (!initialized_) return;
+  // Тумблер bambuEnabled — мастер-выключатель интеграции: при выключении
+  // останавливаем транспорт и фоновые операции ровно один раз, в тихом
+  // режиме никакой Cloud-активности (MQTT/TLS/auto-refresh) не ведём.
+  const DirectCloudServiceMode serviceMode = serviceGate_.decide(enabled);
+  if (serviceMode == DirectCloudServiceMode::kTeardown) {
+    SemaphoreGuard teardown(operationMutex_);
+    stopMqtt();
+    source_.resetValidation();
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    if (request_.action != ACTION_NONE) clearPendingRequest();
+    if (operationDeadlineMs_ != 0 &&
+        status_.phase != BAMBU_AUTH_SIGNED_OUT &&
+        status_.phase != BAMBU_AUTH_READY) {
+      // Незавершённая операция входа прерывается выключением тумблера.
+      clearPendingAuth();
+      operationDeadlineMs_ = 0;
+      status_.phase = BAMBU_AUTH_RECOVERABLE_ERROR;
+      status_.operationId[0] = '\0';
+      strlcpy(status_.error, "bambu_disabled", sizeof(status_.error));
+    }
+    xSemaphoreGive(mutex_);
+  }
   source_.service(millis());
+  if (serviceMode != DirectCloudServiceMode::kActive) return;
   SemaphoreGuard operation(operationMutex_);
 
   const bool expired = operationExpired();
@@ -2155,12 +2306,31 @@ void BambuCloud::service(bool wifiAvailable, bool otaActive) {
         bambuSecureZero(&credential, sizeof(credential));
         return;
       }
-      source_.resetValidation();
-      if (!startMqtt(credential)) {
-        if (candidate) candidateTransportFailed_.store(true);
-        else {
-          mqttRecovery_.fail(RECOVERY_MQTT, millis());
-          fail("mqtt_start_retry");
+      // DNS-race gate: esp-tls teardown after an unresolvable broker host
+      // panics on core 3.3.8 (Store access fault / udp_remove TCPIP-lock
+      // assert) when Wi-Fi just came up and the resolver is not usable yet.
+      // WL_CONNECTED is not proof: confirm the resolve first, failures go to
+      // the bounded RECOVERY_DNS backoff instead of crash-reboot roulette.
+      char brokerHost[32];
+      snprintf(brokerHost, sizeof(brokerHost), "%s.mqtt.bambulab.com",
+               credential.chinaRegion ? "cn" : "us");
+      IPAddress brokerAddress;
+      const bool brokerResolved = WiFi.hostByName(brokerHost, brokerAddress) == 1;
+      if (mqttConnectGate(wifiAvailable, brokerResolved) ==
+          MqttConnectGate::kAwaitDns) {
+        mqttRecovery_.fail(RECOVERY_DNS, millis());
+        Serial.printf("[Bambu] DNS gate: %s не разрешается, повтор через %u мс\n",
+                      brokerHost,
+                      (unsigned)BoundedRecoveryBackoff::delayMs(
+                          mqttRecovery_.failures()));
+      } else {
+        source_.resetValidation();
+        if (!startMqtt(credential)) {
+          if (candidate) candidateTransportFailed_.store(true);
+          else {
+            mqttRecovery_.fail(RECOVERY_MQTT, millis());
+            fail("mqtt_start_retry");
+          }
         }
       }
     }
@@ -2562,6 +2732,7 @@ void BambuCloud::processLogout() {
   // (обнаружено в AT06: logout «залипал» в ready при полностью стёртых
   // учётных данных).
   source_.resetValidation();
+  source_.clearFinishAnnouncementRecord();
   bambuSecureZero(&refreshRecovery_, sizeof(refreshRecovery_));
   eraseCredentialNvs();
   clearPendingAuth();
@@ -2630,8 +2801,14 @@ void BambuCloud::stopMqtt() {
   mqttStopping_.store(true);
   if (mqttClient_) {
     esp_mqtt_client_stop(mqttClient_);
+    // Grace: stop() aborts the socket while the client task may still be
+    // unwinding the transport_read error (esp-tls read error ->
+    // mqtt_process_receive -2); destroying immediately faults there
+    // (Store access fault, core 3.3.8). Let the unwind finish first.
+    vTaskDelay(pdMS_TO_TICKS(250));
     esp_mqtt_client_destroy(mqttClient_);
     mqttClient_ = nullptr;
+    mqttConnectedAtMs_.store(0);
   }
   if (mqttLeaseHeld_) {
     coordinator_.release(SECURE_NETWORK_CLOUD_MQTT);
@@ -2660,7 +2837,14 @@ bool BambuCloud::pauseForExternalTls() {
                            printer.visibleLifecycle == PRINTER_PREPARING ||
                            printer.visibleLifecycle == PRINTER_PRINTING ||
                            printer.visibleLifecycle == PRINTER_PAUSED;
-  if (mqttClient_ && activePrint) return false;
+  // Pause guard: stop+destroy on a freshly connected client races the
+  // esp-mqtt task's first-read unwind and faults on core 3.3.8 (warm-boot
+  // crash loop: weather's HTTPS branch paused a seconds-old connection).
+  if (shouldDeferExternalTlsPause(
+          mqttClient_ != nullptr, activePrint, source_.firstValidReport(),
+          millis() - mqttConnectedAtMs_.load())) {
+    return false;
+  }
   externalTlsPaused_.store(true);
   stopMqtt();
   return true;
@@ -2702,6 +2886,7 @@ void BambuCloud::handleMqttEvent(esp_mqtt_event_handle_t event) {
     xSemaphoreTake(mutex_, portMAX_DELAY);
     status_.mqttConnected = true;
     xSemaphoreGive(mutex_);
+    mqttConnectedAtMs_.store(millis());
     mqttRecovery_.reset();
     activeTransportFailureReason_.store(RECOVERY_MQTT);
     source_.setTransportConnected(true, "MQTT подключен, ждём report");

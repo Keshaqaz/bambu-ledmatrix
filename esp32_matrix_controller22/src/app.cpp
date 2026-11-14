@@ -35,14 +35,11 @@
 #include <Update.h>
 #include <esp_ota_ops.h>
 #include <esp_app_format.h>
-#include <mbedtls/base64.h>
-#include <mbedtls/pk.h>
-#include <mbedtls/sha256.h>
 #include <atomic>
 #include "app.hpp"
 #include "bambu_cloud.hpp"
 #include "bambu_legacy_migration.hpp"
-#include "ota_public_key.hpp"
+#include "ota_display_policy.hpp"
 #include "printer_status_source.hpp"
 #include "security_policy.hpp"
 #include "secure_network_coordinator.hpp"
@@ -113,9 +110,9 @@ static constexpr const char* FW_VERSION = "4.3.11-cap04-2026.09.02";
 #elif defined(BAMBU_AUTH_TRANSPORT_PROBE)
 static constexpr const char* FW_VERSION = "4.3.12-at04-2026.09.02";
 #else
-static constexpr const char* FW_VERSION = "4.3.13-2026.09.03";
+static constexpr const char* FW_VERSION = "4.4.11-2026.11.14";
 #endif
-static constexpr uint8_t SOAK_FW_MINOR = 13;  // 4.3.x — пишется в soak boot ring
+static constexpr uint8_t SOAK_FW_MINOR = 4;  // 4.x — пишется в soak boot ring
 static constexpr uint32_t SOAK_SAMPLE_INTERVAL_MS = 60000UL;
 static constexpr uint32_t SOAK_CHECKPOINT_INTERVAL_MS = 600000UL;
 static constexpr uint32_t STORED_STATE_MAGIC = 0x4D415458UL; // MATX
@@ -358,8 +355,12 @@ static std::atomic<uint32_t> rebootMs{0};
 static std::atomic<bool> otaInProgress{false};
 static SecureNetworkCoordinator secureNetworkCoordinator;
 static BambuCloud bambuCloud(secureNetworkCoordinator);
-static std::atomic<PrinterSourceMode> printerSourceMode{PRINTER_SOURCE_RELAY};
+// T06: direct Cloud — production-default. NVS-ключ ниже хранит явный выбор
+// пользователя; одноразовая миграция дефолта защищена marker-ключом, чтобы
+// позже выбранный вручную relay-rollback не перетирался при следующих загрузках.
+static std::atomic<PrinterSourceMode> printerSourceMode{PRINTER_SOURCE_CLOUD_DIRECT};
 static constexpr const char* PREF_PRINTER_SOURCE = "bsource";
+static constexpr const char* PREF_SOURCE_DEFAULT_MIGRATED = "bsrcmig";
 
 // Boot-guard / анти-кирпич: счётчик незавершённых загрузок в отдельном NVS
 // namespace "bootguard" (StoredStateBlob в "matrix" не трогаем). 3 сбоя подряд →
@@ -918,8 +919,11 @@ static std::atomic<bool> directSourceReady{false};
 
 static PrinterStateSnapshot selectedPrinterSnapshot() {
   const PrinterStateSnapshot direct = bambuCloud.source().snapshot();
+  xSemaphoreTake(bambuCfgMtx, portMAX_DELAY);
+  const bool enabled = bambuCfg.enabled;
+  xSemaphoreGive(bambuCfgMtx);
   directSourceReady.store(updateDirectSourceReadiness(
-      directSourceReady.load(), direct.configured,
+      directSourceReady.load(), enabled && direct.configured,
       bambuCloud.source().firstValidReport()));
   const PrinterSourceMode effectiveSource = effectivePrinterSourceMode(
       printerSourceMode.load(), directSourceReady.load());
@@ -927,9 +931,7 @@ static PrinterStateSnapshot selectedPrinterSnapshot() {
       effectiveSource == PRINTER_SOURCE_CLOUD_DIRECT
           ? direct
           : relayHttpSource.snapshot();
-  xSemaphoreTake(bambuCfgMtx, portMAX_DELAY);
-  snapshot.enabled = bambuCfg.enabled;
-  xSemaphoreGive(bambuCfgMtx);
+  snapshot.enabled = enabled;
   return snapshot;
 }
 
@@ -2106,6 +2108,10 @@ bool saveConfig() {
       ok = prefs.putUChar(PREF_PRINTER_SOURCE,
                           static_cast<uint8_t>(printerSourceMode.load())) == 1;
     }
+    if (ok) {
+      // T06: фиксируем, что одноразовая миграция дефолта источника выполнена.
+      ok = prefs.putUChar(PREF_SOURCE_DEFAULT_MIGRATED, 1) == 1;
+    }
     // Remove legacy split keys, including obsolete account credential buffers.
     prefs.remove("bcfg");
     prefs.remove("bver");
@@ -2130,6 +2136,7 @@ void loadConfig() {
   xSemaphoreTake(bambuCfgMtx, portMAX_DELAY);
   xSemaphoreTake(prefsMtx, portMAX_DELAY);
   bool migratedLegacyState = false;
+  bool migrateSourceDefault = false;  // T06: одноразовая миграция дефолта источника
   if (prefs.begin("matrix", true)) {
     StoredStateBlob blob;
     if (loadStoredStateBlob(blob)) {
@@ -2173,8 +2180,18 @@ void loadConfig() {
     } else {
       lastAutoBrightnessValid.store(false);
     }
+    // T06: cloud_direct — дефолт для новых и мигрированных установок.
+    // Одноразовая миграция: marker отсутствует → источник становится
+    // cloud_direct (relay остаётся effective-fallback, пока direct-сессия не
+    // готова, и явным rollback-выбором пользователя). После первой успешной
+    // записи marker дальнейшие загрузки чтят сохранённый выбор как есть.
+    const bool sourceDefaultMigrated = prefs.isKey(PREF_SOURCE_DEFAULT_MIGRATED);
     uint8_t storedSource = prefs.getUChar(
-        PREF_PRINTER_SOURCE, PRINTER_SOURCE_RELAY);
+        PREF_PRINTER_SOURCE, PRINTER_SOURCE_CLOUD_DIRECT);
+    if (!sourceDefaultMigrated) {
+      storedSource = PRINTER_SOURCE_CLOUD_DIRECT;
+      migrateSourceDefault = true;
+    }
     printerSourceMode.store(storedSource == PRINTER_SOURCE_CLOUD_DIRECT
                                 ? PRINTER_SOURCE_CLOUD_DIRECT
                                 : PRINTER_SOURCE_RELAY);
@@ -2184,13 +2201,16 @@ void loadConfig() {
     Serial.println("[NVS] prefs.begin(read) failed, using defaults");
     lastAutoBrightnessValid.store(false);
     bambuCfg.relayEnabled = true;
+    // Свежая установка (нет namespace "matrix") — дефолт T06 применяется
+    // и фиксируется marker-ключом первой же записью saveConfig().
+    migrateSourceDefault = true;
   }
   xSemaphoreGive(prefsMtx);
   xSemaphoreGive(bambuCfgMtx);
   xSemaphoreGive(cfgMtx);
 
-  if (migratedLegacyState) {
-    if (!saveConfig()) Serial.println("[NVS] Failed to rewrite migrated state v2");
+  if (migratedLegacyState || migrateSourceDefault) {
+    if (!saveConfig()) Serial.println("[NVS] Failed to persist state/source migration");
   }
 
   const bool printerConfigured = bambuCfg.relayUrl[0] != '\0';
@@ -2214,10 +2234,23 @@ static void sendJsonDocument(int code, JsonDocument& doc) {
     server.send(500, "application/json", "{\"error\":\"json_no_memory\"}");
     return;
   }
+  // ArduinoJson writes to a generic Print one byte at a time. Sending it
+  // directly to WiFiClient turned a ~1.7 KB status response into hundreds of
+  // tiny TCP writes (10–25 s on the live C3), so WebUI polling overlapped and
+  // kept the radio/CPU hot. WebServer sends a String body in bounded chunks;
+  // reuse its capacity to avoid steady-state heap fragmentation.
+  static String payload;
+  payload.remove(0);
+  const size_t jsonBytes = measureJson(doc);
+  if (!payload.reserve(jsonBytes + 1) ||
+      serializeJson(doc, payload) != jsonBytes) {
+    payload.remove(0);
+    server.send(500, "application/json", "{\"error\":\"json_serialize_failed\"}");
+    return;
+  }
   server.sendHeader("Cache-Control", "no-store");
-  server.setContentLength(measureJson(doc));
-  server.send(code, "application/json", "");
-  serializeJson(doc, server.client());
+  server.send(code, "application/json", payload);
+  payload.remove(0);
 }
 
 static bool parseBoundedBody(JsonDocument& doc, size_t maximumBytes) {
@@ -2998,57 +3031,20 @@ void handleWeatherRefresh() {
 }
 
 // ════════════════════════════════════════════════════════════
-//  OTA: открытая локальная веб-загрузка /api/update без password/session gate.
-//  Авторизуется сам image: корректная ECDSA-P256 подпись обязательна.
-//  Образ пишется в неактивный слот; otadata переключается атомарно
-//  в Update.end() — до этого момента обрыв безвреден.
+//  OTA: открытая локальная веб-загрузка /api/update без password/session gate
+//  и без подписи (решение владельца 2026-09-03). Целостность образа
+//  гарантируют проверка esp_app_desc в первом чанке, валидация Update.end()
+//  и boot-guard rollback. Образ пишется в неактивный слот; otadata
+//  переключается атомарно в Update.end() — до этого момента обрыв безвреден.
 // ════════════════════════════════════════════════════════════
-static mbedtls_sha256_context otaSha256;
-static bool otaSha256Initialized = false;
 static bool otaUploadAuthorized = false;
-static uint8_t otaSignature[96] = {};
-static size_t otaSignatureLength = 0;
 static char otaUploadError[64] = "";
 static bool otaTlsLeaseHeld = false;
+static uint8_t otaPreviousGlobalBrightness = 0;
+static bool otaBrightnessOverridden = false;
 
-static void otaResetVerification() {
-  if (otaSha256Initialized) mbedtls_sha256_free(&otaSha256);
-  otaSha256Initialized = false;
+static void otaResetState() {
   otaUploadAuthorized = false;
-  secureZero(otaSignature, sizeof(otaSignature));
-  otaSignatureLength = 0;
-}
-
-static bool otaReadSignatureHeader() {
-  String encoded = server.header("X-OTA-Signature");
-  if (encoded.length() < 80 || encoded.length() > 160) return false;
-  size_t decodedLength = 0;
-  int result = mbedtls_base64_decode(
-    otaSignature, sizeof(otaSignature), &decodedLength,
-    reinterpret_cast<const uint8_t*>(encoded.c_str()), encoded.length());
-  otaSignatureLength = decodedLength;
-  return result == 0 && decodedLength >= 64 && decodedLength <= sizeof(otaSignature);
-}
-
-static bool otaVerifySignature() {
-  if (!otaSha256Initialized || otaSignatureLength == 0) return false;
-  uint8_t digest[32];
-  mbedtls_sha256_finish(&otaSha256, digest);
-  mbedtls_sha256_free(&otaSha256);
-  otaSha256Initialized = false;
-
-  mbedtls_pk_context publicKey;
-  mbedtls_pk_init(&publicKey);
-  int result = mbedtls_pk_parse_public_key(
-    &publicKey, reinterpret_cast<const uint8_t*>(OTA_SIGNING_PUBLIC_KEY),
-    sizeof(OTA_SIGNING_PUBLIC_KEY));
-  if (result == 0) {
-    result = mbedtls_pk_verify(&publicKey, MBEDTLS_MD_SHA256, digest, sizeof(digest),
-                               otaSignature, otaSignatureLength);
-  }
-  mbedtls_pk_free(&publicKey);
-  secureZero(digest, sizeof(digest));
-  return result == 0;
 }
 
 // Прогресс OTA на матрице: янтарный столб растёт снизу вверх (в тон boot-
@@ -3073,7 +3069,9 @@ static void showOtaProgress(uint8_t pct) {
     int full = sub / 255;
     uint8_t frac = sub % 255;
     for (int fromBottom = 0; fromBottom <= full && fromBottom < MH; fromBottom++) {
-      uint8_t v = (fromBottom < full) ? 200 : scale8(200, frac);
+      uint8_t v = (fromBottom < full)
+          ? ota_display::kProgressValue
+          : scale8(ota_display::kProgressValue, frac);
       if (!v) continue;
       uint8_t hue = 16 + fromBottom * 2;  // снизу оранжевый, к верху желтее
       for (int x = 0; x < MW; x++) px(x, MH - 1 - fromBottom, CHSV(hue, 255, v));
@@ -3084,7 +3082,8 @@ static void showOtaProgress(uint8_t pct) {
 
 // Образ принят, ждём перезагрузку: ровная зелёная заливка до ресета.
 static void showOtaDone() {
-  fill_solid(leds, NUM_LEDS, CRGB(0, 150, 50));
+  fill_solid(leds, NUM_LEDS,
+             CRGB(0, ota_display::kDoneGreen, ota_display::kDoneBlue));
   FastLED.show();
 }
 
@@ -3109,6 +3108,10 @@ static bool otaEnterUpdateMode() {
     return false;
   }
   otaTlsLeaseHeld = true;
+  otaPreviousGlobalBrightness = FastLED.getBrightness();
+  FastLED.setBrightness(
+      ota_display::otaGlobalBrightness(otaPreviousGlobalBrightness));
+  otaBrightnessOverridden = true;
   clearMatrix(); FastLED.show();        // прежний кадр гасим; дальше рисуем прогресс
   esp_wifi_set_ps(WIFI_PS_NONE);        // power save рвёт приём при flash-операциях
   return true;
@@ -3121,6 +3124,10 @@ static void otaAbortUpdateMode() {
     otaTlsLeaseHeld = false;
   }
   showOtaError();
+  if (otaBrightnessOverridden) {
+    FastLED.setBrightness(otaPreviousGlobalBrightness);
+    otaBrightnessOverridden = false;
+  }
   esp_wifi_set_ps(WIFI_PS_MIN_MODEM);   // steady state и в STA, и в AP
 }
 
@@ -3131,10 +3138,10 @@ void handleUpdateUpload() {
   HTTPUpload& up = server.upload();
   switch (up.status) {
     case UPLOAD_FILE_START: {
-      otaResetVerification();
+      otaResetState();
       otaUploadError[0] = '\0';
-      if (!authorizeLocalOtaUpload(otaReadSignatureHeader())) {
-        strlcpy(otaUploadError, "missing_or_invalid_signature", sizeof(otaUploadError));
+      if (!authorizeLocalOtaUpload(false)) {
+        strlcpy(otaUploadError, "ota_not_authorized", sizeof(otaUploadError));
         break;
       }
       otaUploadAuthorized = true;
@@ -3155,10 +3162,6 @@ void handleUpdateUpload() {
       if (!Update.begin(expected)) {
         strlcpy(otaUploadError, "update_begin_failed", sizeof(otaUploadError));
         Update.printError(Serial);
-      } else {
-        mbedtls_sha256_init(&otaSha256);
-        mbedtls_sha256_starts(&otaSha256, 0);
-        otaSha256Initialized = true;
       }
       break;
     }
@@ -3179,7 +3182,6 @@ void handleUpdateUpload() {
           break;
         }
       }
-      if (otaSha256Initialized) mbedtls_sha256_update(&otaSha256, up.buf, up.currentSize);
       if (Update.write(up.buf, up.currentSize) != up.currentSize) {
         strlcpy(otaUploadError, "flash_write_failed", sizeof(otaUploadError));
         Update.printError(Serial);      // ошибка запомнена в Update, отдадим в final
@@ -3191,13 +3193,7 @@ void handleUpdateUpload() {
       break;
     }
     case UPLOAD_FILE_END: {
-      bool signatureValid = Update.isRunning() && otaVerifySignature();
-      if (!signatureValid) {
-        if (!otaUploadError[0])
-          strlcpy(otaUploadError, "signature_verification_failed", sizeof(otaUploadError));
-        Update.abort();
-        Serial.println("[OTA] Signature verification failed; boot slot unchanged");
-      } else if (Update.end(true)) { // commit boot partition only after signature passes
+      if (Update.end(true)) { // commit boot partition; boot-guard страхует битый образ
         Serial.printf("[OTA] Образ принят: %u байт\n", up.totalSize);
         showOtaDone();                  // зелёная заливка висит до перезагрузки
       } else {
@@ -3209,7 +3205,7 @@ void handleUpdateUpload() {
     case UPLOAD_FILE_ABORTED:
       Update.abort();
       strlcpy(otaUploadError, "upload_aborted", sizeof(otaUploadError));
-      otaResetVerification();
+      otaResetState();
       otaAbortUpdateMode();
       Serial.println("[OTA] Upload прерван клиентом");
       break;
@@ -3219,7 +3215,7 @@ void handleUpdateUpload() {
 
 void handleUpdateFinal() {
   if (!otaUploadAuthorized) {
-    otaResetVerification();
+    otaResetState();
     if (otaInProgress.load() || otaTlsLeaseHeld) otaAbortUpdateMode();
     server.send(403, "application/json", "{\"error\":\"forbidden\"}");
     return;
@@ -3229,7 +3225,7 @@ void handleUpdateFinal() {
     doc["ok"] = false;
     doc["error"] = otaUploadError[0] ? otaUploadError : Update.errorString();
     Update.abort();
-    otaResetVerification();
+    otaResetState();
     otaAbortUpdateMode();
     sendJsonDocument(400, doc);
     return;
@@ -3239,7 +3235,7 @@ void handleUpdateFinal() {
   bootGuardReset();
   xSemaphoreGive(prefsMtx);
   server.send(200, "application/json", "{\"ok\":true}");
-  otaResetVerification();
+  otaResetState();
   otaInProgress.store(false);
   if (otaTlsLeaseHeld) {
     secureNetworkCoordinator.release(SECURE_NETWORK_OTA);
@@ -3435,11 +3431,13 @@ void weatherTask(void* param) {
 void bambuTask(void* param) {
   for (;;) {
     if (otaInProgress.load()) { vTaskDelay(200 / portTICK_PERIOD_MS); continue; }
-    bambuCloud.service(wifiConnected.load(), otaInProgress.load());
     char relayUrl[sizeof(bambuCfg.relayUrl)];
     char relayKey[sizeof(bambuCfg.relayKey)];
     bool enabled = false;
     bool configured = bambuHasRelayConfig(&enabled, relayUrl, sizeof(relayUrl), relayKey, sizeof(relayKey));
+    // Тумблер гейтит и прямой Cloud (MQTT/TLS/auto-refresh), не только
+    // relay-рендер — A/B 2026-09-03 показал безусловный service().
+    bambuCloud.service(enabled, wifiConnected.load(), otaInProgress.load());
 
     if (!enabled) {
       relayHttpSource.configure(false, configured, "Bambu выключен");
@@ -3651,12 +3649,10 @@ void setup() {
   server.on("/api/weather/refresh", HTTP_POST, handleWeatherRefresh);
   server.on("/api/update",    HTTP_POST, handleUpdateFinal, handleUpdateUpload);
   server.onNotFound([](){ server.sendHeader("Location","/"); server.send(302); });
-  const char* collectedHeaders[] = {"X-OTA-Signature"};
-  server.collectHeaders(collectedHeaders, 1);
   server.begin();
   Serial.println("Server started");
 
-  Serial.println("[OTA] ArduinoOTA disabled; signed web OTA only");
+  Serial.println("[OTA] ArduinoOTA disabled; web OTA without signature");
 
   // ESP32-C3 одноядерный: фоновые задачи time-slice на том же ядре, WebServer остаётся в loop task.
   BaseType_t weatherTaskOk = xTaskCreatePinnedToCore(
@@ -3693,6 +3689,16 @@ void loop() {
   // Веб-сервер в loop task (WebServer не потокобезопасен)
   dnsServer.processNextRequest();
   server.handleClient();
+
+  // WebServer invokes the upload callback once per received chunk and then
+  // returns here. Keep normal rendering from replacing the OTA frame between
+  // chunks, and keep the final green frame intact while the HTTP response is
+  // flushed before reboot.
+  if (!ota_display::shouldRenderNormalFrame(otaInProgress.load(),
+                                             rebootPending.load())) {
+    delay(5);
+    return;
+  }
   serviceWifiConnectStateMachine();
 
   // Boot-guard: 60 с аптайма без краша = загрузка успешна. Критерий — только

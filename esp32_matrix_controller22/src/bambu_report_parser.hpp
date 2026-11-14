@@ -19,13 +19,18 @@ inline bool bambuAsciiEqualIgnoreCase(const char* a, const char* b) {
   return *a == '\0' && *b == '\0';
 }
 
+// Ошибка на матрице = принтер сам остановился (FAILED или PAUSE с
+// hms/print_error). Bambu держит в hms и print_error информационные
+// уведомления (влажность AMS, обслуживание, проверка первого слоя), которые
+// принтер не считает ошибкой; при RUNNING/IDLE/FINISH они игнорируются,
+// иначе дельта-репорты с hms давали короткие ложные красные вспышки.
 inline PrinterLifecycle bambuLifecycleFromReport(const char* gcodeState,
                                                  bool hasError) {
-  if (hasError) return PRINTER_ERROR;
   if (bambuAsciiEqualIgnoreCase(gcodeState, "RUNNING")) return PRINTER_PRINTING;
   if (bambuAsciiEqualIgnoreCase(gcodeState, "PREPARE")) return PRINTER_PREPARING;
   if (bambuAsciiEqualIgnoreCase(gcodeState, "PAUSE") ||
-      bambuAsciiEqualIgnoreCase(gcodeState, "PAUSED")) return PRINTER_PAUSED;
+      bambuAsciiEqualIgnoreCase(gcodeState, "PAUSED"))
+    return hasError ? PRINTER_ERROR : PRINTER_PAUSED;
   if (bambuAsciiEqualIgnoreCase(gcodeState, "FINISH")) return PRINTER_FINISHED;
   if (bambuAsciiEqualIgnoreCase(gcodeState, "IDLE")) return PRINTER_IDLE;
   if (bambuAsciiEqualIgnoreCase(gcodeState, "FAILED")) return PRINTER_ERROR;
@@ -457,9 +462,22 @@ class BambuReportParser {
       if (progress > 100.0) progress = 100.0;
       patch_.progress = static_cast<uint8_t>(lround(progress));
       patch_.present |= PRINTER_PATCH_PROGRESS; meaningful_ = true;
-    } else if ((strcmp(key, "subtask_name") == 0 || strcmp(key, "gcode_file") == 0) && isString) {
-      copyText(patch_.jobName, value);
-      patch_.present |= PRINTER_PATCH_JOB_NAME; meaningful_ = true;
+    } else if (strcmp(key, "subtask_name") == 0 && isString) {
+      // Relay-паритет: имя работы даёт subtask_name; пустое значение не
+      // затирает ранее полученное.
+      if (value[0]) {
+        copyText(patch_.jobName, value);
+        patch_.present |= PRINTER_PATCH_JOB_NAME;
+      }
+      meaningful_ = true;
+    } else if (strcmp(key, "gcode_file") == 0 && isString) {
+      // gcode_file — только fallback, если subtask_name не дал имени
+      // (живой репорт 2026-09-04: gcode_file="" затирал непустой subtask_name).
+      if (value[0] && !(patch_.present & PRINTER_PATCH_JOB_NAME)) {
+        copyText(patch_.jobName, value);
+        patch_.present |= PRINTER_PATCH_JOB_NAME;
+      }
+      meaningful_ = true;
     } else if (strcmp(key, "stage") == 0 && isString) {
       copyText(patch_.stage, value); explicitStage_ = true;
       patch_.present |= PRINTER_PATCH_STAGE; meaningful_ = true;
@@ -502,6 +520,8 @@ class BambuReportParser {
     PrinterLifecycle lifecycle = bambuLifecycleFromReport(gcodeState_, hasError_);
     if (lifecycle != PRINTER_UNKNOWN) {
       patch_.lifecycle = lifecycle;
+      patch_.terminalFailure =
+          bambuAsciiEqualIgnoreCase(gcodeState_, "FAILED");
       patch_.present |= PRINTER_PATCH_LIFECYCLE;
     }
     const bool numericIdleDuringActivity =

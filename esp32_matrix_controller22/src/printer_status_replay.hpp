@@ -12,6 +12,10 @@ class ScriptedPrinterStatusSource : public PrinterStatusSource {
 
   void replay(const PrinterStatePatch& patch) { reducer_.apply(patch, nowMs_); }
 
+  void suppressFinishedAnnouncement() {
+    reducer_.suppressFinishedAnnouncement();
+  }
+
   void advanceBy(uint32_t elapsedMs) {
     nowMs_ += elapsedMs;
     reducer_.advance(nowMs_);

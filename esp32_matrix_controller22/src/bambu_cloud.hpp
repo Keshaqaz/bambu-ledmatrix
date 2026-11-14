@@ -9,6 +9,8 @@
 #include "bambu_cloud_credentials.hpp"
 #include "bambu_refresh_policy.hpp"
 #include "bambu_report_parser.hpp"
+#include "bambu_service_gate.hpp"
+#include "finished_announcement.hpp"
 #include "printer_status_source.hpp"
 #include "secure_network_coordinator.hpp"
 #include "t05_resilience.hpp"
@@ -79,26 +81,32 @@ class DirectCloudSource : public PrinterStatusSource {
                       size_t totalLength, uint32_t nowMs);
   void service(uint32_t nowMs);
   void resetValidation();
+  // NVS-латч «финиш уже объявлен»: переживает бут, гасит повторный анонс
+  // многодневнего незакрытого финиша после включения питания.
+  void loadFinishAnnouncementRecord();
+  void clearFinishAnnouncementRecord();
   bool firstValidReport() const { return firstValidReport_.load(); }
   uint32_t rejectedReports() const { return rejectedReports_.load(); }
   uint32_t maximumReportBytes() const { return maximumReportBytes_.load(); }
 
  private:
   mutable portMUX_TYPE mux_ = portMUX_INITIALIZER_UNLOCKED;
-  PrinterStatusReducer reducer_;
+  mutable PrinterStatusReducer reducer_;
   BambuReportParser parser_;
   std::atomic<bool> firstValidReport_{false};
   std::atomic<uint32_t> rejectedReports_{0};
   std::atomic<uint32_t> maximumReportBytes_{0};
   std::atomic<uint32_t> lastValidReportMs_{0};
   std::atomic<bool> staleMarked_{false};
+  FinishAnnouncementRecord finishRecord_;
+  FinishAnnouncementRecord terminalFailureRecord_;
 };
 
 class BambuCloud {
  public:
   explicit BambuCloud(SecureNetworkCoordinator& coordinator);
   bool begin();
-  void service(bool wifiConnected, bool otaInProgress);
+  void service(bool enabled, bool wifiConnected, bool otaInProgress);
   void stopForOta();
   bool pauseForExternalTls();
   void resumeAfterExternalTls();
@@ -187,6 +195,7 @@ class BambuCloud {
 
   SecureNetworkCoordinator& coordinator_;
   DirectCloudSource source_;
+  DirectCloudServiceGate serviceGate_;
   mutable SemaphoreHandle_t mutex_;
   SemaphoreHandle_t operationMutex_;
   BambuCredentialSlots credentialSlots_;
@@ -211,6 +220,9 @@ class BambuCloud {
   std::atomic<uint8_t> activeTransportFailureReason_{RECOVERY_MQTT};
   std::atomic<bool> mqttStopping_{false};
   std::atomic<bool> externalTlsPaused_{false};
+  // millis() of the last MQTT_EVENT_CONNECTED; 0 while never/stopped.
+  // Feeds the external-TLS pause guard (mqtt_pause_policy.hpp).
+  std::atomic<uint32_t> mqttConnectedAtMs_{0};
   bool initialized_;
   BoundedRecoveryBackoff mqttRecovery_;
   bool wifiWasAvailable_;

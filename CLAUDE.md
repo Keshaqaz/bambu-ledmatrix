@@ -11,8 +11,24 @@ token operations).
 ## Project
 
 - Firmware project: `esp32_matrix_controller22/`
-- Deployed firmware: `4.3.13-2026.09.03`, partition `app0` — flashed over USB
-  (network OTA blocked by the mid-upload crash; see Build & Flash). 4.3.13 adds
+- Deployed firmware: `4.4.6-2026.09.04` on `app1`; `app0` contains the same
+  working image (verified 2026-09-04 by alternating OTA through both slots).
+  4.4.6 = 4.4.5 + jobName parser fix; 4.4.5 = Finding A fix + bambuEnabled
+  service gate + NVS finish-announcement latch. The earlier partial `app1`
+  image has been replaced, so boot-guard has a valid fallback again.
+  **The OTA receive-path blocker is not currently reproducible:** six
+  current-handler uploads completed with HTTP 200 and clean slot
+  switches on 2026-09-04 (direct Mac and via pve); a signed old-handler control
+  also completed. The historical `int_wdt` crashes remain real, but their exact
+  cause was not isolated. Re-test with `tools/ota_loop.py` after OTA changes.
+  4.4.1 removed OTA signature verification; 4.4.3 shipped the
+  warm-reboot crash-loop fix (DNS gate + MQTT pause guard + destroy grace —
+  see the fixed-defect note in Build & Flash). T06 live: `cloud_direct`
+  production default, soak journal resumed with `fwMinor=4`.
+- Prepared and **deployed 2026-09-03 (USB)**: `4.4.0-2026.09.03` (T06) —
+  `cloud_direct` is the production default for new and migrated installs via
+  one-time NVS migration (marker `bsrcmig` in namespace `matrix`; explicit
+  later relay choices are honored). 4.3.13 adds
   the **autonomous on-device soak journal** (`src/soak_log.hpp`, NVS namespace
   `soaklog`): mins of heap/largest-block/task reserves, shadow-mismatch and
   MQTT-reconnect totals, accumulated uptime, and a 16-entry boot ring with
@@ -41,37 +57,59 @@ token operations).
 ## Build & Flash
 
 - **Local access policy:** [ADR 0002](docs/adr/0002-use-security-level-zero-for-local-access.md) defines security level 0: open AP and WebUI/API without admin password, session or CSRF. The superseded T01 onboarding/session gate is fully removed in the deployed 4.3.x line (verified: no session/CSRF code in `src/app.cpp`).
-- Working toolchain: `arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs --export-binaries .` from the project root; flash over USB with `-u -p /dev/cu.usbmodem101`. Network updates retain signed WebUI OTA for image integrity; sign with `sh tools/sign_ota.sh build/.../*.ino.bin`. ArduinoOTA/espota is disabled.
+- Working toolchain: `arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs --export-binaries .` from the project root; flash over USB with `-u -p /dev/cu.usbmodem101`. Network updates use WebUI OTA without image signature (owner decision 2026-09-03; `X-OTA-Signature`, `ota_public_key.hpp` and `tools/sign_ota.sh` removed). ArduinoOTA/espota is disabled.
 - Libraries installed via `arduino-cli lib install`: `FastLED@3.10.3`, `ArduinoJson@7.4.3`
 - PlatformIO is currently broken on this machine: `~/.platformio/penv/bin/platformio` has a missing Python interpreter, while `/Users/kesha/Library/Python/3.9/bin/platformio` runs under unsupported Python 3.9. Use `arduino-cli`; `platformio.ini` is retained for future repair.
 - arduino-cli uses esp32 core 3.3.8. **Core 3.x gotcha:** `NetworkClient::setTimeout()` takes milliseconds (core 2.x, which old PlatformIO builds used, took seconds); `setHandshakeTimeout()` still takes seconds. `setTimeout(8)` = 8 ms killed all weather TLS connections until fixed (commit 932e290). Audit client timeouts when porting code written for core 2.x.
-- **OTA:** `min_spiffs` scheme, two 1.875MB app slots (binary limit 1 966 080 bytes). Target security-level-0 `/api/update` has no user/session gate but still requires the ECDSA-P256 `X-OTA-Signature` for image integrity before `Update.end()` commits the boot slot. ArduinoOTA/espota is disabled. Bump `FW_VERSION` in `src/app.cpp`; verify `fwVersion`/`fwPartition` after OTA.
-- **`/api/update` OTA-crash gotcha (BLOCKER, 2026-09-03):** 5 of 6 network OTA
-  attempts today crashed the device mid-upload — curl reported `HTTP 000`
-  (16–120 s in) and the device reset at the upload moment, no commit (only the
-  morning `4.3.12` 3rd install succeeded). Throttling (`--limit-rate 40K`)
-  does not help. Every attempt also erases/overwrites the target slot — check
-  both slots' validity before trusting any fallback. Until the early-boot
-  defect is fixed, prefer direct USB upload (`arduino-cli upload -p
-  /dev/cu.usbmodem101`; 4.3.13 flashed this way in 4.6 s, hash verified).
-  A prepared image is `4.3.13-2026.09.03`: 1,391,296 B, SHA-256
-  `0cd2067a39e21285beb39bafb211e64f1d2ec170dd2461a865c84deb63f4f6b0`, signed.
-- **Standing deploy authorization (owner, 2026-09-02):** firmware/device deploys to project-owned LED Matrix hardware are pre-authorized; do not ask again before signed WebUI OTA or necessary diagnostic flashing. Resolve the exact target, use signed images for network OTA, retain rollback/boot-guard, and verify version, partition, and health afterward. This does not authorize deploying to third-party devices, starting prints, mutating accounts, deleting data, or other destructive actions.
+- **OTA:** `min_spiffs` scheme, two 1.875MB app slots (binary limit 1 966 080 bytes). Target security-level-0 `/api/update` has no user/session gate and, since the owner decision of 2026-09-03, no signature check either — the plain `.ino.bin` is accepted (first-chunk esp_app_desc check, `Update.end()` validation and boot-guard rollback remain). ArduinoOTA/espota is disabled. Bump `FW_VERSION` in `src/app.cpp`; verify `fwVersion`/`fwPartition` after OTA.
+- **`/api/update` OTA-crash history (not reproducing as of 2026-09-04):** 5 of 6 network
+  OTA attempts that day crashed the device mid-upload — curl reported
+  `HTTP 000` (16–120 s in) and the device reset at the upload moment, no
+  commit (only the morning `4.3.12` 3rd install succeeded). Throttling
+  (`--limit-rate 40K`) does not help. Every attempt also erases/overwrites
+  the target slot — check both slots' validity before trusting any fallback.
+  After signature removal, two initial uploads completed. A focused 2026-09-04
+  loop then completed six current-handler uploads (8.7–11.6 s,
+  direct Mac and via pve), each with HTTP 200, one new boot-ring record and a
+  slot switch. A signed upload through the old handler also passed once, so
+  signature hashing alone is not a proven cause. Command:
+  `python3 tools/ota_loop.py build/esp32.esp32.esp32c3/esp32_matrix_controller22.ino.bin --via pve --iters 3`.
+  The loop waits for the new boot-ring sequence before reading status and
+  enforces the 60 s boot-guard cadence. Use USB if this loop turns RED again.
+- **Standing deploy authorization (owner, 2026-09-02):** firmware/device deploys to project-owned LED Matrix hardware are pre-authorized; do not ask again before WebUI OTA or necessary diagnostic flashing. Resolve the exact target, retain rollback/boot-guard, and verify version, partition, and health afterward. This does not authorize deploying to third-party devices, starting prints, mutating accounts, deleting data, or other destructive actions.
 - **arduino-cli gotcha:** `compile --output-dir <dir>` also silently overwrites the sketch-local `build/` export — a test build (e.g. a deliberately crashing one) can poison the `build/.../*.ino.bin` you later OTA. Verify `build/` freshness (or recompile with `--export-binaries`) before uploading.
 - **Boot-guard anti-brick:** NVS namespace `bootguard` counts boots, cleared after 60 s uptime; 3 consecutive failures → `esp_ota_set_boot_partition()` rollback to the other slot (refuses cleanly if that slot is empty/corrupt). Known tradeoff: 3 manual resets within the first 60 s also trigger rollback. Live-proven 2026-09-03 (twice): it rescued the device from 4.3.12 early-boot crash series and rolled back to 4.3.11.
-- **4.3.12 early-boot instability → root cause found (2026-09-03, serial
-  capture):** on early boot the firmware connects to Bambu Cloud MQTT
-  immediately; when DNS is not ready yet (`esp-tls: couldn't get hostname for
-  us.mqtt.bambulab.com, getaddrinfo() returns 202`) the mqtt/esp-tls error
-  teardown panics — **`Guru Meditation Error: Store access fault`** (and a
-  sibling variant: lwIP `assert failed: udp_remove ... Required to lock TCPIP
-  core functionality!`). The panic series (boots crash ~3–15 s in) trips the
-  boot-guard rollback. Cold power-on usually wins the DNS race; `/api/reboot`
-  and OTA-commit reboots usually lose it. Evidence:
-  `/Users/kesha/Desktop/vibecoding/ledmatrix-t05-soak/serial_reboot.log`.
-  Fix (needs its own TDD pass): don't connect MQTT before Wi-Fi+DNS are
-  confirmed usable, and audit the esp-tls cleanup path for the store-access
-  fault / missing TCPIP lock.
+- **Warm-reboot crash loop → FIXED in `4.4.3-2026.09.03` (2026-09-03,
+  TDD pass with on-device loop).** Original symptoms (4.3.x/4.4.2): warm
+  reboots (`/api/reboot`, OTA-commit) crashed ~3–15 s into the new session
+  (`Store access fault` / `udp_remove` TCPIP-lock assert in the
+  mqtt/esp-tls teardown; serial evidence on 4.3.12-era builds), tripping
+  boot-guard rollbacks. Three defenses shipped (not bisected — each maps to
+  a real hazard and carries a host test):
+  1. **DNS gate** (`src/mqtt_dns_gate.hpp`): `startMqtt()` only after
+     `WiFi.hostByName(<broker>)` succeeds; failures feed the existing
+     `RECOVERY_DNS` bounded backoff instead of entering the esp-tls error
+     path. Test: `tests/mqtt_dns_gate_test.cpp`.
+  2. **Pause guard** (`src/mqtt_pause_policy.hpp`): weather/sunrise HTTPS
+     may no longer stop+destroy a freshly connected / unvalidated MQTT
+     client (`kMqttPauseGuardMs` = 45 s grace after CONNECTED); steady-state
+     pause behavior unchanged. Test: `tests/mqtt_pause_policy_test.cpp`.
+  3. **Destroy grace**: 250 ms between `esp_mqtt_client_stop()` and
+     `..._destroy()` so the client task finishes its transport_read unwind.
+  Regression loop: `python3 tools/dnsrace_loop.py --iters 3 --window 45`
+  (ring-based verdict; GREEN ×7 observed on 4.4.3 with live print + MQTT).
+- **PLATFORM ARTIFACT (proven by minimal-sketch probe, 2026-09-03): a clean
+  `ESP.restart()` on ESP32-C3 / core 3.3.8 reports
+  `esp_reset_reason()==ESP_RST_PANIC`.** Soak-journal `panic` entries after
+  warm reboots are NOT crash evidence. Honest crash signals: more ring
+  entries than reboots performed, or watchdog-family reasons
+  (`int_wdt`/`task_wdt`). Historical `int_wdt`/multi-boot series were real;
+  single `panic`-per-reboot lines are mislabeled clean restarts.
+- **Serial debugging on this Mac/C3 is ROM-console only:** app-level
+  `Serial` (HWCDC) output never reaches a host fd (DTR tricks don't help);
+  `esp_rom_printf()` flows reliably. Opening `/dev/cu.usbmodem*` always
+  resets the chip (`rst:0x15`), which contaminates boot-ring observations.
+  Prefer `tools/dnsrace_loop.py`-style ring verdicts over serial captures.
 - ESP32-C3 is single-core: background FreeRTOS tasks and `loop()` time-slice on the same CPU. During OTA `otaInProgress` freezes weatherTask/bambuTask (no TLS handshakes mid flash write) and Wi-Fi power save is switched off.
 
 ## Display / UI State
@@ -100,21 +138,73 @@ token operations).
 
 - T04 direct Cloud path (email/password auth, email/SMS verification, printer
   selection, refresh/logout, direct MQTT) is **complete** and validated live.
-  T05 canary progress: `relay → cloud_direct` and `cloud_direct → relay`
-  switching verified live 2026-09-03 without reboot; relay API-failure test
-  (bad `bambuRelayUrl`) showed bounded failure with preserved overlay and clean
-  recovery. Remaining: 72h soak verdict, Finding-A fix.
-- **Finding A (open defect, fix after window, TDD):** after a print FINISHes,
-  the direct path flaps `finished(5)/visible(5)/progress 100` ↔ `idle(1)/visible 0`
-  every ~15–65 s indefinitely: `DirectCloudSource` demotes on the 30 s grace
-  (`advance()`), but periodic cloud reports re-instate FINISHED
-  (`reducer_.apply` sets lifecycle=5 again). Relay demotes to idle and stays.
-  User effect: endless "green bar / idle" oscillation after every print; it
-  explains 100% of shadow mismatches (bits: lifecycle, visible, progress, plus
-  job_name/stage/detail fields, since relay retains jobName on idle while direct
-  carries empty fields). Reproduced live 2026-09-03 on both 4.3.11 and 4.3.12.
-  Fix idea: never re-enter FINISHED without passing through a non-finished
-  lifecycle; host test in `tests/t05_resilience_test.cpp`.
+  T05 canary: source switching and API-failure resilience verified live
+  2026-09-03. T06 implemented in `4.4.0-2026.09.03` (built/signed, deploy
+  pending owner go): `cloud_direct` is the production default — fresh NVS and
+  existing installs migrate via one-time marker `bsrcmig`; until a direct
+  session is ready the effective source stays relay (`effectivePrinterSourceMode`),
+  which is the documented transitional fallback; WebUI relay choice after
+  migration is preserved. Owner decision 2026-09-03: 72h soak verdict, 2×
+  `int_wdt` investigation, heap-gate recalibration and Finding-A fix are
+  tech debt; the on-device journal keeps accumulating (`GET /api/soak`).
+- **Finding A (FIXED in `4.4.4-2026.09.03`, host-tested):** after a print
+  FINISHes, the direct path flapped `finished(5)/visible(5)/progress 100` ↔
+  `idle(1)/visible 0` every ~15–65 s indefinitely: `DirectCloudSource`
+  demoted on the 30 s grace (`advance()`), but periodic cloud reports
+  re-instated FINISHED (`reducer_.apply` set lifecycle=5 again). Fix:
+  `PrinterStatusReducer` latch `finishedAnnounced_` — after the grace demote
+  repeated FINISHED patches collapse to the relay-parity idle state
+  (`progress 0`, `stage/detail "idle"`, jobName retained); only a
+  non-finished lifecycle (new print) re-arms FINISHED; transient
+  offline/unknown does not. Regression:
+  `tests/printer_status_source_test.cpp`
+  (`test_periodic_finished_reports_hold_idle_after_demote`). Live
+  confirmation pending the next real print finish (shadow-mismatch rate
+  should drop from 100%-of-observations to ~0).
+- **Повторный анонс финиша после бута (FIXED в `4.4.5/4.4.6-2026.09.04`):**
+  живой эпизод — после переподключения питания матрица показывала зелёную
+  полосу «финиша» при простаивающем принтере. Причина: cloud-поток несёт
+  FINISH для незакрытой на принтере работы (Bambu держит `gcode_state=FINISH`
+  до dismiss на экране), а RAM-латч сбрасывался при каждом буте → первый
+  FINISH-репорт заново «объявлял» финиш. Фикс: NVS-латч
+  `src/finished_announcement.hpp` (namespace `bambufin`, ключ `ann`,
+  jobKey = subtask_name): совпавший jobKey → анонс подавлен, новая работа →
+  анонс; активность печати (busy lifecycle) стирает запись; logout чистит.
+  Тест: `tests/finished_announcement_test.cpp`. Известный трейд-оф: финиш
+  той же работы (то же имя), целиком прошедший при выключенной матрице, не
+  анонсируется. Живой поток idle-принтера (захвачено диагностика 2026-09-04):
+  ~1/с `{}` и `push_status` только с температурами (без gcode_state) — парсер
+  их справедливо режектит (`rejectedReports` растёт, это норма), поэтому
+  между редкими полными репортами lifecycle ходит stale-OFFLINE↔значением —
+  рендеру не видно (overlay retention), shadow-паритет с relay сохраняется.
+- **jobName: пустой `gcode_file` затирал `subtask_name` (FIXED в
+  `4.4.6-2026.09.04`):** оба ключа мапились в jobName, и шедший следом
+  `gcode_file:""` обнулял имя (живой репорт со старым FAILED-принтом:
+  `subtask_name:"0.2mm layer…"`, `gcode_file:""` → jobName пустой, shadow
+  mismatch по JOB_NAME). Теперь relay-паритет: subtask_name приоритетен,
+  gcode_file — fallback, пустое значение не затирает непустое
+  (`src/bambu_report_parser.hpp`, кейс в `tests/bambu_report_parser_test.cpp`).
+- **Ложные красные вспышки (FIXED в `4.4.11-2026.11.14`, deployed OTA на
+  `app1`, `app0` = 4.4.10):** любой непустой `hms` или ненулевой
+  `print_error` давал `PRINTER_ERROR` даже при `RUNNING`/`IDLE`; Bambu держит
+  там информационные уведомления, а дельта-репорты с/без `hms` давали
+  короткую красную вспышку без ошибки на принтере. Правило теперь: ошибка =
+  принтер остановился — `FAILED`, либо `PAUSE` + hms/print_error; при
+  остальных состояниях hms/print_error игнорируются
+  (`bambuLifecycleFromReport`, паритет в `relay.py` `map_lifecycle`; тесты
+  `bambu_lifecycle_mapping_test`, `bambu_report_parser_test`,
+  `test_relay.py`). Relay-копия на роутере ещё не задеплоена → до деплоя
+  shadow-mismatch растёт только в моменты hms-уведомлений.
+- **`bambuEnabled` gates the direct path too (FIXED in
+  `4.4.4-2026.09.03`):** `bambuCloud.service()` used to run unconditionally
+  in `bambuTask` — the toggle only gated relay rendering, leaving
+  direct-MQTT/TLS/auto-refresh alive with Bambu "off" (A/B 2026-09-03).
+  Now `BambuCloud::service(enabled, ...)` consults
+  `DirectCloudServiceGate` (`src/bambu_service_gate.hpp`, host test
+  `tests/bambu_service_gate_test.cpp`): one teardown pass on disable
+  (stopMQTT + cancel queued/auto-refresh ops, mid-login operations fail as
+  `bambu_disabled`), then full silence; re-enable reconnects. Verified live:
+  toggle off → `mqttConnected=false` ≤5 s; on → reconnected ≤7 s.
 - TOTP branch (`/api/sign-in/tfa` → `/api/auth/token`) is covered by a contract
   test only — production server never chose it in observed logins (verifyCode
   branch instead); treat live TOTP behavior as unverified until it actually
@@ -156,6 +246,17 @@ token operations).
 - Relay returns `idle` instead of `unknown` when connected with no active print
 
 ## Relay Deployment (router)
+
+- **INCIDENT (resolved, 2026-09-04): relay process stayed down after a power
+  reconnect.** It was enabled (`S95bambu-relay`) but cold-boot DNS returned
+  `socket.gaierror: [Errno -3] Try again`. `retry_runtime()` caught only
+  `RuntimeError`, so six rapid exits exhausted `procd`'s
+  `respawn 3600 5 5` policy and left the service stopped. Fix: retry transient
+  `OSError` failures too; regression in `tools/bambu_relay/test_relay.py`.
+  Deployed to `/root/bambu_relay.py` after a backup at
+  `/tmp/bambu_relay.py.pre-dns-retry`; local/router SHA-256
+  `a3e3eb29b076bdc4d10f872515bd03214fd18588390a4bcc8814c576e8854e07`.
+  `/healthz`, Cloud MQTT `/status`, and matrix shadow comparisons recovered.
 
 - Files on the router: `/root/bambu_relay.py`, `/root/bambu_relay_admin.py`,
   `/etc/init.d/bambu-relay`, `/usr/bin/bambu-relay-token-check`, and
@@ -205,15 +306,22 @@ token operations).
 
 ## Operational Notes
 
-- Last deployed build (2026-09-03): `4.3.12-2026.09.02` on `app0`; exported OTA
-  image 1,386,880 bytes, SHA-256
-  `6d0f1e40e5f461d78e7629741dd6573c044fb064563710cd51877d9d0a4b45b4`
-  (signature `*.ino.bin.sig` beside it). 4.3.11 remains on `app1` as the
-  boot-guard fallback.
+- Slot layout after the 2026-09-04 OTA diagnosis: app1 = 4.4.6 (running),
+  app0 = 4.4.6 (valid fallback). The earlier partial app1 image and temporary
+  4.3.13 A/B probe were overwritten successfully. `fwPartition` via
+  `/api/status` shows only the running slot. 4.3.11/4.3.13/4.4.3 remain
+  rebuildable from git history if a slot must be restored; signing is gone
+  from the production tree.
+  Reboot-loop testing cadence: leave ≥60 s between reboots or the boot-guard
+  counter (cleared only at 60 s uptime) legitimately rolls the slot back —
+  `tools/dnsrace_loop.py` does this automatically.
 - **T05 72h soak (since 2026-09-03 ~11:00 MSK) is ON-DEVICE (autonomous):** the
   firmware journal accumulates mins of heap/largest-block/task reserves,
   shadow-mismatch + MQTT-reconnect totals, uptime and a 16-entry boot ring with
-  reset reasons in NVS. Read verdict: `curl http://192.168.1.65/api/soak`
+  reset reasons in NVS. **Journal resumed on 4.4.0 (`fwMinor=4`) after the
+  evening OTA incident pause on 4.3.11; the int_wdt boot series of the crash
+  ping-pong is preserved in the ring as evidence.**
+  Read verdict: `curl http://192.168.1.65/api/soak`
   (works from a phone on the LAN; no Mac/pve/router needed). NVS checkpoint
   every 10 min — `soakUptimeSeconds` grows stepwise, a crash loses ≤10 min.
   Known cosmetic gaps in 4.3.13: `checkpointCount` stays 0 (wrapper adds
