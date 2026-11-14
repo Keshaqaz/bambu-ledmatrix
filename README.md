@@ -2,11 +2,11 @@
 
 <img src="docs/assets/matrix-preview.svg" width="880" alt="Animated 16×16 matrix: the clock and the outdoor temperature while a print goes preparing, printing, finished and idle, next to the blinking paused and error bars">
 
-### LED Matrix
+### Bambu LED Matrix
 
 A clock that knows how your 3D print is doing.
 
-[![release](https://img.shields.io/badge/release-4.4.11-8A2BE2)](https://github.com/Keshaqaz/ledmatrix/releases/latest)
+[![release](https://img.shields.io/badge/release-4.4.11-8A2BE2)](https://github.com/Keshaqaz/bambu-ledmatrix/releases/latest)
 [![board](https://img.shields.io/badge/board-ESP32--C3-E7352C?logo=espressif&logoColor=white)](esp32_matrix_controller22/README.md)
 [![arduino](https://img.shields.io/badge/arduino--cli-esp32%203.3.8-00979D?logo=arduino&logoColor=white)](esp32_matrix_controller22/README.md)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -58,7 +58,7 @@ Informational printer notices during a print don't turn the bar red.
 **Hardware:** an ESP32-C3 board, a 16×16 WS2812B matrix on GPIO 4, a 5 V supply.
 
 **Firmware.** The easy way: grab the file from the
-[latest release](https://github.com/Keshaqaz/ledmatrix/releases/latest) and
+[latest release](https://github.com/Keshaqaz/bambu-ledmatrix/releases/latest) and
 flash it over USB (this wipes the board, saved settings included):
 
 ```sh

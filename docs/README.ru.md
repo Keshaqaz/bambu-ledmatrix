@@ -2,11 +2,11 @@
 
 <img src="assets/matrix-preview.svg" width="880" alt="Анимация матрицы 16×16: часы и уличная температура, пока печать проходит подготовку, печать, завершение и простой, рядом мигающие полосы паузы и ошибки">
 
-### LED Matrix
+### Bambu LED Matrix
 
 Часы, которые знают, как дела у вашего 3D-принтера.
 
-[![release](https://img.shields.io/badge/release-4.4.11-8A2BE2)](https://github.com/Keshaqaz/ledmatrix/releases/latest)
+[![release](https://img.shields.io/badge/release-4.4.11-8A2BE2)](https://github.com/Keshaqaz/bambu-ledmatrix/releases/latest)
 [![board](https://img.shields.io/badge/board-ESP32--C3-E7352C?logo=espressif&logoColor=white)](../esp32_matrix_controller22/README.md)
 [![arduino](https://img.shields.io/badge/arduino--cli-esp32%203.3.8-00979D?logo=arduino&logoColor=white)](../esp32_matrix_controller22/README.md)
 [![license](https://img.shields.io/badge/license-MIT-blue)](../LICENSE)
@@ -56,7 +56,7 @@
 **Железо:** плата ESP32-C3, матрица WS2812B 16×16 на GPIO 4, блок питания 5 В.
 
 **Прошивка.** Проще всего взять готовый файл из
-[релизов](https://github.com/Keshaqaz/ledmatrix/releases/latest) и залить по USB
+[релизов](https://github.com/Keshaqaz/bambu-ledmatrix/releases/latest) и залить по USB
 (плата стирается целиком, вместе с настройками):
 
 ```sh
